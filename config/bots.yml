@@ -1,0 +1,3 @@
+bots:
+  - username: Steve_AI
+    model_hint: sonnet

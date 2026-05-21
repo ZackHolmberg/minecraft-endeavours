@@ -5,5 +5,9 @@ backups/
 # Don't commit secrets or local overrides
 .env.local
 
+# Node / TypeScript
+node_modules/
+dist/
+
 # Claude Code
 CLAUDE.md
