@@ -1,6 +1,7 @@
 import { loadConfig } from "./config.js";
 import { startBotSupervisor, type BotSupervisor } from "./mineflayer-glue/bot-factory.js";
 import { attachStubEventHooks } from "./mineflayer-glue/event-hooks.js";
+import { attachChatTriggerHarness } from "./skills/chat-trigger.js";
 
 const config = loadConfig();
 console.log(
@@ -12,7 +13,10 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) =>
     botConfig,
     host: config.mcHost,
     port: config.mcPort,
-    onConnect: (bot) => attachStubEventHooks(bot, botConfig.username),
+    onConnect: (bot) => {
+      attachStubEventHooks(bot, botConfig.username);
+      attachChatTriggerHarness(bot, botConfig.username);
+    },
   }),
 );
 
