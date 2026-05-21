@@ -1,0 +1,9 @@
+# Server data (worlds, plugins, configs) — too large for git
+data/
+backups/
+
+# Don't commit secrets or local overrides
+.env.local
+
+# Claude Code
+CLAUDE.md
