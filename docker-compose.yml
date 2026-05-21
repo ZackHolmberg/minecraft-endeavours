@@ -24,7 +24,9 @@ services:
       LEVEL_SEED: ${LEVEL_SEED:-}
 
       # Access control
+      ONLINE_MODE: "false"
       WHITELIST: ${WHITELIST:-false}
+      ENFORCE_WHITELIST: "true"
       OPS: ${OPS:-}
 
       # Quality of life

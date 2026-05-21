@@ -5,7 +5,7 @@ Paper Minecraft server running in Docker.
 ## Requirements
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- Port **25565** open on your router (for friends outside your local network)
+- Port **25565** open on your router
 
 ## Quick Start
 
@@ -53,11 +53,11 @@ All settings live in `.env`. Edit it and run `docker compose up -d` to apply cha
 3. Set **Server Address** to that IP (e.g. `192.168.1.42`)
 4. Click **Done**, then join the server
 
-### From outside the network (friends over the internet)
+### From outside the network
 
 The server uses DuckDNS to maintain a stable hostname at `minecraft-with-friends.duckdns.org`. Port 25565 must be forwarded on the router to the host machine's local IP. Your ISP must also provide a dedicated public IP — if you're behind CGNAT (check your router's WAN IP; if it's in the `100.64.x.x` range, you are), call your ISP and ask to be moved off it.
 
-1. Friends open Minecraft → **Multiplayer** → **Add Server**
+1. Open Minecraft → **Multiplayer** → **Add Server**
 2. Set **Server Address** to `minecraft-with-friends.duckdns.org`
 3. Click **Done**, then join
 
@@ -68,3 +68,7 @@ Everything lives in `./data/` — worlds, plugins, server.properties, etc. This 
 ## Ops / Admin
 
 Add your Minecraft username to `OPS=` in `.env`, then restart the server. In-game you can also run `/op <username>` from the console.
+
+## Access control
+
+The server runs in offline-mode (no Mojang auth) to support AI NPC bots, so access is gated by the **whitelist**: only usernames listed in `WHITELIST=` in `.env` can join. Add friends' Minecraft usernames there (comma-separated) and restart.
