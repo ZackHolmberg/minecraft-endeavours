@@ -1,5 +1,7 @@
 import type { Bot } from "mineflayer";
-import { goals, Movements, type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+
+const { goals, Movements } = pathfinderPkg;
 import { Vec3 } from "vec3";
 import type { GoToTarget, SkillResult } from "./types.js";
 

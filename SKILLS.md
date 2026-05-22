@@ -12,7 +12,7 @@ and returns the same shape regardless of success:
 { ok: boolean, message: string, state?: object }
 ```
 
-**Failure messages are written for Claude's consumption** (slice 3+) — they must be specific enough that the model can adapt (`"no oak_log within 64 blocks"`, not `"failed"`). Wrap every call site in `runSkill(name, params, fn)` so unexpected exceptions become `{ ok: false, message }` results instead of taking down the bot.
+**Failure messages are written for Claude's consumption** — they must be specific enough that the model can adapt (`"no oak_log within 64 blocks"`, not `"failed"`). Wrap every call site in `runSkill(bot, name, params, fn)` so unexpected exceptions become `{ ok: false, message }` results instead of taking down the bot. `runSkill` also records successful, non-noisy results to the bot's [recent-actions log](../src/state/actions-log.ts) and flips the conversation-continuity flag when `say`/`whisper` produces a `?`-terminated message.
 
 For higher-level design (catalogue, principles, push-work-down-the-stack), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -24,7 +24,7 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `remember`, `setTaskQueue`, `advanceTaskQueue` | ✅ Implemented in slice 3 (phase 2) |
 | `findBlock`, `findEntity`, `checkInventory`, `followPlayer`, `stop`, `lookAt`, `placeBlock`, `activateBlock`, `pickUpNearby`, `equipItem`, `dropItem`, `giveItemTo`, `craft`, `attack`, `flee`, `wait` | ⏳ Pending |
 
-The manual chat-trigger harness (`!cmd args` in-game) is the slice-2 testing interface. It will be removed once the Claude orchestrator lands in slice 3 — anything inside `src/skills/chat-trigger.ts` is scaffolding, not production code.
+The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
 
 ## Reference
 
@@ -41,7 +41,7 @@ Sends `message` on public chat. Trimmed; truncates silently at 256 chars (`state
 | Success | `said "<message>"` |
 | Failures | `empty message` |
 
-**Smoke test:** `!say hello world` — bot echoes the message in chat.
+`state` includes `sent` (the actual chat content sent) — used by `runSkill` to detect `?`-terminated questions for the conversation-continuity heuristic.
 
 ---
 
@@ -58,7 +58,7 @@ whisper(bot, { player: string, message: string }): Promise<SkillResult>
 | Success | `whispered to <player>` |
 | Failures | `empty message` · `player "<name>" is not online` |
 
-**Smoke test:** no `!whisper` command in the harness yet — drive it from the chat-trigger source if you need to exercise it.
+Like `say`, includes `sent` in state for the question-continuity hook.
 
 ---
 
@@ -85,9 +85,7 @@ Claude's primary `look around`. Pre-aggregates so Claude doesn't have to: groups
 | Success | `<N> block group(s), <M> entit(ies) within <radius> blocks` |
 | Failures | None expected — read-only. Exceptions are caught by `runSkill` and become `observeSurroundings crashed: <msg>`. |
 
-**State shape:** `position`, `dimension`, `facing` (cardinal), `time` (`{ timeOfDay, phase }`), `weather`, `status` (`health/food/saturation/experience/isInWater/isOnFire`), `heldItem`, `nearbyBlocks`, `nearbyEntities`, `nearbyDroppedItems`, plus the stubbed memory/state fields above. See `src/skills/perception.ts` for the full TS interface.
-
-**Smoke test:** `!observe` — bot replies in chat with a compact summary (`blocks: 7× oak_log@4.5, ... | entities: Zack(player)@2.1, ...`). Full state object is logged to the orchestrator console.
+**State shape:** `position`, `dimension`, `facing` (cardinal), `time` (`{ timeOfDay, phase }`), `weather`, `status` (`health/food/saturation/experience/isInWater/isOnFire`), `heldItem`, `nearbyBlocks`, `nearbyEntities`, `nearbyDroppedItems`, `knownStorage`, `recentActions`, `recentlySeenPlayers`, `currentTask`, `remainingTasks`. See `src/skills/perception.ts` for the full TS interface.
 
 ---
 
@@ -116,11 +114,6 @@ Pre-checks reachability with `pathfinder.getPathTo()`. If the path computation r
 |---|---|
 | Success | `arrived near <label> at (x, y, z)` |
 | Failures | `entity "<name>" not visible to the bot` · `unknown block type "<name>"` · `no <block> within 64 blocks` · `no path to <label> at (x, y, z)` · `pathfinding to <label> failed: <msg>` |
-
-**Smoke tests:**
-- `!goto Zack` — bot pathfinds to player Zack (or any nearby mob with that name).
-- `!goto 100 64 -200` — three numeric args resolve to coords.
-- `!goto block oak_log` — finds the nearest oak_log within 64 blocks and pathfinds to it.
 
 ---
 
@@ -157,10 +150,6 @@ Workflow per iteration:
 - **Drop pickup is unreliable.** Field-confirmed in the slice-3 smoke test for sand — the 500ms post-dig wait misses natural auto-collect often enough that the bot finishes "mining" with items still on the ground. Fix planned via an explicit pickup sweep after each dig (or land `pickUpNearby` and call it from the composite). Tracked in [ROADMAP.md → Slice-3 smoke-test follow-ups](ROADMAP.md).
 - Tool selection picks the last `canHarvest` match in inventory rather than computing fastest dig time.
 
-**Smoke tests:**
-- `!mine oak_log 3` (bare-handed) — should mine 3 nearby logs.
-- `!mine stone 1` (no pickaxe) — should fail with `no pickaxe in inventory to mine stone` *before any movement*.
-
 ---
 
 ### `remember` — record a POI to per-bot world knowledge
@@ -175,8 +164,6 @@ Writes a point of interest into `data/orchestrator/memory/<bot>/world.json` unde
 |---|---|
 | Success | `remembered: <type> "<name>" at (x, y, z)` · `already remembered: <type> "<name>" at (x, y, z)` |
 | Failures | `type is required (e.g. base, portal, bed)` · `no position available — bot has no entity yet` |
-
-**Smoke test:** `!remember base main_base` — adds a POI at the bot's current position. Inspect `data/orchestrator/memory/<bot>/world.json` to see the entry; re-run the same command to verify idempotency.
 
 ---
 
@@ -193,8 +180,6 @@ Replaces the bot's task queue with the supplied list. The first task becomes `cu
 | Success | `task queue set (<N> tasks); current: "<task>"` |
 | Failures | `tasks must be a non-empty array of strings` · `all tasks were empty after trimming` · `no state registered for this bot` |
 
-**Smoke test:** `!queue get wood; get iron; return` — bot reports the queue; subsequent `!observe` shows `currentTask: "get wood"`, `remainingTasks: ["get iron", "return"]`.
-
 ---
 
 ### `advanceTaskQueue` — mark the current task complete
@@ -210,8 +195,6 @@ Drops the current task and promotes the next one. Returns `task queue drained` w
 | Success | `advanced; current: "<task>"` · `task queue drained` |
 | Failures | `no state registered for this bot` |
 
-**Smoke test:** With a queue set, `!advance` shifts to the next item; repeat until drained.
-
 ---
 
 ### `stopMovement` — cancel pathfinding (helper, not a registered skill)
@@ -220,39 +203,27 @@ Drops the current task and promotes the next one. Returns `task queue drained` w
 stopMovement(bot): SkillResult
 ```
 
-Synchronous helper used by the manual harness's `!stop` to interrupt a running `goTo` / `mineBlock`. The architectural `stop` skill from the catalogue (Movement section) will subsume this in slice 3+ and gain the ability to cancel any in-flight skill, not just pathfinding.
+Synchronous helper that calls `pathfinder.stop()`. Currently orphaned — the slice-2 `!stop` harness command that called it is gone, and the agent doesn't have access to it yet. The architectural `stop` skill from the catalogue (Movement section) will revive it as a registered tool in a later slice with the ability to cancel any in-flight skill, not just pathfinding.
 
 | | |
 |---|---|
 | Success | `stopped` |
 | Failures | None. |
 
-**Smoke test:** `!stop` while a `goto`/`mine` is in flight — bot halts where it stands.
+## Exercising skills
 
-## Manual testing via the chat-trigger harness
+The bot is driven by Claude through natural in-game chat — no `!cmd` shortcuts. To exercise a skill, address the bot and ask:
 
-Slice 2 mounts `attachChatTriggerHarness(bot, username)` from `src/index.ts` alongside the stub event hooks. It listens for `!cmd args` from any player on public chat and `/msg` whispers, dispatches the matching skill through `runSkill`, and replies on the same channel.
+- **Public chat** with the bot's name (e.g. `Steve_AI, look around`) wakes the bot. Reply lands in public chat via the `say` tool.
+- **`/msg <bot> <message>`** wakes the bot privately. Reply lands as a whisper via the `whisper` tool.
+- **`@all <message>`** wakes every configured bot.
+- **Follow-up without name-mention** (within 30s of the bot ending a reply with `?`) is routed via the conversation-continuity heuristic.
 
-| Command | Dispatches |
-|---|---|
-| `!say <msg>` | `say({ message })` |
-| `!observe [radius]` | `observeSurroundings({ radius })` |
-| `!goto <name>` · `!goto <x> <y> <z>` · `!goto block <name>` | `goTo({ target })` |
-| `!mine <block> [count]` | `mineBlock({ type, count })` |
-| `!stop` | `stopMovement()` |
-| `!queue <task1>; <task2>; ...` | `setTaskQueue({ tasks })` |
-| `!advance` | `advanceTaskQueue()` |
-| `!remember <type> [name]` | `remember({ type, name })` (uses bot's current pos) |
+What to watch in the orchestrator console:
 
-Only one skill runs at a time; subsequent commands are rejected with `busy — say !stop to cancel`. `!stop` always preempts. Result is summarised back in chat (`[ok] mine: mined 3 oak_log` etc.); for `!observe` the chat reply is a digest and the full state object goes to the orchestrator console.
+- `ROUTE chat→<bot> reason=...` — the chat router picked this bot.
+- `→ mcp__minecraft-skills__<skill>({...})` — the model called a skill.
+- `thinking: ...` — the model's plain assistant text (logged but never sent in-game).
+- `turn complete (cache_read=NNNN, out=NN)` — turn finished; usage stats.
 
-### Smoke-test sequence
-
-Prereq: Steve_AI must be on the server whitelist. Then `./scripts/dev.sh` to bring up MC + orchestrator, join the server as a player, and run the commands above in order. Recommended path:
-
-1. `!say hello` — proves the bot is connected, listening, and the harness is wired.
-2. `!observe` — proves perception aggregation works; check the console JSON.
-3. `!goto <yourname>` — proves pathfinding + entity resolution.
-4. `!goto block oak_log` — proves the block-target branch.
-5. `!mine oak_log 3` — proves the canonical composite. Bare hands work for logs.
-6. `!mine stone 1` (no pickaxe) — proves fail-fast tool check.
+If the bot whispers *"I'm rate-limited, try again in ~N min"* the Pro 5-hour window is exhausted; the agent drops further chats until reset. See [ARCHITECTURE.md "Resilience"](ARCHITECTURE.md).

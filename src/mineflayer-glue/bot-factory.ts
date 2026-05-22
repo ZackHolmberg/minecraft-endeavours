@@ -14,6 +14,7 @@ export interface BotSupervisorOptions {
   botConfig: BotConfig;
   host: string;
   port: number;
+  version: string;
   /**
    * Called every time a new mineflayer Bot instance is created, before its
    * `spawn` event. Wire chat listeners and other per-connection hooks here —
@@ -24,7 +25,7 @@ export interface BotSupervisorOptions {
 }
 
 export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
-  const { botConfig, host, port, onConnect } = opts;
+  const { botConfig, host, port, version, onConnect } = opts;
   const tag = `[${botConfig.username}]`;
 
   let stopped = false;
@@ -41,6 +42,7 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
       port,
       username: botConfig.username,
       auth: "offline",
+      version,
     });
     currentBot = bot;
     bot.loadPlugin(pathfinder);

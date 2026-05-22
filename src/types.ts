@@ -9,4 +9,5 @@ export interface AppConfig {
   bots: BotConfig[];
   mcHost: string;
   mcPort: number;
+  mcVersion: string;
 }

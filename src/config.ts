@@ -33,7 +33,18 @@ export function loadConfig(botsYmlPath = "config/bots.yml"): AppConfig {
     bots,
     mcHost: process.env.MC_HOST ?? "localhost",
     mcPort: Number(process.env.MC_PORT ?? 25565),
+    mcVersion: resolveMcVersion(),
   };
+}
+
+function resolveMcVersion(): string {
+  const raw = process.env.MC_VERSION;
+  if (!raw || raw === "LATEST") {
+    throw new Error(
+      "MC_VERSION must be pinned to a specific Minecraft version supported by mineflayer's minecraft-data (e.g. 1.21.9). See CLAUDE.md.",
+    );
+  }
+  return raw;
 }
 
 function parseBot(entry: unknown, index: number, path: string): BotConfig {

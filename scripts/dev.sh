@@ -4,6 +4,15 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Source .env so the orchestrator inherits MC_VERSION (and friends) from the
+# same file docker-compose uses — keeps server and bot client in lockstep.
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
 echo "Ensuring Minecraft server is up..."
 docker compose up -d minecraft
 

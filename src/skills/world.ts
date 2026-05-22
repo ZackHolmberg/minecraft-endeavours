@@ -1,5 +1,7 @@
 import type { Bot } from "mineflayer";
-import { goals, Movements, type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+
+const { goals, Movements } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
 import type { SkillResult } from "./types.js";

@@ -2,7 +2,6 @@ import { NpcAgent, registerAgent, unregisterAgent } from "./agent/npc-agent.js";
 import { loadConfig } from "./config.js";
 import { startBotSupervisor, type BotSupervisor } from "./mineflayer-glue/bot-factory.js";
 import { attachBotEventHooks } from "./mineflayer-glue/event-hooks.js";
-import { attachChatTriggerHarness } from "./skills/chat-trigger.js";
 import { createBotState, registerBotState, unregisterBotState } from "./state/index.js";
 
 const config = loadConfig();
@@ -22,14 +21,14 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
     botConfig,
     host: config.mcHost,
     port: config.mcPort,
+    version: config.mcVersion,
     onConnect: (bot) => {
-      attachBotEventHooks(bot, botConfig.username, allBotUsernames, state);
-      attachChatTriggerHarness(bot, botConfig.username);
       // Fresh agent per connection — conversation context is intentionally
       // not preserved across reconnects (durable knowledge lives in
       // world.json). Replacing in the registry triggers `stop()` on the
       // previous agent.
       registerAgent(botConfig.username, new NpcAgent({ bot, botConfig }));
+      attachBotEventHooks(bot, botConfig.username, allBotUsernames, state);
     },
   });
 });
