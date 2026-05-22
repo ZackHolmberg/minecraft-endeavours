@@ -21,7 +21,8 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | Skill | Status |
 |---|---|
 | `say`, `whisper`, `observeSurroundings`, `goTo`, `mineBlock` | ✅ Implemented in slice 2 |
-| `findBlock`, `findEntity`, `checkInventory`, `followPlayer`, `stop`, `lookAt`, `placeBlock`, `activateBlock`, `pickUpNearby`, `equipItem`, `dropItem`, `giveItemTo`, `craft`, `attack`, `flee`, `wait`, `remember`, `setTaskQueue`, `advanceTaskQueue` | ⏳ Pending |
+| `remember`, `setTaskQueue`, `advanceTaskQueue` | ✅ Implemented in slice 3 (phase 2) |
+| `findBlock`, `findEntity`, `checkInventory`, `followPlayer`, `stop`, `lookAt`, `placeBlock`, `activateBlock`, `pickUpNearby`, `equipItem`, `dropItem`, `giveItemTo`, `craft`, `attack`, `flee`, `wait` | ⏳ Pending |
 
 The manual chat-trigger harness (`!cmd args` in-game) is the slice-2 testing interface. It will be removed once the Claude orchestrator lands in slice 3 — anything inside `src/skills/chat-trigger.ts` is scaffolding, not production code.
 
@@ -75,9 +76,9 @@ Claude's primary `look around`. Pre-aggregates so Claude doesn't have to: groups
 
 **Block allowlist:** trees (`*_log`, `*_wood`), ores (`*_ore`), water/lava, crafting/furnace/smithing variants, chest family (chest, barrel, shulker, ender_chest), beds, doors/trapdoors, portals, spawner, respawn anchor, lodestone, beacon. **Never returns a raw voxel grid.**
 
-**State fields stubbed until slice 3:**
-- `knownStorage` — empty array; will read from per-bot `world.json` once the memory layer lands.
-- `recentActions`, `recentlySeenPlayers`, `currentTask`, `remainingTasks` — empty / null; will come from the in-process state stores (`actions-log.ts`, `player-presence.ts`, `task-queue.ts`).
+**State fields now live (slice 3, phases 1–2):**
+- `recentActions`, `recentlySeenPlayers`, `currentTask`, `remainingTasks` — sourced from the in-process state stores (`src/state/actions-log.ts`, `player-presence.ts`, `task-queue.ts`).
+- `knownStorage` — sourced from `data/orchestrator/memory/<bot>/world.json` (the `containers[]` section). Stays empty until container auto-capture lands; the `remember` skill writes only to `pois[]`.
 
 | | |
 |---|---|
@@ -162,6 +163,57 @@ Workflow per iteration:
 
 ---
 
+### `remember` — record a POI to per-bot world knowledge
+
+```ts
+remember(bot, { type: string, name?: string, pos?: Coords }): Promise<SkillResult>
+```
+
+Writes a point of interest into `data/orchestrator/memory/<bot>/world.json` under `pois[]`. `pos` defaults to the bot's current position (rounded to integer blocks) so Claude doesn't need to look up coords first. Idempotent on (`type`, `position`): a duplicate `remember` reports "already remembered" without writing a second entry. Source on every Claude-driven entry is `"claude"`; the `"auto"` source is reserved for event-hook capture (deferred).
+
+| | |
+|---|---|
+| Success | `remembered: <type> "<name>" at (x, y, z)` · `already remembered: <type> "<name>" at (x, y, z)` |
+| Failures | `type is required (e.g. base, portal, bed)` · `no position available — bot has no entity yet` |
+
+**Smoke test:** `!remember base main_base` — adds a POI at the bot's current position. Inspect `data/orchestrator/memory/<bot>/world.json` to see the entry; re-run the same command to verify idempotency.
+
+---
+
+### `setTaskQueue` — declare a multi-task plan
+
+```ts
+setTaskQueue(bot, { tasks: string[] }): Promise<SkillResult>
+```
+
+Replaces the bot's task queue with the supplied list. The first task becomes `currentTask`; the rest become `remainingTasks`. Both are surfaced in every subsequent `observeSurroundings` so Claude reads its own plan back from the world instead of from conversation memory. Empty strings in the input are trimmed.
+
+| | |
+|---|---|
+| Success | `task queue set (<N> tasks); current: "<task>"` |
+| Failures | `tasks must be a non-empty array of strings` · `all tasks were empty after trimming` · `no state registered for this bot` |
+
+**Smoke test:** `!queue get wood; get iron; return` — bot reports the queue; subsequent `!observe` shows `currentTask: "get wood"`, `remainingTasks: ["get iron", "return"]`.
+
+---
+
+### `advanceTaskQueue` — mark the current task complete
+
+```ts
+advanceTaskQueue(bot): Promise<SkillResult>
+```
+
+Drops the current task and promotes the next one. Returns `task queue drained` when nothing is queued.
+
+| | |
+|---|---|
+| Success | `advanced; current: "<task>"` · `task queue drained` |
+| Failures | `no state registered for this bot` |
+
+**Smoke test:** With a queue set, `!advance` shifts to the next item; repeat until drained.
+
+---
+
 ### `stopMovement` — cancel pathfinding (helper, not a registered skill)
 
 ```ts
@@ -188,6 +240,9 @@ Slice 2 mounts `attachChatTriggerHarness(bot, username)` from `src/index.ts` alo
 | `!goto <name>` · `!goto <x> <y> <z>` · `!goto block <name>` | `goTo({ target })` |
 | `!mine <block> [count]` | `mineBlock({ type, count })` |
 | `!stop` | `stopMovement()` |
+| `!queue <task1>; <task2>; ...` | `setTaskQueue({ tasks })` |
+| `!advance` | `advanceTaskQueue()` |
+| `!remember <type> [name]` | `remember({ type, name })` (uses bot's current pos) |
 
 Only one skill runs at a time; subsequent commands are rejected with `busy — say !stop to cancel`. `!stop` always preempts. Result is summarised back in chat (`[ok] mine: mined 3 oak_log` etc.); for `!observe` the chat reply is a digest and the full state object goes to the orchestrator console.
 

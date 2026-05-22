@@ -4,7 +4,7 @@ import { say } from "./chat.js";
 import { observeSurroundings } from "./perception.js";
 import { goTo, stopMovement } from "./movement.js";
 import { mineBlock } from "./world.js";
-import { getBotState } from "../state/index.js";
+import { advanceTaskQueue, remember, setTaskQueue } from "./meta.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 /**
@@ -19,8 +19,9 @@ import type { GoToTarget, SkillResult } from "./types.js";
  *   !goto <player|mob> | !goto <x> <y> <z> | !goto block <name>
  *   !mine <block> [count]
  *   !stop
- *   !queue <task1>; <task2>; ...   (debug: pokes the task-queue state store)
- *   !advance                        (debug: advances the task queue)
+ *   !queue <task1>; <task2>; ...   (calls the setTaskQueue meta skill)
+ *   !advance                        (calls the advanceTaskQueue meta skill)
+ *   !remember <type> [name]         (calls the remember meta skill — uses current pos)
  */
 export function attachChatTriggerHarness(bot: Bot, username: string): void {
   const tag = `[${username}]`;
@@ -86,31 +87,24 @@ async function dispatch(bot: Bot, cmd: string, args: string[], raw: string): Pro
       return stopMovement(bot);
 
     case "queue": {
-      const state = getBotState(bot.username);
-      if (!state) return { ok: false, message: "no state registered for this bot" };
-      // Re-split the original line so semicolon tasks survive whitespace splitting above.
+      // Re-split the original line so semicolon-separated tasks survive the
+      // whitespace tokenization the dispatcher does above.
       const body = raw.replace(/^!\w+\s*/, "");
       const tasks = body.split(";").map((t) => t.trim()).filter((t) => t.length > 0);
       if (tasks.length === 0) {
         return { ok: false, message: "usage: !queue <task1>; <task2>; ..." };
       }
-      state.tasks.set(tasks);
-      return {
-        ok: true,
-        message: `queue set: current="${state.tasks.current()}", remaining=${JSON.stringify(state.tasks.remaining())}`,
-      };
+      return runSkill(bot, "setTaskQueue", { tasks }, (p) => setTaskQueue(bot, p));
     }
 
-    case "advance": {
-      const state = getBotState(bot.username);
-      if (!state) return { ok: false, message: "no state registered for this bot" };
-      const next = state.tasks.advance();
-      return {
-        ok: true,
-        message: next === null
-          ? "queue drained"
-          : `advanced: current="${next}", remaining=${JSON.stringify(state.tasks.remaining())}`,
-      };
+    case "advance":
+      return runSkill(bot, "advanceTaskQueue", undefined, () => advanceTaskQueue(bot));
+
+    case "remember": {
+      const type = args[0];
+      if (!type) return { ok: false, message: "usage: !remember <type> [name]" };
+      const name = args.slice(1).join(" ").trim() || undefined;
+      return runSkill(bot, "remember", { type, name }, (p) => remember(bot, p));
     }
 
     default:

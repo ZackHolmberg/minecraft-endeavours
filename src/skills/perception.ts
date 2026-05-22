@@ -1,6 +1,8 @@
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Block } from "prismarine-block";
+import { Vec3 } from "vec3";
+import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
 import type { SkillResult } from "./types.js";
 
@@ -47,7 +49,14 @@ export interface ObserveSurroundingsState {
     lookingAt?: boolean;
   }>;
   nearbyDroppedItems: Array<{ item: string; count: number; dist: number }>;
-  knownStorage: Array<unknown>;
+  knownStorage: Array<{
+    type: string;
+    pos: { x: number; y: number; z: number };
+    dist: number;
+    lastOpened?: number;
+    lastOpenedBy?: string;
+    contents?: Array<{ item: string; count: number }>;
+  }>;
   recentActions: string[];
   recentlySeenPlayers: Array<{ name: string; lastSeen: number; lastPos: { x: number; y: number; z: number } | null }>;
   currentTask: string | null;
@@ -103,6 +112,21 @@ export async function observeSurroundings(
   const heldItem = held ? { name: held.name, count: held.count } : null;
 
   const botState = getBotState(bot.username);
+  const world = await readWorldKnowledge(bot.username);
+  const knownStorage = world.containers
+    .map((c) => {
+      const d = me.distanceTo(new Vec3(c.position.x, c.position.y, c.position.z));
+      const entry: ObserveSurroundingsState["knownStorage"][number] = {
+        type: c.type,
+        pos: c.position,
+        dist: round2(d),
+      };
+      if (c.last_opened !== undefined) entry.lastOpened = c.last_opened;
+      if (c.last_opened_by !== undefined) entry.lastOpenedBy = c.last_opened_by;
+      if (c.contents !== undefined) entry.contents = c.contents;
+      return entry;
+    })
+    .sort((a, b) => a.dist - b.dist);
 
   return {
     ok: true,
@@ -125,7 +149,7 @@ export async function observeSurroundings(
       nearbyBlocks,
       nearbyEntities,
       nearbyDroppedItems,
-      knownStorage: [],
+      knownStorage,
       recentActions: botState?.actions.recent() ?? [],
       recentlySeenPlayers: botState?.presence.recentlySeen() ?? [],
       currentTask: botState?.tasks.current() ?? null,

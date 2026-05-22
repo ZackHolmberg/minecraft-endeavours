@@ -4,3 +4,4 @@ export { say, whisper } from "./chat.js";
 export { observeSurroundings, type ObserveSurroundingsState } from "./perception.js";
 export { goTo, stopMovement } from "./movement.js";
 export { mineBlock } from "./world.js";
+export { remember, setTaskQueue, advanceTaskQueue } from "./meta.js";
