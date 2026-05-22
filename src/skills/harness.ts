@@ -1,4 +1,8 @@
 import type { Bot } from "mineflayer";
+import {
+  getCurrentConversationPartner,
+  noteBotQuestionedPlayer,
+} from "../orchestrator/chat-router.js";
 import { getBotState } from "../state/index.js";
 import type { SkillResult } from "./types.js";
 
@@ -42,5 +46,29 @@ export async function runSkill<P, R extends SkillResult>(
     const state = getBotState(bot.username);
     state?.actions.record(result.message);
   }
+
+  if (result.ok && (name === "say" || name === "whisper")) {
+    maybeNoteQuestion(bot, name, params, result);
+  }
+
   return result;
+}
+
+/**
+ * Conversation-continuity heuristic: when the bot says or whispers a line
+ * ending in `?`, flag the target player for 30 seconds so their next chat
+ * routes back to this bot without requiring another name-mention. Pure
+ * middleware — see ARCHITECTURE.md "Conversation continuity".
+ */
+function maybeNoteQuestion(bot: Bot, name: string, params: unknown, result: SkillResult): void {
+  const sent = (result.state as { sent?: string } | undefined)?.sent?.trim();
+  if (!sent || !sent.endsWith("?")) return;
+
+  const target =
+    name === "whisper"
+      ? (params as { player?: string }).player
+      : getCurrentConversationPartner(bot.username);
+  if (!target) return;
+
+  noteBotQuestionedPlayer(bot.username, target);
 }

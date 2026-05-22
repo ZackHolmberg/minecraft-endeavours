@@ -17,7 +17,7 @@ export async function say(bot: Bot, { message }: SayParams): Promise<SkillResult
   return {
     ok: true,
     message: `said "${sent}"`,
-    state: { truncated: sent.length < trimmed.length },
+    state: { sent, truncated: sent.length < trimmed.length },
   };
 }
 
@@ -42,6 +42,6 @@ export async function whisper(
   return {
     ok: true,
     message: `whispered to ${player}`,
-    state: { truncated: sent.length < trimmed.length },
+    state: { sent, truncated: sent.length < trimmed.length },
   };
 }

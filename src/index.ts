@@ -9,6 +9,8 @@ console.log(
   `orchestrator: starting ${config.bots.length} bot(s), target ${config.mcHost}:${config.mcPort}`,
 );
 
+const allBotUsernames: readonly string[] = config.bots.map((b) => b.username);
+
 const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
   // State outlives the bot connection — a brief disconnect shouldn't erase
   // what happened 30 seconds ago. Lifetime ends with the orchestrator.
@@ -20,7 +22,7 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
     host: config.mcHost,
     port: config.mcPort,
     onConnect: (bot) => {
-      attachBotEventHooks(bot, botConfig.username, state);
+      attachBotEventHooks(bot, botConfig.username, allBotUsernames, state);
       attachChatTriggerHarness(bot, botConfig.username);
     },
   });
