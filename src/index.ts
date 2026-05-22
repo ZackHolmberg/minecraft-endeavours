@@ -1,3 +1,4 @@
+import { NpcAgent, registerAgent, unregisterAgent } from "./agent/npc-agent.js";
 import { loadConfig } from "./config.js";
 import { startBotSupervisor, type BotSupervisor } from "./mineflayer-glue/bot-factory.js";
 import { attachBotEventHooks } from "./mineflayer-glue/event-hooks.js";
@@ -24,6 +25,11 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
     onConnect: (bot) => {
       attachBotEventHooks(bot, botConfig.username, allBotUsernames, state);
       attachChatTriggerHarness(bot, botConfig.username);
+      // Fresh agent per connection — conversation context is intentionally
+      // not preserved across reconnects (durable knowledge lives in
+      // world.json). Replacing in the registry triggers `stop()` on the
+      // previous agent.
+      registerAgent(botConfig.username, new NpcAgent({ bot, botConfig }));
     },
   });
 });
@@ -34,6 +40,7 @@ const shutdown = async (signal: string): Promise<void> => {
   shuttingDown = true;
   console.log(`orchestrator: received ${signal}, disconnecting bots`);
   await Promise.all(supervisors.map((s) => s.stop()));
+  await Promise.all(supervisors.map((s) => unregisterAgent(s.username)));
   for (const s of supervisors) unregisterBotState(s.username);
   console.log("orchestrator: bye");
   process.exit(0);

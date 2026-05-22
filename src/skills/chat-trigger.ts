@@ -5,6 +5,7 @@ import { observeSurroundings } from "./perception.js";
 import { goTo, stopMovement } from "./movement.js";
 import { mineBlock } from "./world.js";
 import { advanceTaskQueue, remember, setTaskQueue } from "./meta.js";
+import { getAgent } from "../agent/npc-agent.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 /**
@@ -22,6 +23,7 @@ import type { GoToTarget, SkillResult } from "./types.js";
  *   !queue <task1>; <task2>; ...   (calls the setTaskQueue meta skill)
  *   !advance                        (calls the advanceTaskQueue meta skill)
  *   !remember <type> [name]         (calls the remember meta skill — uses current pos)
+ *   !ask <message>                  (pushes a synthetic chat into the NPC agent's queue)
  */
 export function attachChatTriggerHarness(bot: Bot, username: string): void {
   const tag = `[${username}]`;
@@ -41,7 +43,7 @@ export function attachChatTriggerHarness(bot: Bot, username: string): void {
     console.log(`${tag} chat-trigger from ${sender}: ${raw}`);
     busy = cmd !== "stop";
     try {
-      const result = await dispatch(bot, cmd, args, raw);
+      const result = await dispatch(bot, sender, cmd, args, raw);
       reply(bot, sender, channel, formatResult(cmd, result));
     } finally {
       busy = false;
@@ -52,7 +54,13 @@ export function attachChatTriggerHarness(bot: Bot, username: string): void {
   bot.on("whisper", (sender, message) => void handle(sender, message, "whisper"));
 }
 
-async function dispatch(bot: Bot, cmd: string, args: string[], raw: string): Promise<SkillResult> {
+async function dispatch(
+  bot: Bot,
+  sender: string,
+  cmd: string,
+  args: string[],
+  raw: string,
+): Promise<SkillResult> {
   switch (cmd) {
     case "say":
       return runSkill(bot, "say", { message: args.join(" ") }, (p) => say(bot, p));
@@ -105,6 +113,21 @@ async function dispatch(bot: Bot, cmd: string, args: string[], raw: string): Pro
       if (!type) return { ok: false, message: "usage: !remember <type> [name]" };
       const name = args.slice(1).join(" ").trim() || undefined;
       return runSkill(bot, "remember", { type, name }, (p) => remember(bot, p));
+    }
+
+    case "ask": {
+      const message = args.join(" ").trim();
+      if (!message) return { ok: false, message: "usage: !ask <message>" };
+      const agent = getAgent(bot.username);
+      if (!agent) return { ok: false, message: "no agent registered for this bot" };
+      if (agent.isRateLimited()) {
+        return { ok: false, message: "agent is rate-limited; try again later" };
+      }
+      agent.pushChat(
+        { channel: "chat", sender, message },
+        { channel: "chat", reason: "name-mention" },
+      );
+      return { ok: true, message: `pushed to ${bot.username}'s agent` };
     }
 
     default:
