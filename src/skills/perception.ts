@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Block } from "prismarine-block";
+import { getBotState } from "../state/index.js";
 import type { SkillResult } from "./types.js";
 
 const DEFAULT_RADIUS = 16;
@@ -47,9 +48,8 @@ export interface ObserveSurroundingsState {
   }>;
   nearbyDroppedItems: Array<{ item: string; count: number; dist: number }>;
   knownStorage: Array<unknown>;
-  // Stubs until slice 3 wires the in-process state stores.
   recentActions: string[];
-  recentlySeenPlayers: Array<{ name: string; lastSeen: number; lastPos: { x: number; y: number; z: number } }>;
+  recentlySeenPlayers: Array<{ name: string; lastSeen: number; lastPos: { x: number; y: number; z: number } | null }>;
   currentTask: string | null;
   remainingTasks: string[];
 }
@@ -102,6 +102,8 @@ export async function observeSurroundings(
   const held = bot.heldItem;
   const heldItem = held ? { name: held.name, count: held.count } : null;
 
+  const botState = getBotState(bot.username);
+
   return {
     ok: true,
     message: `${nearbyBlocks.length} block group(s), ${nearbyEntities.length} entit(ies) within ${radius} blocks`,
@@ -124,10 +126,10 @@ export async function observeSurroundings(
       nearbyEntities,
       nearbyDroppedItems,
       knownStorage: [],
-      recentActions: [],
-      recentlySeenPlayers: [],
-      currentTask: null,
-      remainingTasks: [],
+      recentActions: botState?.actions.recent() ?? [],
+      recentlySeenPlayers: botState?.presence.recentlySeen() ?? [],
+      currentTask: botState?.tasks.current() ?? null,
+      remainingTasks: botState?.tasks.remaining() ?? [],
     },
   };
 }

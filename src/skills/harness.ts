@@ -1,8 +1,22 @@
+import type { Bot } from "mineflayer";
+import { getBotState } from "../state/index.js";
 import type { SkillResult } from "./types.js";
 
 /**
+ * Skills whose result message is too noisy or chatty to be useful in the
+ * 5-minute action log surfaced via `observeSurroundings`.
+ */
+const ACTION_LOG_DENYLIST = new Set([
+  "observeSurroundings",
+  "say",
+  "whisper",
+  "stopMovement",
+]);
+
+/**
  * Wrap a skill in a try/catch so unexpected exceptions become
- * `{ ok: false, message }` results instead of taking down the bot.
+ * `{ ok: false, message }` results instead of taking down the bot, and
+ * record successful results to the bot's recent-actions log.
  *
  * Callers (the manual chat trigger now, the Claude tool dispatcher later)
  * should always go through this rather than invoking skill functions raw —
@@ -10,15 +24,23 @@ import type { SkillResult } from "./types.js";
  * remain unit-testable as plain async functions.
  */
 export async function runSkill<P, R extends SkillResult>(
+  bot: Bot,
   name: string,
   params: P,
   fn: (params: P) => Promise<R>,
 ): Promise<SkillResult> {
+  let result: SkillResult;
   try {
-    return await fn(params);
+    result = await fn(params);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[skill ${name}] threw:`, err);
-    return { ok: false, message: `${name} crashed: ${message}` };
+    result = { ok: false, message: `${name} crashed: ${message}` };
   }
+
+  if (result.ok && !ACTION_LOG_DENYLIST.has(name)) {
+    const state = getBotState(bot.username);
+    state?.actions.record(result.message);
+  }
+  return result;
 }

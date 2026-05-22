@@ -4,6 +4,7 @@ import { say } from "./chat.js";
 import { observeSurroundings } from "./perception.js";
 import { goTo, stopMovement } from "./movement.js";
 import { mineBlock } from "./world.js";
+import { getBotState } from "../state/index.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 /**
@@ -18,6 +19,8 @@ import type { GoToTarget, SkillResult } from "./types.js";
  *   !goto <player|mob> | !goto <x> <y> <z> | !goto block <name>
  *   !mine <block> [count]
  *   !stop
+ *   !queue <task1>; <task2>; ...   (debug: pokes the task-queue state store)
+ *   !advance                        (debug: advances the task queue)
  */
 export function attachChatTriggerHarness(bot: Bot, username: string): void {
   const tag = `[${username}]`;
@@ -37,7 +40,7 @@ export function attachChatTriggerHarness(bot: Bot, username: string): void {
     console.log(`${tag} chat-trigger from ${sender}: ${raw}`);
     busy = cmd !== "stop";
     try {
-      const result = await dispatch(bot, cmd, args);
+      const result = await dispatch(bot, cmd, args, raw);
       reply(bot, sender, channel, formatResult(cmd, result));
     } finally {
       busy = false;
@@ -48,14 +51,14 @@ export function attachChatTriggerHarness(bot: Bot, username: string): void {
   bot.on("whisper", (sender, message) => void handle(sender, message, "whisper"));
 }
 
-async function dispatch(bot: Bot, cmd: string, args: string[]): Promise<SkillResult> {
+async function dispatch(bot: Bot, cmd: string, args: string[], raw: string): Promise<SkillResult> {
   switch (cmd) {
     case "say":
-      return runSkill("say", { message: args.join(" ") }, (p) => say(bot, p));
+      return runSkill(bot, "say", { message: args.join(" ") }, (p) => say(bot, p));
 
     case "observe": {
       const radius = args[0] ? Number(args[0]) : undefined;
-      return runSkill("observeSurroundings", { radius }, (p) => observeSurroundings(bot, p));
+      return runSkill(bot, "observeSurroundings", { radius }, (p) => observeSurroundings(bot, p));
     }
 
     case "goto": {
@@ -66,7 +69,7 @@ async function dispatch(bot: Bot, cmd: string, args: string[]): Promise<SkillRes
           message: "usage: !goto <player|mob> | !goto <x> <y> <z> | !goto block <name>",
         };
       }
-      return runSkill("goTo", { target }, (p) => goTo(bot, p));
+      return runSkill(bot, "goTo", { target }, (p) => goTo(bot, p));
     }
 
     case "mine": {
@@ -76,11 +79,39 @@ async function dispatch(bot: Bot, cmd: string, args: string[]): Promise<SkillRes
       if (Number.isNaN(count) || count < 1) {
         return { ok: false, message: `count must be a positive integer (got "${args[1]}")` };
       }
-      return runSkill("mineBlock", { type, count }, (p) => mineBlock(bot, p));
+      return runSkill(bot, "mineBlock", { type, count }, (p) => mineBlock(bot, p));
     }
 
     case "stop":
       return stopMovement(bot);
+
+    case "queue": {
+      const state = getBotState(bot.username);
+      if (!state) return { ok: false, message: "no state registered for this bot" };
+      // Re-split the original line so semicolon tasks survive whitespace splitting above.
+      const body = raw.replace(/^!\w+\s*/, "");
+      const tasks = body.split(";").map((t) => t.trim()).filter((t) => t.length > 0);
+      if (tasks.length === 0) {
+        return { ok: false, message: "usage: !queue <task1>; <task2>; ..." };
+      }
+      state.tasks.set(tasks);
+      return {
+        ok: true,
+        message: `queue set: current="${state.tasks.current()}", remaining=${JSON.stringify(state.tasks.remaining())}`,
+      };
+    }
+
+    case "advance": {
+      const state = getBotState(bot.username);
+      if (!state) return { ok: false, message: "no state registered for this bot" };
+      const next = state.tasks.advance();
+      return {
+        ok: true,
+        message: next === null
+          ? "queue drained"
+          : `advanced: current="${next}", remaining=${JSON.stringify(state.tasks.remaining())}`,
+      };
+    }
 
     default:
       return { ok: false, message: `unknown command "!${cmd}"` };
