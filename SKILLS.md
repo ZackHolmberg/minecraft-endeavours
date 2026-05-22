@@ -153,8 +153,8 @@ Workflow per iteration:
 
 **Partial progress:** failure results include `state: { mined: <count> }` so the caller knows how far the skill got.
 
-**Known limitations** (revisit if testing exposes them):
-- Drop pickup relies on natural auto-collect + a 500ms wait. If items are left behind in practice, add an explicit pickup sweep.
+**Known limitations:**
+- **Drop pickup is unreliable.** Field-confirmed in the slice-3 smoke test for sand — the 500ms post-dig wait misses natural auto-collect often enough that the bot finishes "mining" with items still on the ground. Fix planned via an explicit pickup sweep after each dig (or land `pickUpNearby` and call it from the composite). Tracked in [ROADMAP.md → Slice-3 smoke-test follow-ups](ROADMAP.md).
 - Tool selection picks the last `canHarvest` match in inventory rather than computing fastest dig time.
 
 **Smoke tests:**
