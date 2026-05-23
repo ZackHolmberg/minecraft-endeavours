@@ -59,20 +59,32 @@ export async function runSkill<P, R extends SkillResult>(
 }
 
 /**
- * Conversation-continuity heuristic: when the bot says or whispers a line
- * ending in `?`, flag the target player for 30 seconds so their next chat
+ * Conversation-continuity heuristic: when the bot says or whispers a message
+ * containing `?`, flag the target player for 30 seconds so their next chat
  * routes back to this bot without requiring another name-mention. Pure
  * middleware — see ARCHITECTURE.md "Conversation continuity".
+ *
+ * Why `includes("?")` rather than `endsWith("?")`: the model often appends a
+ * short acknowledgment after the question ("What size? Let me know"), and
+ * the original strict-ends-with check missed those. A false positive (a
+ * non-question message that happens to contain `?`) just over-routes the
+ * player's next unaddressed chat to this bot for 30s, which is harmless.
  */
 function maybeNoteQuestion(bot: Bot, name: string, params: unknown, result: SkillResult): void {
   const sent = (result.state as { sent?: string } | undefined)?.sent?.trim();
-  if (!sent || !sent.endsWith("?")) return;
+  if (!sent || !sent.includes("?")) return;
 
   const target =
     name === "whisper"
       ? (params as { player?: string }).player
       : getCurrentConversationPartner(bot.username);
-  if (!target) return;
+  if (!target) {
+    console.log(
+      `[${bot.username}] continuity skipped — ?-message detected but no conversation partner to flag`,
+    );
+    return;
+  }
 
   noteBotQuestionedPlayer(bot.username, target);
+  console.log(`[${bot.username}] continuity armed for ${target} (30s)`);
 }
