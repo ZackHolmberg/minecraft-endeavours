@@ -218,16 +218,19 @@ Per-bot running dialog state held by the Claude Agent SDK. Short-term: verbatim 
 
 ## Bot state
 
-Per-bot in-memory state that middleware maintains so Claude doesn't have to track it from conversation history. Distinct from memory: these are short-lived or always-current, not durable facts about the world. All surfaced through `observeSurroundings`.
+Per-bot in-memory state that middleware maintains so Claude doesn't have to track it from conversation history. Distinct from memory: these are short-lived or always-current, not durable facts about the world. Most fields are surfaced to Claude through `observeSurroundings`; the in-flight tool name is observability-only (consumed by the dashboard).
 
 ### Recent actions log
-Rolling 5-minute log of bot activity, summarized to short phrases (`"mined 7 oak_log"`, `"walked 200 blocks"`, `"killed 2 zombies"`). The orchestrator appends entries from skill calls and notable mineflayer events; oldest entries drop off. When a player asks *"what have you been doing?"*, Claude reads the log rather than reconstructing from chat history. Not persisted across restarts in v0.2.
+Rolling 5-minute log of bot activity, summarized to short phrases (`"mined 7 oak_log"`, `"walked 200 blocks"`, `"killed 2 zombies"`). `runSkill` appends successful (non-noisy) skill messages; oldest entries drop off. When a player asks *"what have you been doing?"*, Claude reads the log rather than reconstructing from chat history. Not persisted across restarts in v0.2.
 
 ### Player presence
 Per-player table: online/offline, last-seen position, last-seen timestamp. Captured from mineflayer `playerJoin` / `playerLeave` / movement events. Currently-online nearby players appear in `nearbyEntities`; offline-but-recently-seen players appear in `recentlySeenPlayers`. Useful for answering "has Zack been on today?" without Claude guessing.
 
 ### Task queue
 When a player chains requests (*"get wood, then iron, then come back"*), Claude calls `setTaskQueue(["get wood", "get iron", "return"])` to declare the plan, then `advanceTaskQueue()` between items. The orchestrator persists the queue across turns and surfaces `currentTask` + `remainingTasks` in every `observeSurroundings` call. Claude doesn't have to remember the chain from conversation memory — the queue is always in the bot's view of the world.
+
+### Current tool (observability-only)
+Name + start timestamp of the skill currently executing for this bot. Set/cleared by `runSkill` (`src/skills/harness.ts`) inside a `try/finally` so it's always reset even on exception. Read by the v0.3 dashboard via `getBotSnapshot` to render the live `DOING` field; **not surfaced through `observeSurroundings`** — Claude doesn't need to see its own in-flight tool (it called it).
 
 ### Why the split
 - **World knowledge is exact** — programmatic capture beats Claude summarization for facts (*"7 oak_log in the chest"* vs. *"a few logs I think"*).
@@ -249,52 +252,62 @@ When a player chains requests (*"get wood, then iron, then come back"*), Claude 
 
 ## Project layout
 
-TypeScript project at the repo root.
+TypeScript project at the repo root. The actual tree is below; some files in the design (e.g. additional per-skill modules under `skills/`, `memory/conversation.ts`) are deferred — see SKILLS.md status table and ROADMAP.md.
 
 ```
 package.json
 tsconfig.json
 src/
-  index.ts                  # entry — loads config, starts orchestrator
+  index.ts                  # entry — installs log buffer, loads config, starts supervisors + agents, optional dashboard
+  mineflayer-glue/
+    bot-factory.ts          # supervisor + reconnect + per-bot registry + state/connectedSince/bot getters
+    event-hooks.ts          # wires bot chat/player events → state stores + chat router
   orchestrator/
-    supervisor.ts           # spawns / monitors NPC agents, handles reconnect
-    chat-router.ts          # filters chat events, routes to addressed bot
+    chat-router.ts          # filters chat events, routes to addressed bot (name-mention / @all / whisper / continuation)
   agent/
-    npc-agent.ts            # per-bot Claude Agent SDK loop
+    npc-agent.ts            # per-bot Claude Agent SDK loop, async user-message queue, rate-limit cooldown, usage retention
+    skill-tools.ts          # MCP-wrapped skill registration for the SDK (Zod schemas + namespaced tool names)
     system-prompt.ts        # prompt template
-    behavior.ts             # default / clarify / propose decision logic
+    behavior.ts             # model-id mapping, RateLimitCooldown
   skills/
-    index.ts                # combines and exports as tool set
-    perception.ts           # observeSurroundings, findBlock, findEntity, checkInventory
-    movement.ts             # goTo, followPlayer, stop, lookAt
-    world.ts                # mineBlock, placeBlock, activateBlock
-    inventory.ts            # pickUpNearby, equipItem, dropItem, giveItemTo
-    crafting.ts             # craft
-    combat.ts               # attack, flee
+    index.ts                # re-exports
+    types.ts                # SkillResult, GoToTarget, shared param types
+    harness.ts              # runSkill — exception trap, actions log, currentTool tracking, ?-question continuity
     chat.ts                 # say, whisper
-    meta.ts                 # wait, remember
-    types.ts                # SkillResult, shared param types
-  memory/
-    world-knowledge.ts      # read/write per-bot world.json
-    conversation.ts         # in-process conversation state
+    perception.ts           # observeSurroundings
+    movement.ts             # goTo, stopMovement (orphaned helper; full `stop` skill pending)
+    world.ts                # mineBlock
+    meta.ts                 # remember, setTaskQueue, advanceTaskQueue
+    (pending) inventory.ts / crafting.ts / combat.ts                 # skill batches per ROADMAP slice-3 follow-ups
   state/
+    index.ts                # BotState bundle + per-bot registry
     actions-log.ts          # rolling 5-min recent actions per bot
     player-presence.ts      # online/offline + last-seen tracking
     task-queue.ts           # per-bot multi-task queue
-  mineflayer-glue/
-    bot-factory.ts          # creates mineflayer bot with pathfinder + reconnect
-    event-hooks.ts          # wires bot events → world-knowledge captures + chat router
-  config.ts                 # loads config/bots.yml, validates shape
-  types.ts                  # cross-cutting types
+    current-tool.ts         # in-flight skill name + start timestamp (set by runSkill; read by snapshot/dashboard)
+  memory/
+    world-knowledge.ts      # read/write per-bot world.json (pois[]; containers[] populated once auto-capture lands)
+  observability/
+    log-buffer.ts           # ring buffer wrapping console.log/info/warn/error; subscribe + forwarding toggle
+    snapshot.ts             # getBotSnapshot(username) → plain JSON-serializable struct; used by dashboard + future HTTP/WS
+  dashboard/
+    index.ts                # multi-bot blessed-contrib TUI; Tab cycles bots; mounted when DASHBOARD=1
+    blessed-contrib.d.ts    # ambient shim (no @types/blessed-contrib on DefinitelyTyped)
+  config.ts                 # loads config/bots.yml, validates shape, MC_VERSION pin
+  types.ts                  # cross-cutting types (BotConfig, ModelHint, …)
 config/
   bots.yml                  # versioned
 data/orchestrator/memory/<bot-username>/world.json   # per-bot world knowledge (gitignored via data/)
 scripts/
-  dev.sh                    # NEW: brings up MC + runs orchestrator in foreground
+  dev.sh                    # MC up + orchestrator (host, foreground, tsx watch)
+  dashboard.sh              # MC up + orchestrator with dashboard mounted (no watch — blessed and hot reload don't mix)
   start.sh, stop.sh, backup.sh, console.sh           # existing
+spikes/
+  sdk-spike.ts              # pinned SDK answers — see SDK_NOTES.md
+  dashboard-spike.ts        # v0.3 phase 0 — confirmed blessed-contrib renders before wiring real data
 ```
 
-Layer-named directories match the architecture's layer stack. `mineflayer-glue/` isolates the raw mineflayer surface — if we ever swap bot clients, only this directory changes.
+Layer-named directories match the architecture's layer stack. `mineflayer-glue/` isolates the raw mineflayer surface — if we ever swap bot clients, only this directory changes. `observability/` and `dashboard/` are pure consumers — they read from the registries set up by lower layers and never write back into agent / skill / orchestrator state.
 
 **Language:** TypeScript. Type-checked skill params, `observeSurroundings` output, and `world.json` schema catch a lot of bugs at compile time. Dev iteration is fast via `tsx`; Docker prod compiles to JS.
 

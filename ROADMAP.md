@@ -5,8 +5,9 @@ Where the project is going. Items we've intentionally deferred from current work
 ## Versioning
 
 - **v0.1** — Plain Paper server in Docker with DuckDNS dynamic DNS. ✅ Shipped.
-- **v0.2** — First AI NPC: one bot, chat-driven (name-mention / `/msg` / `@all`), full skill catalogue, offline-mode + whitelist. 🚧 In progress — design phase. See [ARCHITECTURE.md](ARCHITECTURE.md).
-- **v0.3+** — Backlog below. Version tags are tentative; assigned only where there's a clear next step.
+- **v0.2** — First AI NPC: one bot, chat-driven (name-mention / `/msg` / `@all`), partial skill catalogue (8 of 24 skills), offline-mode + whitelist. ✅ Shipped. See [ARCHITECTURE.md](ARCHITECTURE.md).
+- **v0.3** — In-terminal dashboard for orchestrator + bot state (4 phases: blessed-contrib spike → orchestrator instrumentation → `getBotSnapshot` aggregator → single-bot layout → multi-bot tabs + sparkline + error highlighting). ✅ Shipped. Run via `./scripts/dashboard.sh` or `DASHBOARD=1 npm run start`.
+- **v0.3+** — Backlog below. Next up: the pending skill batches (priority + follow-on) to fill out the rest of the v0.2 catalogue. Version tags are tentative; assigned only where there's a clear next step.
 
 ---
 
@@ -41,9 +42,29 @@ These five together would cover the most-frequent gaps observed. Bundle as one s
 - **Rate-limit cooldown.** `SDKRateLimitEvent` with `status: "rejected"` triggers the whisper-and-drop path. Pro quota was healthy during smoke testing — the rejected branch hasn't actually run. Will exercise itself the first time we burn a 5-hour window.
 - **Reconnect of an active agent session.** The supervisor's reconnect logic existed before slice 3, but slice 3 added the per-bot agent lifecycle (`registerAgent` replaces the existing one and `stop()`s it). Tearing down a live SDK session mid-conversation and rebuilding it on the new bot connection isn't field-tested. Force a disconnect (kill the MC server briefly) during an active turn to verify the agent rebuilds cleanly.
 
-### In-terminal dashboard for orchestrator + bot state
+### In-terminal dashboard for orchestrator + bot state — ✅ shipped in v0.3
 
-**Why deferred:** Useful but not blocking — the current console.log stream is sufficient for development. Earns its keep as bot count grows, as observability becomes a debugging bottleneck, or when "what's Claude using its quota on?" becomes a real question.
+Four-phase build landed on `main`:
+- **Phase 0** — `spikes/dashboard-spike.ts`. Confirmed `blessed-contrib` renders on this terminal before wiring real data.
+- **Phase 1** — orchestrator instrumentation: `agent.sessionUsage` / `lastTurnUsage` / `lastTurnError` retained, `latestRateLimitInfo` payload kept verbatim, `BotState.currentTool` tracker, `BotSupervisor.state` + `connectedSince` + `bot` getters, ring-buffer logger (`src/observability/log-buffer.ts`) that monkey-patches `console.*` with optional forwarding and pub/sub subscribers.
+- **Phase 2** — `getBotSnapshot(username)` plain-object aggregator at `src/observability/snapshot.ts`. Reusable for a future HTTP/WebSocket API.
+- **Phase 3** — single-bot layout at `src/dashboard/index.ts`: status panel + token/Pro-window panel + recent-actions list + live log pane, polled at 500ms.
+- **Phase 4** — multi-bot tabs (Tab / Shift-Tab), per-turn cache-hit `contrib.sparkline`, red `LAST ERR` banner from `agent.lastTurnError`.
+
+Run with `./scripts/dashboard.sh` (brings up MC + orchestrator + dashboard) or `DASHBOARD=1 npm run start` if MC is already up.
+
+**Still deferred (post-v0.3):**
+- **IPC split** — dashboard and orchestrator share one Node process today; quitting the dashboard SIGINTs the orchestrator. Split via Unix socket / WebSocket when restarting the dashboard without dropping bots becomes useful.
+- **Log filtering** — pane shows orchestrator-wide log; no per-bot filter when tabbed to one bot. Add `[username]`-prefix filter on the active tab.
+- **SDK subprocess stdout capture** — the Agent SDK spawns Claude Code as a subprocess. Its own stdout/stderr currently bypasses the ring buffer; only `console.*` calls from this process are captured. Pipe the subprocess streams into the ring buffer if/when a real bug hides there.
+- **Cost projections** — `lastTurnUsage.total_cost_usd` and `sessionUsage.total_cost_usd` shown; no projection to the 5-hour window's likely spend. Easy add when the data justifies it.
+- **Pro window precision (verify in live use)** — `rate_limit_info.utilization` may only populate at `allowed_warning`. Confirmed in early testing that `status: "allowed"` events ship without it. Dashboard falls back to `status + resetsAt countdown` until `utilization` shows up.
+
+---
+
+The remainder of this section preserves the original design context for future debugging / extension. **Below this line is design history, not active work.**
+
+---
 
 **Goal:** A live TUI showing per-bot state (location, current activity, health, task queue, conversation partner), Pro 5-hour-window token usage, per-turn token breakdown, recent skill activity, and a live log pane — without losing the existing log stream that's invaluable when something blows up unexpectedly.
 

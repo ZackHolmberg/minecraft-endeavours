@@ -12,7 +12,10 @@ and returns the same shape regardless of success:
 { ok: boolean, message: string, state?: object }
 ```
 
-**Failure messages are written for Claude's consumption** — they must be specific enough that the model can adapt (`"no oak_log within 64 blocks"`, not `"failed"`). Wrap every call site in `runSkill(bot, name, params, fn)` so unexpected exceptions become `{ ok: false, message }` results instead of taking down the bot. `runSkill` also records successful, non-noisy results to the bot's [recent-actions log](../src/state/actions-log.ts) and flips the conversation-continuity flag when `say`/`whisper` produces a `?`-terminated message.
+**Failure messages are written for Claude's consumption** — they must be specific enough that the model can adapt (`"no oak_log within 64 blocks"`, not `"failed"`). Wrap every call site in `runSkill(bot, name, params, fn)` so unexpected exceptions become `{ ok: false, message }` results instead of taking down the bot. `runSkill` also:
+- records successful, non-noisy results to the bot's [recent-actions log](../src/state/actions-log.ts),
+- flips the conversation-continuity flag when `say` / `whisper` produces a `?`-terminated message,
+- tracks the in-flight skill name on `BotState.currentTool` (in a `try / finally`, so it always clears) — the v0.3 dashboard reads this for its live `DOING` field.
 
 For higher-level design (catalogue, principles, push-work-down-the-stack), see [ARCHITECTURE.md](ARCHITECTURE.md).
 
