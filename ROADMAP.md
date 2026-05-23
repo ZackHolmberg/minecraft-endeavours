@@ -18,12 +18,13 @@ Where the project is going. Items we've intentionally deferred from current work
 
 **`mineBlock` doesn't always pick up dropped items** (confirmed bug). Field-tested with sand: bot finishes the composite with items still on the ground. The 500ms post-dig wait relies on natural auto-collect which isn't reliable across block types. Fix: either sweep for dropped items in a small radius after each dig, or land `pickUpNearby` (below) and call it from `mineBlock`. Pulling in `mineflayer-collectblock` is the alternative. See [SKILLS.md → mineBlock → Known limitations](SKILLS.md).
 
-**Next skill batch (priority from smoke-test demand).** Four pending skills surfaced repeatedly in real play within minutes of going live:
+**Next skill batch (priority from smoke-test demand).** Five pending skills surfaced repeatedly in real play within minutes of going live:
 - `pickUpNearby` — also resolves the `mineBlock` pickup issue without rewriting it.
 - `dropItem` and `giveItemTo` — players naturally ask the bot to hand off what it just gathered.
 - `followPlayer` — "follow me until I say stop" was an immediate request the bot had to decline.
+- `placeBlock` — gathering without placing is half the loop. Surfaced during v0.3 dashboard testing when the bot couldn't act on a "put that block there" follow-up. Signature already specified in ARCHITECTURE.md (`type, position`); mineflayer's `bot.placeBlock(referenceBlock, faceVector)` needs an adjacent-face derivation from the requested target position.
 
-These four together would cover the most-frequent gaps observed. Bundle as one slice rather than landing piecemeal.
+These five together would cover the most-frequent gaps observed. Bundle as one slice rather than landing piecemeal.
 
 **Field-untested code paths from slice 3.** Implementations exist; smoke testing didn't exercise them. Each needs a deliberate live test before being trusted.
 - **Chat router's 30s conversation-continuity heuristic.** Routing logs confirmed it fires correctly in isolation, but it's never been triggered by a real bot question followed by an addressee-less reply. Live test plan: post-phase-5 cutover, ask the bot something vague enough to provoke a clarifying question (`?`-terminated), then reply without using its name; expect `reason=continuation` in the dispatch.

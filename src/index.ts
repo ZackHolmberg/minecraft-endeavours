@@ -62,3 +62,17 @@ const shutdown = async (signal: string): Promise<void> => {
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// Optional dashboard. Single-process model — quitting the dashboard SIGINTs
+// the orchestrator. Dynamic import so the blessed/blessed-contrib trees only
+// load when actually needed.
+if (process.env.DASHBOARD === "1") {
+  const target = allBotUsernames[0];
+  if (!target) {
+    console.warn("DASHBOARD=1 set but no bots configured");
+  } else {
+    void import("./dashboard/index.js").then(({ mountDashboard }) => {
+      mountDashboard(target);
+    });
+  }
+}
