@@ -1,23 +1,26 @@
 /**
- * Single-bot terminal dashboard. Polls `getBotSnapshot(username)` every
- * ~500ms and renders into a `blessed-contrib` grid:
+ * Multi-bot terminal dashboard. Polls `getBotSnapshot()` for the active bot
+ * every ~500ms and renders into a `blessed-contrib` grid:
  *
- *   ┌── status (bot, position, hp/food, task, talk, net) ──┬── 5h Pro window + tokens ──┐
- *   │                                                       │                            │
- *   ├───────────────────────────────────────────────────────┴────────────────────────────┤
- *   │ Recent actions (last 5 min, from state.actions)                                    │
- *   ├────────────────────────────────────────────────────────────────────────────────────┤
- *   │ Log (live tail of console output via the ring-buffer logger)                       │
- *   └────────────────────────────────────────────────────────────────────────────────────┘
+ *   ┌── [1/N] bot · Tab to cycle ───────────┬── 5h Pro window · Tokens ─┐
+ *   │ STATE / DOING / POS / HP+FOOD / ...   │ status / util / resets    │
+ *   │ TIME / TASK / QUEUE / TALK / NET      │ Last turn / Session       │
+ *   │                                       ├── cache-hit % ────────────┤
+ *   │                                       │ sparkline                 │
+ *   ├───────────────────────────────────────┴───────────────────────────┤
+ *   │ Recent actions (active bot)                                       │
+ *   ├───────────────────────────────────────────────────────────────────┤
+ *   │ Log (orchestrator-wide; error/warn lines colorized)               │
+ *   └───────────────────────────────────────────────────────────────────┘
  *
- * Mounted by `src/index.ts` when `DASHBOARD=1` is set. Quit with q / Esc /
- * Ctrl+C — exits the whole orchestrator (single-process model per ROADMAP;
- * IPC split is future work).
+ * Mounted by `src/index.ts` when `DASHBOARD=1`. Tab / Shift-Tab cycle bots.
+ * Quit with q / Esc / Ctrl+C — SIGINTs the orchestrator (single-process).
  */
 
 import blessed from "blessed";
 import contrib from "blessed-contrib";
 
+import { listSupervisors } from "../mineflayer-glue/bot-factory.js";
 import {
   getRecentLogs,
   setLogForwarding,
@@ -29,38 +32,60 @@ import { getBotSnapshot, type BotSnapshot } from "../observability/snapshot.js";
 const POLL_MS = 500;
 const ACTIONS_MAX = 50;
 const LOG_BACKFILL = 80;
+const CACHE_HISTORY_MAX = 30;
+const ERROR_BANNER_TTL_MS = 5 * 60 * 1000;
 
 export interface DashboardHandle {
   unmount(): void;
 }
 
-export function mountDashboard(username: string): DashboardHandle {
+/**
+ * Mount the dashboard. With no args, cycles through every registered bot.
+ * For deterministic testing, pass an explicit list.
+ */
+export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
+  const initial =
+    usernames && usernames.length > 0
+      ? [...usernames]
+      : listSupervisors().map((s) => s.username);
+
+  if (initial.length === 0) {
+    console.warn("dashboard: no bots registered; aborting mount");
+    return { unmount: () => undefined };
+  }
+
   // Blessed owns the terminal once the screen is created — stop letting
-  // console.log writes paint over the alt-screen render. Everything still
-  // lands in the ring buffer, so the log pane stays complete.
+  // console.log writes paint over the alt-screen render.
   setLogForwarding(false);
 
   const screen = blessed.screen({
     smartCSR: true,
-    title: `minecraft-endeavours · ${username}`,
+    title: `minecraft-endeavours · ${initial[0]}`,
   });
 
   const grid = new contrib.grid({ rows: 12, cols: 12, screen });
 
   const statusBox = grid.set(0, 0, 6, 7, blessed.box, {
-    label: ` ${username} `,
+    label: "",
     tags: true,
     border: { type: "line" },
     style: { border: { fg: "cyan" } },
     padding: { left: 1, right: 1 },
   });
 
-  const tokenBox = grid.set(0, 7, 6, 5, blessed.box, {
+  const tokenBox = grid.set(0, 7, 4, 5, blessed.box, {
     label: " 5h Pro window · Tokens ",
     tags: true,
     border: { type: "line" },
     style: { border: { fg: "cyan" } },
     padding: { left: 1, right: 1 },
+  });
+
+  const sparkline = grid.set(4, 7, 2, 5, contrib.sparkline, {
+    label: " Cache hit % (per turn) ",
+    tags: true,
+    style: { fg: "green", titleFg: "white" },
+    border: { type: "line", fg: "cyan" },
   });
 
   const actionsBox = grid.set(6, 0, 3, 12, blessed.list, {
@@ -88,17 +113,74 @@ export function mountDashboard(username: string): DashboardHandle {
     screen.render();
   });
 
+  // ─── Multi-bot state ──────────────────────────────────────────────────────
+  let usernamesView: string[] = [...initial];
+  let activeIndex = 0;
+  // Per-bot cache-hit history (last N turns).
+  const cacheHistory = new Map<string, number[]>();
+  // Per-bot last seen turn count — used to detect when a new turn lands.
+  const lastSeenTurns = new Map<string, number>();
+  for (const u of usernamesView) {
+    cacheHistory.set(u, []);
+    lastSeenTurns.set(u, 0);
+  }
+
+  const refreshUsernames = (): void => {
+    // Pick up bots added later (none today, but future-proof).
+    const fresh = listSupervisors().map((s) => s.username);
+    if (fresh.length === 0) return;
+    const merged = [...new Set([...usernamesView, ...fresh])].filter((u) =>
+      fresh.includes(u),
+    );
+    if (merged.join("|") !== usernamesView.join("|")) {
+      usernamesView = merged;
+      for (const u of usernamesView) {
+        if (!cacheHistory.has(u)) cacheHistory.set(u, []);
+        if (!lastSeenTurns.has(u)) lastSeenTurns.set(u, 0);
+      }
+      if (activeIndex >= usernamesView.length) activeIndex = 0;
+    }
+  };
+
+  const cycle = (delta: number): void => {
+    refreshUsernames();
+    if (usernamesView.length === 0) return;
+    activeIndex =
+      (activeIndex + delta + usernamesView.length) % usernamesView.length;
+    tick();
+  };
+
+  // ─── Render tick ──────────────────────────────────────────────────────────
   const tick = (): void => {
+    refreshUsernames();
+    const username = usernamesView[activeIndex];
+    if (!username) {
+      statusBox.setContent("\n  {red-fg}no bots registered{/}");
+      screen.render();
+      return;
+    }
+
+    statusBox.setLabel(renderStatusLabel(username, activeIndex, usernamesView.length));
+
     const snap = getBotSnapshot(username);
     if (!snap) {
       statusBox.setContent(`\n  {red-fg}unknown bot: ${username}{/}`);
       tokenBox.setContent("");
+      sparkline.setData(["cache %"], [[]]);
       actionsBox.setItems([]);
-    } else {
-      statusBox.setContent(renderStatusPanel(snap));
-      tokenBox.setContent(renderTokenPanel(snap));
-      actionsBox.setItems(snap.state.recentActions.slice(-ACTIONS_MAX).reverse());
+      screen.render();
+      return;
     }
+
+    // Update cache-hit history for every bot whenever a new turn lands, not
+    // just the active one — so switching tabs shows a populated sparkline.
+    updateCacheHistoryForAllBots(cacheHistory, lastSeenTurns);
+
+    statusBox.setContent(renderStatusPanel(snap));
+    tokenBox.setContent(renderTokenPanel(snap));
+    sparkline.setData(["cache %"], [cacheHistory.get(username) ?? []]);
+    actionsBox.setItems(snap.state.recentActions.slice(-ACTIONS_MAX).reverse());
+    screen.title = `minecraft-endeavours · ${username}`;
     screen.render();
   };
 
@@ -117,17 +199,52 @@ export function mountDashboard(username: string): DashboardHandle {
 
   screen.key(["q", "C-c", "escape"], () => {
     unmount();
-    // Bring the orchestrator down with the dashboard — single-process model.
     process.kill(process.pid, "SIGINT");
   });
+  screen.key(["tab"], () => cycle(1));
+  screen.key(["S-tab"], () => cycle(-1));
 
   screen.render();
   return { unmount };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-bot cache-hit history. Polled rather than event-driven so we don't have
+// to thread a callback into the agent — the snapshot already tells us when
+// turn count increments.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function updateCacheHistoryForAllBots(
+  cacheHistory: Map<string, number[]>,
+  lastSeenTurns: Map<string, number>,
+): void {
+  for (const username of cacheHistory.keys()) {
+    const snap = getBotSnapshot(username);
+    if (!snap?.agent) continue;
+    const turns = snap.agent.sessionUsage.turns;
+    const prevTurns = lastSeenTurns.get(username) ?? 0;
+    if (turns <= prevTurns) continue;
+
+    lastSeenTurns.set(username, turns);
+    const t = snap.agent.lastTurnUsage;
+    if (!t) continue;
+    const totalIn = t.input_tokens + t.cache_creation_input_tokens + t.cache_read_input_tokens;
+    const pct = totalIn > 0 ? (t.cache_read_input_tokens / totalIn) * 100 : 0;
+    const history = cacheHistory.get(username) ?? [];
+    history.push(Math.round(pct));
+    while (history.length > CACHE_HISTORY_MAX) history.shift();
+    cacheHistory.set(username, history);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Panel renderers
 // ─────────────────────────────────────────────────────────────────────────────
+
+function renderStatusLabel(username: string, index: number, total: number): string {
+  if (total <= 1) return ` ${username} `;
+  return ` [${index + 1}/${total}] ${username} · Tab to cycle `;
+}
 
 function renderStatusPanel(snap: BotSnapshot): string {
   const lines: string[] = [];
@@ -179,6 +296,15 @@ function renderStatusPanel(snap: BotSnapshot): string {
     ? `${conn.state} · uptime ${formatDuration(conn.uptimeMs)}`
     : conn.state;
   lines.push(`{bold}NET{/}      {${stateColor}-fg}${netLine}{/}`);
+
+  // Error banner — only show if recent enough to still be relevant.
+  if (agent?.lastTurnError) {
+    const age = snap.capturedAt - agent.lastTurnError.at;
+    if (age < ERROR_BANNER_TTL_MS) {
+      lines.push("");
+      lines.push(`{red-fg}{bold}LAST ERR{/} ${agent.lastTurnError.subtype} ({gray-fg}${formatDuration(age)} ago{/}){/}`);
+    }
+  }
 
   return lines.join("\n");
 }
@@ -251,8 +377,6 @@ function formatLogLine(entry: LogEntry): string {
     entry.level === "error" ? "red-fg" :
     entry.level === "warn" ? "yellow-fg" :
     "white-fg";
-  // Strip the alt-screen-corrupting carriage returns mineflayer occasionally
-  // emits, and collapse newlines so each entry is one log line.
   const text = entry.text.replace(/\r/g, "").replace(/\n/g, " ");
   return `${ts} {${color}}${text}{/}`;
 }

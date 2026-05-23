@@ -67,12 +67,12 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 // the orchestrator. Dynamic import so the blessed/blessed-contrib trees only
 // load when actually needed.
 if (process.env.DASHBOARD === "1") {
-  const target = allBotUsernames[0];
-  if (!target) {
+  if (allBotUsernames.length === 0) {
     console.warn("DASHBOARD=1 set but no bots configured");
   } else {
     void import("./dashboard/index.js").then(({ mountDashboard }) => {
-      mountDashboard(target);
+      // No-arg form pulls every registered bot; the dashboard cycles via Tab.
+      mountDashboard();
     });
   }
 }

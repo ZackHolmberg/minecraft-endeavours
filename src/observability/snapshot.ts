@@ -18,6 +18,7 @@
 import type { Bot } from "mineflayer";
 import {
   getAgent,
+  type LastTurnError,
   type RateLimitInfo,
   type SessionUsage,
   type TurnUsage,
@@ -72,6 +73,7 @@ export interface AgentFields {
   rateLimitInfo: RateLimitInfo | null;
   lastTurnUsage: TurnUsage | null;
   sessionUsage: SessionUsage;
+  lastTurnError: LastTurnError | null;
 }
 
 /**
@@ -166,6 +168,7 @@ function snapshotAgentFields(username: string): AgentFields | null {
     rateLimitInfo: agent.getRateLimitInfo(),
     lastTurnUsage: agent.getLastTurnUsage(),
     sessionUsage: agent.getSessionUsage(),
+    lastTurnError: agent.getLastTurnError(),
   };
 }
 

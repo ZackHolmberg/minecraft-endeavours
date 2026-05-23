@@ -61,6 +61,17 @@ export interface SessionUsage extends TurnUsage {
  */
 export type RateLimitInfo = Record<string, unknown>;
 
+/**
+ * Most recent non-success terminal result. Retained until a successful turn
+ * arrives so the dashboard can surface "last turn errored" without polling
+ * the log stream. `error_during_execution` / `error_max_turns` / `error_max_budget_usd`
+ * are the SDK's known subtypes; we store whatever string the SDK gives us.
+ */
+export interface LastTurnError {
+  subtype: string;
+  at: number;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Async queue feeding the SDK's streaming-input prompt.
 // Single-producer / single-consumer (the SDK iterates).
@@ -135,6 +146,7 @@ export class NpcAgent {
   };
   private lastTurnUsage: TurnUsage | null = null;
   private latestRateLimitInfo: RateLimitInfo | null = null;
+  private lastTurnError: LastTurnError | null = null;
 
   constructor(private readonly opts: NpcAgentOptions) {
     this.start();
@@ -240,10 +252,12 @@ export class NpcAgent {
             this.sessionUsage.total_cost_usd += turn.total_cost_usd;
           }
           this.sessionUsage.turns += 1;
+          this.lastTurnError = null;
           console.log(
             `${tag} turn complete (cache_read=${turn.cache_read_input_tokens}, out=${turn.output_tokens})`,
           );
         } else {
+          this.lastTurnError = { subtype: msg.subtype, at: Date.now() };
           console.warn(`${tag} turn ended: ${msg.subtype}`);
         }
         return;
@@ -305,6 +319,10 @@ export class NpcAgent {
 
   getCooldownRemainingMinutes(): number {
     return this.cooldown.remainingMinutes();
+  }
+
+  getLastTurnError(): LastTurnError | null {
+    return this.lastTurnError ? { ...this.lastTurnError } : null;
   }
 
   async stop(): Promise<void> {

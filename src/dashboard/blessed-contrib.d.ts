@@ -58,13 +58,25 @@ declare module "blessed-contrib" {
     setData(percent: number): void;
   }
 
+  interface SparklineOptions {
+    label?: string;
+    tags?: boolean;
+    style?: { fg?: string; titleFg?: string };
+    border?: { type?: "line" | "bg"; fg?: string };
+  }
+  interface SparklineWidget extends Widgets.BlessedElement {
+    setData(titles: string[], datasets: number[][]): void;
+  }
+
   const _default: {
     grid: typeof Grid;
     log: WidgetFactory<LogOptions, LogWidget>;
     gauge: WidgetFactory<GaugeOptions, GaugeWidget>;
+    sparkline: WidgetFactory<SparklineOptions, SparklineWidget>;
   };
   export default _default;
   export const grid: typeof Grid;
   export const log: WidgetFactory<LogOptions, LogWidget>;
   export const gauge: WidgetFactory<GaugeOptions, GaugeWidget>;
+  export const sparkline: WidgetFactory<SparklineOptions, SparklineWidget>;
 }
