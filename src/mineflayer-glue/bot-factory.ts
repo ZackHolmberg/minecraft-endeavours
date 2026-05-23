@@ -20,6 +20,8 @@ export interface BotSupervisor {
   readonly state: BotConnectionState;
   /** Unix-ms timestamp of the most recent successful `spawn`, or null. */
   readonly connectedSince: number | null;
+  /** The current mineflayer Bot instance, or null while disconnected. */
+  readonly bot: Bot | null;
   stop(): Promise<void>;
 }
 
@@ -114,6 +116,9 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
     get connectedSince(): number | null {
       return connectedSince;
     },
+    get bot(): Bot | null {
+      return currentBot;
+    },
     async stop() {
       stopped = true;
       if (reconnectTimer) {
@@ -138,4 +143,28 @@ function formatPos(bot: Bot): string {
   const p = bot.entity?.position;
   if (!p) return "unknown";
   return `${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-bot supervisor registry. Matches the agent + state registry pattern so
+// observability helpers (snapshot, dashboard) can look up by username without
+// holding the supervisor array from index.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const supervisors = new Map<string, BotSupervisor>();
+
+export function registerSupervisor(supervisor: BotSupervisor): void {
+  supervisors.set(supervisor.username, supervisor);
+}
+
+export function unregisterSupervisor(username: string): void {
+  supervisors.delete(username);
+}
+
+export function getSupervisor(username: string): BotSupervisor | null {
+  return supervisors.get(username) ?? null;
+}
+
+export function listSupervisors(): BotSupervisor[] {
+  return [...supervisors.values()];
 }

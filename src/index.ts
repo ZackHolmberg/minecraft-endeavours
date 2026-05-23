@@ -1,6 +1,11 @@
 import { NpcAgent, registerAgent, unregisterAgent } from "./agent/npc-agent.js";
 import { loadConfig } from "./config.js";
-import { startBotSupervisor, type BotSupervisor } from "./mineflayer-glue/bot-factory.js";
+import {
+  registerSupervisor,
+  startBotSupervisor,
+  unregisterSupervisor,
+  type BotSupervisor,
+} from "./mineflayer-glue/bot-factory.js";
 import { attachBotEventHooks } from "./mineflayer-glue/event-hooks.js";
 import { installLogBuffer } from "./observability/log-buffer.js";
 import { createBotState, registerBotState, unregisterBotState } from "./state/index.js";
@@ -22,7 +27,7 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
   const state = createBotState();
   registerBotState(botConfig.username, state);
 
-  return startBotSupervisor({
+  const supervisor = startBotSupervisor({
     botConfig,
     host: config.mcHost,
     port: config.mcPort,
@@ -36,6 +41,8 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
       attachBotEventHooks(bot, botConfig.username, allBotUsernames, state);
     },
   });
+  registerSupervisor(supervisor);
+  return supervisor;
 });
 
 let shuttingDown = false;
@@ -45,7 +52,10 @@ const shutdown = async (signal: string): Promise<void> => {
   console.log(`orchestrator: received ${signal}, disconnecting bots`);
   await Promise.all(supervisors.map((s) => s.stop()));
   await Promise.all(supervisors.map((s) => unregisterAgent(s.username)));
-  for (const s of supervisors) unregisterBotState(s.username);
+  for (const s of supervisors) {
+    unregisterBotState(s.username);
+    unregisterSupervisor(s.username);
+  }
   console.log("orchestrator: bye");
   process.exit(0);
 };
