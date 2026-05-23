@@ -17,7 +17,11 @@ import type { Bot } from "mineflayer";
 import { z } from "zod";
 import {
   advanceTaskQueue,
+  attack,
+  craft,
+  depositToChest,
   dropItem,
+  flee,
   followPlayer,
   giveItemTo,
   goTo,
@@ -30,6 +34,7 @@ import {
   setTaskQueue,
   stop,
   whisper,
+  withdrawFromChest,
 } from "../skills/index.js";
 import { runSkill } from "../skills/harness.js";
 import type { SkillResult } from "../skills/types.js";
@@ -48,6 +53,11 @@ const SKILL_NAMES = [
   "pickUpNearby",
   "dropItem",
   "giveItemTo",
+  "craft",
+  "attack",
+  "flee",
+  "depositToChest",
+  "withdrawFromChest",
   "remember",
   "setTaskQueue",
   "advanceTaskQueue",
@@ -171,6 +181,58 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
           count: z.number().int().min(1).max(2304).optional(),
         },
         async (args) => toToolResult(await runSkill(bot, "giveItemTo", args, (p) => giveItemTo(bot, p))),
+      ),
+
+      tool(
+        "craft",
+        "Craft `count` of `item`. Composite: resolve a recipe, walk to a crafting table if the recipe needs one (2×2 recipes use inventory; 3×3 need a table), call bot.craft. Table resolution order: caller-supplied `tablePos` → crafting_table within 32 blocks → nearest remembered crafting_table from world memory. Failure messages name the missing ingredient and shortfall count.",
+        {
+          item: z.string().min(1).describe("Item ID, e.g. 'oak_planks', 'iron_pickaxe'"),
+          count: z.number().int().min(1).max(64).optional(),
+          tablePos: posSchema.optional().describe("Explicit crafting table position; omit to auto-find"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "craft", args, (p) => craft(bot, p))),
+      ),
+
+      tool(
+        "attack",
+        "Attack `entity` (a mob name like 'zombie' or a player username) in melee. Equips the best available weapon, paths into range, swings on cooldown. Blocking; exits when the target dies, leaves visibility, or cancellation is requested (player says 'stop' / `stop` skill).",
+        { entity: z.string().min(1) },
+        async (args) => toToolResult(await runSkill(bot, "attack", args, (p) => attack(bot, p))),
+      ),
+
+      tool(
+        "flee",
+        "Run away from `from` (a mob name or player username) until `dist` blocks of separation, or cancellation. Re-paths every ~1.5s so a chasing threat doesn't end up running alongside the bot.",
+        {
+          from: z.string().min(1),
+          dist: z.number().int().min(1).max(64).optional().describe("Target separation in blocks (default 16)"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "flee", args, (p) => flee(bot, p))),
+      ),
+
+      tool(
+        "depositToChest",
+        "Walk to a chest and deposit items. When `pos` is omitted, picks the nearest known container from world memory. When `count` is omitted, deposits every matching stack in inventory. Container auto-capture snapshots the chest's new contents into world memory automatically.",
+        {
+          item: z.string().min(1).describe("Item ID to deposit"),
+          count: z.number().int().min(1).max(2304).optional(),
+          pos: posSchema.optional().describe("Explicit chest position; omit to use nearest known container"),
+        },
+        async (args) =>
+          toToolResult(await runSkill(bot, "depositToChest", args, (p) => depositToChest(bot, p))),
+      ),
+
+      tool(
+        "withdrawFromChest",
+        "Walk to a chest and withdraw items. When `pos` is omitted, picks the nearest known container whose remembered contents include the requested item. Verifies the chest actually has the item on open and adjusts the take count if memory was stale.",
+        {
+          item: z.string().min(1).describe("Item ID to withdraw"),
+          count: z.number().int().min(1).max(2304).optional(),
+          pos: posSchema.optional().describe("Explicit chest position; omit to use nearest known container with the item"),
+        },
+        async (args) =>
+          toToolResult(await runSkill(bot, "withdrawFromChest", args, (p) => withdrawFromChest(bot, p))),
       ),
 
       tool(

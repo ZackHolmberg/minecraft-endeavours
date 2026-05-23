@@ -1,5 +1,12 @@
 import type { Bot } from "mineflayer";
+import type { Block } from "prismarine-block";
+import type { Window } from "prismarine-windows";
 import { getAgent } from "../agent/npc-agent.js";
+import {
+  addPoi,
+  isUtilityBlockType,
+  upsertContainer,
+} from "../memory/world-knowledge.js";
 import {
   getCurrentConversationPartner,
   isAddressed,
@@ -15,6 +22,47 @@ import type { BotState } from "../state/index.js";
  */
 const CANCELLABLE_SKILLS = new Set(["followPlayer", "attack", "flee"]);
 const STOP_REGEX = /\b(stop|halt|wait)\b/i;
+
+const CONTAINER_BLOCK_TYPES = new Set([
+  "chest",
+  "trapped_chest",
+  "barrel",
+  "shulker_box",
+  "white_shulker_box",
+  "orange_shulker_box",
+  "magenta_shulker_box",
+  "light_blue_shulker_box",
+  "yellow_shulker_box",
+  "lime_shulker_box",
+  "pink_shulker_box",
+  "gray_shulker_box",
+  "light_gray_shulker_box",
+  "cyan_shulker_box",
+  "purple_shulker_box",
+  "blue_shulker_box",
+  "brown_shulker_box",
+  "green_shulker_box",
+  "red_shulker_box",
+  "black_shulker_box",
+]);
+
+const UTILITY_SCAN_INTERVAL_MS = 5_000;
+const UTILITY_SCAN_RADIUS = 8;
+const CURSOR_REACH = 6;
+
+/**
+ * Per-bot hint set by chest skills before bot.openChest fires its window
+ * event — the skill knows exactly which block it opened, which is more
+ * reliable than the cursor heuristic when the chest is behind a wall or
+ * the bot didn't lookAt it. The windowOpen hook consults this first, then
+ * falls back to blockAtCursor.
+ */
+const pendingContainerOpen = new Map<string, { block: Block; at: number }>();
+const PENDING_TTL_MS = 4_000;
+
+export function noteContainerOpening(username: string, block: Block): void {
+  pendingContainerOpen.set(username, { block, at: Date.now() });
+}
 
 /**
  * Wire mineflayer events into the per-bot state stores, the chat router,
@@ -61,6 +109,91 @@ export function attachBotEventHooks(
     console.log(`${tag} player left: ${player.username}`);
     state.presence.onLeave(player.username, snapshotPos(player));
   });
+
+  // Container auto-capture. Track which block the bot is opening at
+  // windowOpen time, then snapshot contents on windowClose. The skills
+  // hint via noteContainerOpening; the cursor lookup is a fallback for
+  // chests opened via `bot.activateBlock` or any other path.
+  let openContext: { block: Block; type: string } | null = null;
+
+  bot.on("windowOpen", (window: Window) => {
+    const hint = pendingContainerOpen.get(username);
+    pendingContainerOpen.delete(username);
+    let block: Block | null = null;
+    if (hint && Date.now() - hint.at < PENDING_TTL_MS) {
+      block = hint.block;
+    } else {
+      const looked = bot.blockAtCursor(CURSOR_REACH);
+      if (looked && CONTAINER_BLOCK_TYPES.has(looked.name)) block = looked;
+    }
+    if (!block) return;
+    openContext = { block, type: block.name };
+    void window; // contents may not be ready yet — capture on windowClose
+  });
+
+  bot.on("windowClose", (window: Window) => {
+    if (!openContext) return;
+    const { block, type } = openContext;
+    openContext = null;
+    try {
+      const contents = window.containerItems().map((i) => ({ item: i.name, count: i.count }));
+      void upsertContainer(username, {
+        type,
+        position: { x: block.position.x, y: block.position.y, z: block.position.z },
+        contents,
+        openedBy: username,
+      }).catch((err) => {
+        console.warn(`${tag} container snapshot failed:`, err);
+      });
+    } catch (err) {
+      console.warn(`${tag} container snapshot threw:`, err);
+    }
+  });
+
+  // Utility-block proximity auto-capture. Periodic scan (vs per-tick move
+  // events) so we don't burn CPU when the bot's mining or following — the
+  // bot doesn't need a real-time POI update, just "remember this when you
+  // pass by". Idempotent on (type, position) so re-scanning is free.
+  const utilityScan = setInterval(() => {
+    void scanForUtilityBlocks(bot, username, tag);
+  }, UTILITY_SCAN_INTERVAL_MS);
+  bot.once("end", () => {
+    clearInterval(utilityScan);
+    pendingContainerOpen.delete(username);
+  });
+}
+
+async function scanForUtilityBlocks(bot: Bot, username: string, tag: string): Promise<void> {
+  if (!bot.entity) return;
+  // Collect utility block IDs once per scan; cheap to rebuild and keeps
+  // us insulated from registry changes between minecraft-data versions.
+  const ids: number[] = [];
+  for (const block of bot.registry.blocksArray) {
+    if (isUtilityBlockType(block.name)) ids.push(block.id);
+  }
+  if (ids.length === 0) return;
+  const positions = bot.findBlocks({
+    point: bot.entity.position,
+    matching: ids,
+    maxDistance: UTILITY_SCAN_RADIUS,
+    count: 32,
+  });
+  for (const p of positions) {
+    const block = bot.blockAt(p);
+    if (!block) continue;
+    try {
+      const result = await addPoi(username, {
+        type: block.name,
+        position: { x: p.x, y: p.y, z: p.z },
+        source: "auto",
+      });
+      if (result.added) {
+        console.log(`${tag} auto-poi: ${block.name} at (${p.x}, ${p.y}, ${p.z})`);
+      }
+    } catch (err) {
+      console.warn(`${tag} auto-poi write failed:`, err);
+    }
+  }
 }
 
 /**

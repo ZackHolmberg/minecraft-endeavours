@@ -123,7 +123,7 @@ Each skill is a JS function exposed to Claude as a tool. Skills take **specific,
 
 | Category | Skill | Params | Notes |
 |---|---|---|---|
-| Perception | `observeSurroundings` | — | Nearby blocks (with counts/distances), entities, players, time, weather, bot health/hunger/position. Claude's primary "look around". |
+| Perception | `observeSurroundings` | — | Nearby blocks (with counts/distances), entities, players, time, weather, bot health/hunger/position, plus middleware state (recent actions, recently-seen players, current task queue, `knownStorage`, `knownUtilities`). Claude's primary "look around". |
 | Perception | `findBlock` | `type, maxDist?` | Nearest block of a type. |
 | Perception | `findEntity` | `filter, maxDist?` | Nearest entity (mob type or player name). |
 | Perception | `checkInventory` | — | Pre-aggregated inventory: grouped by type with counts, durability, and equipped status (e.g. `"16 logs, 64 cobblestone, iron pickaxe (35%)"`) — not raw slots. |
@@ -165,7 +165,8 @@ The bot's primary "look around". Load-bearing because Claude's defaults for vagu
   nearbyBlocks: [ { type, count, nearest: { x, y, z, dist } }, … ],   // grouped, top ~15
   nearbyEntities: [ { type, name?, pos, dist, lookingAt? }, … ],      // players → hostiles → passive, ~10 cap
   nearbyDroppedItems: [ { item, count, dist }, … ],
-  knownStorage: [ { type, pos, dist, contents?, lastSeen? }, … ],     // from world.json, proximity-filtered
+  knownStorage: [ { type, pos, dist, contents?, lastOpened?, lastOpenedBy? }, … ],   // from world.json containers[], proximity-sorted
+  knownUtilities: [ { type, pos, dist, name? }, … ],                                  // from world.json pois[] filtered to utility blocks, proximity-sorted
 
   // Pre-computed middleware state (see Bot state below)
   recentActions: [ "mined 7 oak_log", "walked 200 blocks", "killed 2 zombies" ],   // rolling 5-min summary
@@ -205,9 +206,9 @@ Per-bot JSON file at `data/orchestrator/memory/<bot-username>/world.json` storin
 - `deaths[]` — death locations and causes for "where did I drop my stuff" recovery.
 
 **Automatic capture (mineflayer events → direct write):**
-- Container `windowOpen` / `windowClose` → snapshot contents.
-- Bot enters ~8-block proximity of a portal / bed / crafting table → record as POI (idempotent — don't re-add if already known).
-- Bot death event → record position and cause.
+- Container `windowOpen` / `windowClose` → snapshot contents into `containers[]`. Shipped in v0.3+: hook in `mineflayer-glue/event-hooks.ts` correlates the window to a block via a per-bot hint (set by the chest skills before they call `openChest`) with a `blockAtCursor(6)` fallback for chests opened via `activateBlock` or any other path.
+- Bot enters ~8-block proximity of a crafting table / furnace / smithing table / etc. → upsert as POI in `pois[]`. Shipped in v0.3+: periodic 5s scan in `event-hooks.ts` walks `findBlocks` for the utility-block ID set and calls the idempotent `addPoi`. Cleared on `bot.on("end")`.
+- Bot death event → record position and cause. (Pending.)
 
 **Claude-driven capture (`remember` skill):**
 - Player names a location (*"this is our base"*, *"call this spot the wheat farm"*) → Claude calls `remember(type, name, pos)`.
@@ -274,12 +275,14 @@ src/
     types.ts                # SkillResult, GoToTarget, shared param types
     harness.ts              # runSkill — exception trap, actions log, currentTool tracking, ?-question continuity
     chat.ts                 # say, whisper
-    perception.ts           # observeSurroundings
+    perception.ts           # observeSurroundings (surfaces knownStorage + knownUtilities from world.json)
     movement.ts             # goTo, stop, followPlayer
     world.ts                # mineBlock, placeBlock
     inventory.ts            # pickUpNearby, dropItem, giveItemTo
+    crafting.ts             # craft (with knownUtilities fallback for remembered tables)
+    combat.ts               # attack, flee
+    storage.ts              # depositToChest, withdrawFromChest
     meta.ts                 # remember, setTaskQueue, advanceTaskQueue
-    (pending) crafting.ts / combat.ts                                # skill batches per ROADMAP slice-3 follow-ups
   state/
     index.ts                # BotState bundle + per-bot registry
     actions-log.ts          # rolling 5-min recent actions per bot
@@ -288,7 +291,7 @@ src/
     current-tool.ts         # in-flight skill name + start timestamp (set by runSkill; read by snapshot/dashboard)
     cancellation.ts         # per-bot cooperative cancellation flag; flipped by stop skill + chat-event side-channel
   memory/
-    world-knowledge.ts      # read/write per-bot world.json (pois[]; containers[] populated once auto-capture lands)
+    world-knowledge.ts      # read/write per-bot world.json (pois[] auto-captured on utility-block proximity; containers[] auto-captured via windowOpen/windowClose hook)
   observability/
     log-buffer.ts           # ring buffer wrapping console.log/info/warn/error; subscribe + forwarding toggle
     snapshot.ts             # getBotSnapshot(username) → plain JSON-serializable struct; used by dashboard + future HTTP/WS

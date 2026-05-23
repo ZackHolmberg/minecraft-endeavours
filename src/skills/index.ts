@@ -5,4 +5,7 @@ export { observeSurroundings, type ObserveSurroundingsState } from "./perception
 export { goTo, stop, followPlayer } from "./movement.js";
 export { mineBlock, placeBlock } from "./world.js";
 export { pickUpNearby, dropItem, giveItemTo } from "./inventory.js";
+export { craft } from "./crafting.js";
+export { attack, flee } from "./combat.js";
+export { depositToChest, withdrawFromChest } from "./storage.js";
 export { remember, setTaskQueue, advanceTaskQueue } from "./meta.js";

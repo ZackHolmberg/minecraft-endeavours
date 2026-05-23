@@ -132,3 +132,71 @@ export async function addPoi(
   await writeWorldKnowledge(username, world);
   return { added: true };
 }
+
+export interface UpsertContainerInput {
+  type: string;
+  position: Pos;
+  contents: Array<{ item: string; count: number }>;
+  openedBy: string;
+}
+
+/**
+ * Capture a container snapshot. Idempotent on `position`: a second open of
+ * the same chest overwrites contents + lastOpened + lastOpenedBy instead of
+ * appending a duplicate. Called from the windowOpen/windowClose event hook
+ * (any chest the bot opens) and from the deposit/withdraw skills.
+ */
+export async function upsertContainer(
+  username: string,
+  input: UpsertContainerInput,
+): Promise<{ created: boolean }> {
+  const world = await readWorldKnowledge(username);
+  const idx = world.containers.findIndex(
+    (c) =>
+      c.position.x === input.position.x &&
+      c.position.y === input.position.y &&
+      c.position.z === input.position.z,
+  );
+  const record: Container = {
+    type: input.type,
+    position: input.position,
+    last_opened: Date.now(),
+    last_opened_by: input.openedBy,
+    contents: input.contents,
+  };
+  if (idx >= 0) {
+    world.containers[idx] = record;
+  } else {
+    world.containers.push(record);
+  }
+  await writeWorldKnowledge(username, world);
+  return { created: idx < 0 };
+}
+
+/**
+ * Block types whose locations are worth remembering as durable POIs because
+ * Claude will want to walk back to them later — crafting, smelting, etc.
+ * Surfaced by `observeSurroundings` as `knownUtilities` so the model can
+ * plan trips back to a remembered table from deep in a mine.
+ */
+export const UTILITY_BLOCK_TYPES = new Set([
+  "crafting_table",
+  "furnace",
+  "blast_furnace",
+  "smoker",
+  "smithing_table",
+  "loom",
+  "stonecutter",
+  "anvil",
+  "chipped_anvil",
+  "damaged_anvil",
+  "enchanting_table",
+  "brewing_stand",
+  "grindstone",
+  "cartography_table",
+  "fletching_table",
+]);
+
+export function isUtilityBlockType(name: string): boolean {
+  return UTILITY_BLOCK_TYPES.has(name);
+}

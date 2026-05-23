@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import type { Entity } from "prismarine-entity";
 import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
-import { readWorldKnowledge } from "../memory/world-knowledge.js";
+import { isUtilityBlockType, readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
 import type { SkillResult } from "./types.js";
 
@@ -56,6 +56,12 @@ export interface ObserveSurroundingsState {
     lastOpened?: number;
     lastOpenedBy?: string;
     contents?: Array<{ item: string; count: number }>;
+  }>;
+  knownUtilities: Array<{
+    type: string;
+    pos: { x: number; y: number; z: number };
+    dist: number;
+    name?: string;
   }>;
   recentActions: string[];
   recentlySeenPlayers: Array<{ name: string; lastSeen: number; lastPos: { x: number; y: number; z: number } | null }>;
@@ -128,6 +134,20 @@ export async function observeSurroundings(
     })
     .sort((a, b) => a.dist - b.dist);
 
+  const knownUtilities = world.pois
+    .filter((p) => isUtilityBlockType(p.type))
+    .map((p) => {
+      const d = me.distanceTo(new Vec3(p.position.x, p.position.y, p.position.z));
+      const entry: ObserveSurroundingsState["knownUtilities"][number] = {
+        type: p.type,
+        pos: p.position,
+        dist: round2(d),
+      };
+      if (p.name !== undefined) entry.name = p.name;
+      return entry;
+    })
+    .sort((a, b) => a.dist - b.dist);
+
   return {
     ok: true,
     message: `${nearbyBlocks.length} block group(s), ${nearbyEntities.length} entit(ies) within ${radius} blocks`,
@@ -150,6 +170,7 @@ export async function observeSurroundings(
       nearbyEntities,
       nearbyDroppedItems,
       knownStorage,
+      knownUtilities,
       recentActions: botState?.actions.recent() ?? [],
       recentlySeenPlayers: botState?.presence.recentlySeen() ?? [],
       currentTask: botState?.tasks.current() ?? null,

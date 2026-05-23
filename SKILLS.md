@@ -26,7 +26,8 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `say`, `whisper`, `observeSurroundings`, `goTo`, `mineBlock` | ✅ Implemented in slice 2 |
 | `remember`, `setTaskQueue`, `advanceTaskQueue` | ✅ Implemented in slice 3 (phase 2) |
 | `stop`, `followPlayer`, `placeBlock`, `pickUpNearby`, `dropItem`, `giveItemTo` | ✅ Implemented in v0.3+ priority batch |
-| `findBlock`, `findEntity`, `checkInventory`, `lookAt`, `activateBlock`, `equipItem`, `craft`, `attack`, `flee`, `wait` | ⏳ Pending |
+| `craft`, `attack`, `flee`, `depositToChest`, `withdrawFromChest` | ✅ Implemented in v0.3+ follow-on batch |
+| `findBlock`, `findEntity`, `checkInventory`, `lookAt`, `activateBlock`, `equipItem`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
 
@@ -287,6 +288,96 @@ Drops from every matching inventory stack until `count` is satisfied. If `count`
 |---|---|
 | Success | `dropped <K> <item>` |
 | Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no <item> in inventory to drop` · `dropped <K> of <N> <item>; toss failed: <msg>` · `dropped <K> of <N> <item>; only <M> were available` |
+
+---
+
+### `craft` — composite craft (with auto table search + known-utility fallback)
+
+```ts
+craft(bot, { item: string, count?: number, tablePos?: Coords }): Promise<SkillResult>
+```
+
+Resolves a recipe via `bot.recipesFor` and crafts. Inventory-only recipes (2×2) skip any walking. 3×3 recipes need a crafting table; resolution order:
+
+1. caller-supplied `tablePos`,
+2. nearest `crafting_table` within 32 blocks (live `findBlock` search),
+3. nearest remembered `crafting_table` from `world.json` POIs.
+
+(3) is what makes the multi-step production loop (mine → smelt → craft) actually work — Claude sees the remembered table in `observeSurroundings.knownUtilities` and `craft` walks the bot back to it from deep in a cave automatically.
+
+Shortfall reporting: when a recipe exists but ingredients are missing, the message names the first missing ingredient and its shortfall — `cannot craft 1 iron_pickaxe: need 3 iron_ingot; have 1` — so Claude can spawn a sub-task with no extra perception calls.
+
+| | |
+|---|---|
+| Success | `crafted <N> <item>` · `crafted <N> <item> at crafting_table (x, y, z)` |
+| Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no known recipe for "<item>"` · `cannot craft <N> <item>: need <K> <ingredient>; have <H>` · `no crafting_table within 32 blocks and none remembered in world memory` · `nearest remembered crafting_table is at (x, y, z) (~D blocks away) but the chunk isn't loaded — walk closer first` · `couldn't reach crafting_table at (x, y, z) (<source>): <msg>` · `craft failed for <item>: <msg>` |
+
+---
+
+### `attack` — tick-loop melee until cancelled / target dead
+
+```ts
+attack(bot, { entity: string }): Promise<SkillResult>
+```
+
+Equips the best available weapon (sword > axe, tiered netherite > diamond > iron > golden > stone > wooden), sets a dynamic pathfinder `GoalFollow` at `ATTACK_REACH - 1` blocks, and swings on cooldown. Exits when the target dies, leaves the bot's entity view, or cancellation is requested.
+
+Cancellation: the side-channel preempt in `event-hooks.ts` flips the flag when the current conversation partner says "stop" / "halt" / "wait" while `attack` is in flight. Always clears the pathfinder goal in a `finally`.
+
+| | |
+|---|---|
+| Success | `killed <entity> after <N> swing(s)` · `stopped attacking <entity> after <N> swing(s)` |
+| Failures | `entity is required` · `entity "<name>" not visible to the bot` |
+
+---
+
+### `flee` — path away from a threat until `dist` blocks separation
+
+```ts
+flee(bot, { from: string, dist?: number }): Promise<SkillResult>
+```
+
+Computes an away-vector from the threat's current position, sets a `GoalNear` to a point that distance further along the vector, then re-paths every ~1.5s so a chasing threat doesn't end up running alongside the bot toward the same destination. Exits when separation ≥ `dist`, the threat disappears, or cancellation fires.
+
+| Param | Default | Notes |
+|---|---|---|
+| `from` | — | Required. Player username or mob name. |
+| `dist` | `16` | Target separation in blocks, 1–64. |
+
+| | |
+|---|---|
+| Success | `fled from <name> to <D> blocks separation` · `<name> is no longer visible — fleeing complete` · `stopped fleeing from <name> (<D> blocks separation)` |
+| Failures | `from is required` · `dist must be between 1 and 64, got <n>` · `entity "<name>" not visible to the bot` |
+
+---
+
+### `depositToChest` — walk to a chest and put items in
+
+```ts
+depositToChest(bot, { item: string, count?: number, pos?: Coords }): Promise<SkillResult>
+```
+
+When `pos` is omitted, picks the nearest known container from `world.json.containers[]` as a best-effort default. When `count` is omitted, deposits every matching stack. Container auto-capture (windowOpen/windowClose hook in `event-hooks.ts`) snapshots the chest's new contents on close, so `knownStorage` stays current automatically.
+
+| | |
+|---|---|
+| Success | `deposited <N> <item> into <container> at (x, y, z) (<source>)` |
+| Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no <item> in inventory to deposit` · `cannot deposit <N> <item>: only <M> in inventory` · `no known containers; pass an explicit pos for the chest to deposit into` · `chunk at (x, y, z) isn't loaded — walk closer first` · `block at (x, y, z) is <name>, not a container` · `nearest known container is at (x, y, z) (~D blocks) but the chunk isn't loaded — walk closer first` · `remembered <type> at (x, y, z) is now <name> — chest may have been broken; refresh memory by passing an explicit pos` · `couldn't reach <container> at (x, y, z): <msg>` · `failed to open <container> at (x, y, z): <msg>` · `deposit of <N> <item> into <container> at (x, y, z) failed: <msg>` |
+
+---
+
+### `withdrawFromChest` — walk to a chest and take items out
+
+```ts
+withdrawFromChest(bot, { item: string, count?: number, pos?: Coords }): Promise<SkillResult>
+```
+
+When `pos` is omitted, picks the nearest known container whose remembered contents include the requested item. Re-checks the chest's actual contents on open and adjusts the take count if memory was stale (e.g. another player emptied the chest between snapshots).
+
+| | |
+|---|---|
+| Success | `withdrew <K> <item> from <container> at (x, y, z) (<source>)` · `withdrew <K> <item> from <container> at (x, y, z) (<source>); chest only had <N>` |
+| Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no known containers; open a chest at least once so I can remember its contents, or pass an explicit pos` · `no remembered container holds <item>; pass an explicit pos or gather fresh` · `<container> at (x, y, z) has no <item> (stored memory was stale)` · (plus the same chest-reach / open / chunk-loaded failures as `depositToChest`) · `withdraw of <K> <item> from <container> at (x, y, z) failed: <msg>` |
 
 ---
 
