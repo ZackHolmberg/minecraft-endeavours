@@ -3,11 +3,15 @@ import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 
 const { goals, Movements } = pathfinderPkg;
 import { Vec3 } from "vec3";
+import { getBotState } from "../state/index.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 const DEFAULT_REACH = 1;
 const SEARCH_RADIUS_FOR_BLOCK = 64;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
+const FOLLOW_DEFAULT_DIST = 2;
+const FOLLOW_MAX_DIST = 16;
+const FOLLOW_TICK_MS = 250;
 
 export interface GoToParams {
   target: GoToTarget;
@@ -49,10 +53,72 @@ export async function goTo(bot: Bot, { target, reach = DEFAULT_REACH }: GoToPara
   };
 }
 
-export function stopMovement(bot: Bot): SkillResult {
+/**
+ * The full `stop` skill from the catalogue: flips the per-bot cancellation
+ * flag (so tick-loop skills like `followPlayer` / `attack` / `flee` exit
+ * promptly) and cancels any active pathfinder goal. Safe to call when nothing
+ * is in flight — the flag is reset by each cancellable skill on entry.
+ */
+export async function stop(bot: Bot): Promise<SkillResult> {
+  const state = getBotState(bot.username);
+  state?.cancellation.request();
   const pBot = bot as BotWithPathfinder;
   pBot.pathfinder?.stop();
   return { ok: true, message: "stopped" };
+}
+
+export interface FollowPlayerParams {
+  player: string;
+  dist?: number;
+}
+
+/**
+ * Sustained follow. Sets a dynamic pathfinder GoalFollow and parks in a tick
+ * loop until cancellation is requested (player says "stop" → side-channel in
+ * event-hooks, or Claude calls the `stop` skill) or the player leaves the
+ * server. The skill returns only when one of those conditions fires —
+ * blocking the agent loop is intentional, matching `mineBlock`'s shape.
+ */
+export async function followPlayer(
+  bot: Bot,
+  { player, dist = FOLLOW_DEFAULT_DIST }: FollowPlayerParams,
+): Promise<SkillResult> {
+  if (!player) return { ok: false, message: "player name required" };
+  if (dist < 1 || dist > FOLLOW_MAX_DIST) {
+    return { ok: false, message: `dist must be between 1 and ${FOLLOW_MAX_DIST}, got ${dist}` };
+  }
+
+  const playerInfo = bot.players[player];
+  if (!playerInfo?.entity) {
+    return { ok: false, message: `player "${player}" is not visible to the bot` };
+  }
+
+  const pBot = bot as BotWithPathfinder;
+  ensureMovements(pBot);
+
+  const state = getBotState(bot.username);
+  state?.cancellation.begin();
+
+  pBot.pathfinder.setGoal(new goals.GoalFollow(playerInfo.entity, dist), true);
+
+  try {
+    while (true) {
+      if (state?.cancellation.isRequested()) {
+        return { ok: true, message: `stopped following ${player}` };
+      }
+      const current = bot.players[player]?.entity;
+      if (!current) {
+        return { ok: false, message: `lost sight of ${player} (left server or moved out of range)` };
+      }
+      await sleep(FOLLOW_TICK_MS);
+    }
+  } finally {
+    pBot.pathfinder.setGoal(null);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 type Resolved = { ok: true; destination: Vec3; label: string } | { ok: false; message: string };

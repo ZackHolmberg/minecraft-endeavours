@@ -17,12 +17,18 @@ import type { Bot } from "mineflayer";
 import { z } from "zod";
 import {
   advanceTaskQueue,
+  dropItem,
+  followPlayer,
+  giveItemTo,
   goTo,
   mineBlock,
   observeSurroundings,
+  pickUpNearby,
+  placeBlock,
   remember,
   say,
   setTaskQueue,
+  stop,
   whisper,
 } from "../skills/index.js";
 import { runSkill } from "../skills/harness.js";
@@ -35,7 +41,13 @@ const SKILL_NAMES = [
   "say",
   "whisper",
   "goTo",
+  "stop",
+  "followPlayer",
   "mineBlock",
+  "placeBlock",
+  "pickUpNearby",
+  "dropItem",
+  "giveItemTo",
   "remember",
   "setTaskQueue",
   "advanceTaskQueue",
@@ -97,13 +109,68 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
       ),
 
       tool(
+        "stop",
+        "Cancel the bot's current movement and any in-flight long-running skill (followPlayer, attack, flee). Safe to call when nothing is in flight. Use when the player says 'stop' or when you decide to abandon a sustained skill mid-task.",
+        {},
+        async () => toToolResult(await runSkill(bot, "stop", undefined, () => stop(bot))),
+      ),
+
+      tool(
+        "followPlayer",
+        "Follow a player at `dist` blocks of separation, indefinitely, until cancelled. Cancellation fires when the player says 'stop'/'halt'/'wait' (side-channel) or when you call the `stop` skill. Blocks the agent loop — use only when sustained following is what the player actually asked for.",
+        {
+          player: z.string().min(1),
+          dist: z.number().int().min(1).max(16).optional().describe("Follow distance in blocks (default 2)"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "followPlayer", args, (p) => followPlayer(bot, p))),
+      ),
+
+      tool(
         "mineBlock",
-        "Mine N blocks of a specific type. Composite: find → path → equip best tool → dig → wait for pickup. Fails fast (before any movement) if the required tool tier isn't in inventory. Partial progress is reported in state.mined on failure.",
+        "Mine N blocks of a specific type. Composite: find → path → equip best tool → dig → sweep dropped items. Fails fast (before any movement) if the required tool tier isn't in inventory. Partial progress is reported in state.mined on failure.",
         {
           type: z.string().min(1).describe("Block ID, e.g. 'oak_log', 'stone', 'iron_ore'"),
           count: z.number().int().min(1).max(64).optional(),
         },
         async (args) => toToolResult(await runSkill(bot, "mineBlock", args, (p) => mineBlock(bot, p))),
+      ),
+
+      tool(
+        "placeBlock",
+        "Place a block of the given type at the target position. Requires the item in inventory and a solid neighbor at one of the six adjacent positions to click against. Fails with a specific message if either is missing.",
+        {
+          type: z.string().min(1).describe("Block item ID, e.g. 'cobblestone', 'oak_planks'"),
+          position: posSchema,
+        },
+        async (args) => toToolResult(await runSkill(bot, "placeBlock", args, (p) => placeBlock(bot, p))),
+      ),
+
+      tool(
+        "pickUpNearby",
+        "Walk to and pick up every dropped item within `maxDist` blocks. Use after a mob fight, after dropping items, or whenever you see items in `nearbyDroppedItems` you want to collect. mineBlock already does this internally per-dig, so you usually don't need it after a mining task.",
+        { maxDist: z.number().int().min(1).max(32).optional().describe("Search radius in blocks (default 8)") },
+        async (args) => toToolResult(await runSkill(bot, "pickUpNearby", args, (p) => pickUpNearby(bot, p))),
+      ),
+
+      tool(
+        "dropItem",
+        "Drop `count` of `item` from inventory onto the ground at the bot's feet. If `count` is omitted, drops every matching stack. Partial-progress is reported in state.dropped on failure.",
+        {
+          item: z.string().min(1).describe("Item ID, e.g. 'oak_log', 'iron_ingot'"),
+          count: z.number().int().min(1).max(2304).optional(),
+        },
+        async (args) => toToolResult(await runSkill(bot, "dropItem", args, (p) => dropItem(bot, p))),
+      ),
+
+      tool(
+        "giveItemTo",
+        "Walk within drop range of a player, face them, and toss the item so the natural pickup radius pulls it in. Composite: goTo(player) → lookAt → dropItem. Fails if the player isn't visible, can't be reached, or the bot doesn't have the item.",
+        {
+          player: z.string().min(1),
+          item: z.string().min(1),
+          count: z.number().int().min(1).max(2304).optional(),
+        },
+        async (args) => toToolResult(await runSkill(bot, "giveItemTo", args, (p) => giveItemTo(bot, p))),
       ),
 
       tool(

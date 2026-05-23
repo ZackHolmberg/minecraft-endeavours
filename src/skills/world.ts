@@ -4,11 +4,22 @@ import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 const { goals, Movements } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
-import type { SkillResult } from "./types.js";
+import { Vec3 } from "vec3";
+import { pickUpNearby } from "./inventory.js";
+import type { Coords, SkillResult } from "./types.js";
 
 const SEARCH_RADIUS = 64;
-const POST_DIG_PICKUP_WAIT_MS = 500;
+const POST_DIG_PICKUP_RADIUS = 4;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
+
+const FACE_OFFSETS: ReadonlyArray<{ vec: Vec3; label: string }> = [
+  { vec: new Vec3(0, -1, 0), label: "bottom" },
+  { vec: new Vec3(0, 1, 0), label: "top" },
+  { vec: new Vec3(0, 0, -1), label: "north" },
+  { vec: new Vec3(0, 0, 1), label: "south" },
+  { vec: new Vec3(-1, 0, 0), label: "west" },
+  { vec: new Vec3(1, 0, 0), label: "east" },
+];
 
 export interface MineBlockParams {
   type: string;
@@ -75,7 +86,9 @@ export async function mineBlock(
       };
     }
 
-    await sleep(POST_DIG_PICKUP_WAIT_MS);
+    // Explicit pickup sweep — replaces the unreliable post-dig wait that
+    // missed drops for blocks like sand in the slice-3 smoke test.
+    await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
     mined += 1;
   }
 
@@ -83,6 +96,106 @@ export async function mineBlock(
     ok: true,
     message: `mined ${mined} ${type}`,
     state: { mined },
+  };
+}
+
+export interface PlaceBlockParams {
+  type: string;
+  position: Coords;
+}
+
+/**
+ * Place a block of `type` at `position`. mineflayer's `bot.placeBlock` wants
+ * a reference block + face vector (the block we click *on*, plus which face),
+ * not a target coordinate — so we probe the 6 adjacent positions, pick the
+ * first solid neighbor, and derive the face vector from there. Fails fast if
+ * the bot isn't holding the item and doesn't have one to equip, or if there
+ * is no solid neighbor to place against.
+ */
+export async function placeBlock(
+  bot: Bot,
+  { type, position }: PlaceBlockParams,
+): Promise<SkillResult> {
+  if (!type) return { ok: false, message: "type is required" };
+  if (!position) return { ok: false, message: "position is required" };
+
+  const itemData = bot.registry.itemsByName[type];
+  if (!itemData) return { ok: false, message: `unknown block item "${type}"` };
+
+  const stack = bot.inventory.items().find((i) => i.type === itemData.id);
+  if (!stack) {
+    return { ok: false, message: `no ${type} in inventory to place` };
+  }
+
+  const target = new Vec3(position.x, position.y, position.z);
+  const targetBlock = bot.blockAt(target);
+  if (targetBlock && targetBlock.boundingBox === "block") {
+    return {
+      ok: false,
+      message: `${target.x}, ${target.y}, ${target.z} is already occupied by ${targetBlock.name}`,
+    };
+  }
+
+  // Pick a solid neighbor to click on. Prefer bottom (most natural for
+  // standing-on-ground placement); fall through to sides; top last.
+  let reference: { block: Block; face: Vec3; label: string } | null = null;
+  for (const offset of FACE_OFFSETS) {
+    const neighborPos = target.plus(offset.vec);
+    const neighbor = bot.blockAt(neighborPos);
+    if (!neighbor || neighbor.boundingBox !== "block") continue;
+    // Face vector points from the reference block toward the target — the
+    // opposite of the offset we used to find the neighbor.
+    reference = {
+      block: neighbor,
+      face: offset.vec.scaled(-1),
+      label: offset.label,
+    };
+    break;
+  }
+  if (!reference) {
+    return {
+      ok: false,
+      message: `no solid neighbor at ${fmt(target.x, target.y, target.z)} to place ${type} against`,
+    };
+  }
+
+  // Walk close enough to click on the reference block (~3 blocks reach).
+  const pBot = bot as BotWithPathfinder;
+  ensureMovements(pBot);
+  const refPos = reference.block.position;
+  try {
+    await pBot.pathfinder.goto(new goals.GoalNear(refPos.x, refPos.y, refPos.z, 3));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      message: `couldn't reach a placing position for ${type} at ${fmt(target.x, target.y, target.z)}: ${message}`,
+    };
+  }
+
+  if (bot.heldItem?.type !== stack.type) {
+    try {
+      await bot.equip(stack, "hand");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `failed to equip ${type}: ${message}` };
+    }
+  }
+
+  try {
+    await bot.placeBlock(reference.block, reference.face);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      message: `place failed at ${fmt(target.x, target.y, target.z)} (against ${reference.block.name} ${reference.label}): ${message}`,
+    };
+  }
+
+  return {
+    ok: true,
+    message: `placed ${type} at ${fmt(target.x, target.y, target.z)}`,
+    state: { position: { x: target.x, y: target.y, z: target.z }, against: reference.block.name },
   };
 }
 
@@ -157,8 +270,4 @@ function ensureMovements(bot: BotWithPathfinder): void {
 
 function fmt(x: number, y: number, z: number): string {
   return `(${Math.round(x)}, ${Math.round(y)}, ${Math.round(z)})`;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -275,16 +275,18 @@ src/
     harness.ts              # runSkill — exception trap, actions log, currentTool tracking, ?-question continuity
     chat.ts                 # say, whisper
     perception.ts           # observeSurroundings
-    movement.ts             # goTo, stopMovement (orphaned helper; full `stop` skill pending)
-    world.ts                # mineBlock
+    movement.ts             # goTo, stop, followPlayer
+    world.ts                # mineBlock, placeBlock
+    inventory.ts            # pickUpNearby, dropItem, giveItemTo
     meta.ts                 # remember, setTaskQueue, advanceTaskQueue
-    (pending) inventory.ts / crafting.ts / combat.ts                 # skill batches per ROADMAP slice-3 follow-ups
+    (pending) crafting.ts / combat.ts                                # skill batches per ROADMAP slice-3 follow-ups
   state/
     index.ts                # BotState bundle + per-bot registry
     actions-log.ts          # rolling 5-min recent actions per bot
     player-presence.ts      # online/offline + last-seen tracking
     task-queue.ts           # per-bot multi-task queue
     current-tool.ts         # in-flight skill name + start timestamp (set by runSkill; read by snapshot/dashboard)
+    cancellation.ts         # per-bot cooperative cancellation flag; flipped by stop skill + chat-event side-channel
   memory/
     world-knowledge.ts      # read/write per-bot world.json (pois[]; containers[] populated once auto-capture lands)
   observability/

@@ -13,11 +13,13 @@
  */
 
 import { ActionsLog } from "./actions-log.js";
+import { CancellationFlag } from "./cancellation.js";
 import { CurrentToolTracker } from "./current-tool.js";
 import { PlayerPresence } from "./player-presence.js";
 import { TaskQueue } from "./task-queue.js";
 
 export { ActionsLog } from "./actions-log.js";
+export { CancellationFlag } from "./cancellation.js";
 export { CurrentToolTracker } from "./current-tool.js";
 export { PlayerPresence, type RecentlySeenPlayer } from "./player-presence.js";
 export { TaskQueue } from "./task-queue.js";
@@ -27,6 +29,7 @@ export interface BotState {
   presence: PlayerPresence;
   tasks: TaskQueue;
   currentTool: CurrentToolTracker;
+  cancellation: CancellationFlag;
 }
 
 export function createBotState(): BotState {
@@ -35,6 +38,7 @@ export function createBotState(): BotState {
     presence: new PlayerPresence(),
     tasks: new TaskQueue(),
     currentTool: new CurrentToolTracker(),
+    cancellation: new CancellationFlag(),
   };
 }
 

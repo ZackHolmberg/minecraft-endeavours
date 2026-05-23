@@ -14,7 +14,7 @@ const ACTION_LOG_DENYLIST = new Set([
   "observeSurroundings",
   "say",
   "whisper",
-  "stopMovement",
+  "stop",
 ]);
 
 /**

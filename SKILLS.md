@@ -25,7 +25,8 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 |---|---|
 | `say`, `whisper`, `observeSurroundings`, `goTo`, `mineBlock` | ✅ Implemented in slice 2 |
 | `remember`, `setTaskQueue`, `advanceTaskQueue` | ✅ Implemented in slice 3 (phase 2) |
-| `findBlock`, `findEntity`, `checkInventory`, `followPlayer`, `stop`, `lookAt`, `placeBlock`, `activateBlock`, `pickUpNearby`, `equipItem`, `dropItem`, `giveItemTo`, `craft`, `attack`, `flee`, `wait` | ⏳ Pending |
+| `stop`, `followPlayer`, `placeBlock`, `pickUpNearby`, `dropItem`, `giveItemTo` | ✅ Implemented in v0.3+ priority batch |
+| `findBlock`, `findEntity`, `checkInventory`, `lookAt`, `activateBlock`, `equipItem`, `craft`, `attack`, `flee`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
 
@@ -150,8 +151,9 @@ Workflow per iteration:
 **Partial progress:** failure results include `state: { mined: <count> }` so the caller knows how far the skill got.
 
 **Known limitations:**
-- **Drop pickup is unreliable.** Field-confirmed in the slice-3 smoke test for sand — the 500ms post-dig wait misses natural auto-collect often enough that the bot finishes "mining" with items still on the ground. Fix planned via an explicit pickup sweep after each dig (or land `pickUpNearby` and call it from the composite). Tracked in [ROADMAP.md → Slice-3 smoke-test follow-ups](ROADMAP.md).
 - Tool selection picks the last `canHarvest` match in inventory rather than computing fastest dig time.
+
+**Drop pickup:** the prior 500ms post-dig wait was unreliable for blocks like sand. Each iteration now invokes `pickUpNearby({ maxDist: 4 })` after the dig, which walks to any dropped items in range so natural ~1.5-block auto-collect fires. Standalone `pickUpNearby` remains useful for "pick up what I just dropped" or after a mob fight.
 
 ---
 
@@ -200,18 +202,106 @@ Drops the current task and promotes the next one. Returns `task queue drained` w
 
 ---
 
-### `stopMovement` — cancel pathfinding (helper, not a registered skill)
+### `stop` — cancel current movement and any in-flight long-running skill
 
 ```ts
-stopMovement(bot): SkillResult
+stop(bot): Promise<SkillResult>
 ```
 
-Synchronous helper that calls `pathfinder.stop()`. Currently orphaned — the slice-2 `!stop` harness command that called it is gone, and the agent doesn't have access to it yet. The architectural `stop` skill from the catalogue (Movement section) will revive it as a registered tool in a later slice with the ability to cancel any in-flight skill, not just pathfinding.
+Flips the per-bot cancellation flag (so tick-loop skills like `followPlayer` / `attack` / `flee` exit on their next iteration) and cancels any active pathfinder goal. Safe to call when nothing is in flight — each cancellable skill resets the flag on entry.
+
+There is also a **side-channel** in `mineflayer-glue/event-hooks.ts`: when a cancellable skill is in flight and the current conversation partner sends a message matching `/\b(stop|halt|wait)\b/i`, the cancellation flag flips immediately so the skill exits without waiting for the message to drain through the (queued) agent loop. The message still flows through normal dispatch so Claude sees it on the next turn. This is what makes "stop" actually work despite `mineBlock` / `followPlayer` blocking the agent loop.
 
 | | |
 |---|---|
 | Success | `stopped` |
 | Failures | None. |
+
+---
+
+### `followPlayer` — sustained follow until cancelled
+
+```ts
+followPlayer(bot, { player: string, dist?: number }): Promise<SkillResult>
+```
+
+Sets a dynamic pathfinder `GoalFollow(entity, dist)` and parks in a tick loop. Returns only when the cancellation flag is set (player says "stop"/"halt"/"wait", or Claude calls the `stop` skill) or when the player leaves the server. Blocks the agent loop — chat that arrives mid-follow queues normally, the side-channel handles the preempt.
+
+| Param | Default | Notes |
+|---|---|---|
+| `player` | — | Required. Player username; the player's `bot.players` entity must be visible at call time. |
+| `dist` | `2` | Follow distance, 1–16 blocks. |
+
+| | |
+|---|---|
+| Success | `stopped following <player>` |
+| Failures | `player name required` · `dist must be between 1 and 16, got <n>` · `player "<name>" is not visible to the bot` · `lost sight of <player> (left server or moved out of range)` |
+
+---
+
+### `placeBlock` — place an inventory block at a target position
+
+```ts
+placeBlock(bot, { type: string, position: Coords }): Promise<SkillResult>
+```
+
+mineflayer's `bot.placeBlock` needs a reference block + face vector, not a target coordinate, so this skill probes the six adjacent positions for the first solid neighbor, derives the face vector from there, paths within range, equips the item, and clicks. Neighbor preference order: bottom → top → N → S → W → E.
+
+| | |
+|---|---|
+| Success | `placed <type> at (x, y, z)` (state includes `against: <neighbor block name>`) |
+| Failures | `type is required` · `position is required` · `unknown block item "<name>"` · `no <type> in inventory to place` · `(x, y, z) is already occupied by <block>` · `no solid neighbor at (x, y, z) to place <type> against` · `couldn't reach a placing position for <type> at (x, y, z): <msg>` · `failed to equip <type>: <msg>` · `place failed at (x, y, z) (against <block> <face>): <msg>` |
+
+---
+
+### `pickUpNearby` — sweep dropped items in range
+
+```ts
+pickUpNearby(bot, { maxDist?: number }): Promise<SkillResult>
+```
+
+Snapshots the dropped-item entities in `maxDist` blocks at entry, walks to each (sorted by distance) so natural ~1.5-block auto-collect fires, and reports how many disappeared from `bot.entities` during the sweep. Snapshot-at-entry prevents the sweep from looping forever on newly-spawned drops — Claude can call it again if more items appeared. Path failures on individual drops are tolerated; the sweep continues to the next.
+
+Also invoked internally by `mineBlock` after each dig (`maxDist: 4`) to backstop the unreliable natural auto-collect that the slice-3 smoke test surfaced.
+
+| Param | Default | Notes |
+|---|---|---|
+| `maxDist` | `8` | Search radius in blocks, 1–32. |
+
+| | |
+|---|---|
+| Success | `no dropped items within <N> blocks` · `picked up <K> dropped item stack(s) within <N> blocks` |
+| Failures | `maxDist must be between 1 and 32, got <n>` · `walked to <N> dropped item(s) within <M> blocks but collected none` |
+
+---
+
+### `dropItem` — toss items from inventory onto the ground
+
+```ts
+dropItem(bot, { item: string, count?: number }): Promise<SkillResult>
+```
+
+Drops from every matching inventory stack until `count` is satisfied. If `count` is omitted, every matching stack is dropped. Reports partial progress in `state.dropped` on failure (e.g. inventory had fewer than requested).
+
+| | |
+|---|---|
+| Success | `dropped <K> <item>` |
+| Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no <item> in inventory to drop` · `dropped <K> of <N> <item>; toss failed: <msg>` · `dropped <K> of <N> <item>; only <M> were available` |
+
+---
+
+### `giveItemTo` — composite hand-off (walk to player → face → drop)
+
+```ts
+giveItemTo(bot, { player: string, item: string, count?: number }): Promise<SkillResult>
+```
+
+Composite: `goTo(player)` via pathfinder `GoalNear(reach=2)`, then `lookAt` the player's head, then `dropItem`. The natural ~1.5-block item-attraction radius pulls the stack into the player. Refreshes the player's entity reference post-walk in case they moved.
+
+| | |
+|---|---|
+| Success | `gave <K> <item> to <player>` |
+| Failures | `player name required` · `item is required` · `player "<name>" is not visible to the bot` · `unknown item "<name>"` · `no <item> in inventory to give to <player>` · `couldn't reach <player> to hand off <item>: <msg>` · `reached <player> but: <dropItem failure message>` |
 
 ## Exercising skills
 
