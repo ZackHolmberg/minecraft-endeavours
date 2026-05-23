@@ -2,7 +2,12 @@ import { NpcAgent, registerAgent, unregisterAgent } from "./agent/npc-agent.js";
 import { loadConfig } from "./config.js";
 import { startBotSupervisor, type BotSupervisor } from "./mineflayer-glue/bot-factory.js";
 import { attachBotEventHooks } from "./mineflayer-glue/event-hooks.js";
+import { installLogBuffer } from "./observability/log-buffer.js";
 import { createBotState, registerBotState, unregisterBotState } from "./state/index.js";
+
+// Patch console.* so every line we write is also retained for the dashboard
+// log pane. Must run before any other module logs.
+installLogBuffer();
 
 const config = loadConfig();
 console.log(

@@ -5,8 +5,21 @@ import type { BotConfig } from "../types.js";
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 
+/**
+ * Connection state surfaced through the supervisor so the dashboard (phase 3)
+ * can render the NET row without polling mineflayer internals.
+ *  - connecting: bot built, awaiting the first `spawn` event
+ *  - connected:  spawn fired, bot is in-world
+ *  - reconnecting: disconnected, backoff timer scheduled
+ *  - stopped: supervisor shut down (final state)
+ */
+export type BotConnectionState = "connecting" | "connected" | "reconnecting" | "stopped";
+
 export interface BotSupervisor {
   readonly username: string;
+  readonly state: BotConnectionState;
+  /** Unix-ms timestamp of the most recent successful `spawn`, or null. */
+  readonly connectedSince: number | null;
   stop(): Promise<void>;
 }
 
@@ -32,6 +45,8 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
   let backoffMs = INITIAL_BACKOFF_MS;
   let currentBot: Bot | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
+  let spawned = false;
+  let connectedSince: number | null = null;
 
   const connect = (): void => {
     if (stopped) return;
@@ -52,6 +67,8 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
     bot.once("spawn", () => {
       console.log(`${tag} spawned in world (pos=${formatPos(bot)})`);
       backoffMs = INITIAL_BACKOFF_MS;
+      spawned = true;
+      connectedSince = Date.now();
     });
 
     bot.on("kicked", (reason) => {
@@ -66,6 +83,8 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
     bot.once("end", (reason) => {
       console.warn(`${tag} disconnected: ${reason}`);
       currentBot = null;
+      spawned = false;
+      connectedSince = null;
       if (stopped) return;
       scheduleReconnect();
     });
@@ -86,6 +105,15 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
 
   return {
     username: botConfig.username,
+    get state(): BotConnectionState {
+      if (stopped) return "stopped";
+      if (spawned) return "connected";
+      if (reconnectTimer !== null) return "reconnecting";
+      return "connecting";
+    },
+    get connectedSince(): number | null {
+      return connectedSince;
+    },
     async stop() {
       stopped = true;
       if (reconnectTimer) {
@@ -100,6 +128,8 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
         }
         currentBot = null;
       }
+      spawned = false;
+      connectedSince = null;
     },
   };
 }

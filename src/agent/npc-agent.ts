@@ -37,6 +37,30 @@ import { buildSystemPrompt } from "./system-prompt.js";
 const MAX_TURNS_PER_EVENT = 8;
 const DEFAULT_COOLDOWN_SECONDS = 5 * 60;
 
+/**
+ * Token usage shape we accumulate from `SDKResultSuccess.usage`. Names match
+ * the SDK field names (snake_case) for direct mapping.
+ */
+export interface TurnUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  total_cost_usd: number | null;
+}
+
+export interface SessionUsage extends TurnUsage {
+  turns: number;
+}
+
+/**
+ * Whatever the SDK puts on `SDKRateLimitEvent.rate_limit_info`. Retained
+ * verbatim so the dashboard can render whichever fields actually populate
+ * (per ROADMAP "Pro window precision" risk — utilization/surpassedThreshold
+ * may only show up under allowed_warning / rejected).
+ */
+export type RateLimitInfo = Record<string, unknown>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Async queue feeding the SDK's streaming-input prompt.
 // Single-producer / single-consumer (the SDK iterates).
@@ -100,6 +124,17 @@ export class NpcAgent {
   private readonly cooldown = new RateLimitCooldown();
   private session: Query | null = null;
   private stopped = false;
+
+  private sessionUsage: SessionUsage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    total_cost_usd: 0,
+    turns: 0,
+  };
+  private lastTurnUsage: TurnUsage | null = null;
+  private latestRateLimitInfo: RateLimitInfo | null = null;
 
   constructor(private readonly opts: NpcAgentOptions) {
     this.start();
@@ -172,19 +207,41 @@ export class NpcAgent {
       }
 
       case "rate_limit_event": {
-        const info = msg.rate_limit_info;
+        const info = (msg.rate_limit_info ?? null) as RateLimitInfo | null;
+        this.latestRateLimitInfo = info;
+        // Log the full payload so we learn which fields actually populate
+        // (per ROADMAP "Pro window precision" — utilization may only appear
+        // under allowed_warning / rejected).
         console.log(`${tag} rate-limit event: ${JSON.stringify(info)}`);
-        if (info?.status === "rejected") {
-          this.startCooldown(info.resetsAt ?? null);
+        if ((info?.status as string | undefined) === "rejected") {
+          const resetsAt = info && typeof info.resetsAt === "number" ? info.resetsAt : null;
+          this.startCooldown(resetsAt);
         }
         return;
       }
 
       case "result": {
         if (msg.subtype === "success") {
-          const usage = msg.usage as { cache_read_input_tokens?: number; output_tokens?: number } | undefined;
+          const usage = msg.usage as Partial<TurnUsage> | undefined;
+          const totalCost = (msg as { total_cost_usd?: number | null }).total_cost_usd ?? null;
+          const turn: TurnUsage = {
+            input_tokens: usage?.input_tokens ?? 0,
+            output_tokens: usage?.output_tokens ?? 0,
+            cache_creation_input_tokens: usage?.cache_creation_input_tokens ?? 0,
+            cache_read_input_tokens: usage?.cache_read_input_tokens ?? 0,
+            total_cost_usd: totalCost,
+          };
+          this.lastTurnUsage = turn;
+          this.sessionUsage.input_tokens += turn.input_tokens;
+          this.sessionUsage.output_tokens += turn.output_tokens;
+          this.sessionUsage.cache_creation_input_tokens += turn.cache_creation_input_tokens;
+          this.sessionUsage.cache_read_input_tokens += turn.cache_read_input_tokens;
+          if (turn.total_cost_usd !== null && this.sessionUsage.total_cost_usd !== null) {
+            this.sessionUsage.total_cost_usd += turn.total_cost_usd;
+          }
+          this.sessionUsage.turns += 1;
           console.log(
-            `${tag} turn complete (cache_read=${usage?.cache_read_input_tokens ?? "?"}, out=${usage?.output_tokens ?? "?"})`,
+            `${tag} turn complete (cache_read=${turn.cache_read_input_tokens}, out=${turn.output_tokens})`,
           );
         } else {
           console.warn(`${tag} turn ended: ${msg.subtype}`);
@@ -232,6 +289,22 @@ export class NpcAgent {
 
   isRateLimited(): boolean {
     return this.cooldown.isActive();
+  }
+
+  getSessionUsage(): SessionUsage {
+    return { ...this.sessionUsage };
+  }
+
+  getLastTurnUsage(): TurnUsage | null {
+    return this.lastTurnUsage ? { ...this.lastTurnUsage } : null;
+  }
+
+  getRateLimitInfo(): RateLimitInfo | null {
+    return this.latestRateLimitInfo ? { ...this.latestRateLimitInfo } : null;
+  }
+
+  getCooldownRemainingMinutes(): number {
+    return this.cooldown.remainingMinutes();
   }
 
   async stop(): Promise<void> {

@@ -33,6 +33,9 @@ export async function runSkill<P, R extends SkillResult>(
   params: P,
   fn: (params: P) => Promise<R>,
 ): Promise<SkillResult> {
+  const state = getBotState(bot.username);
+  state?.currentTool.begin(name);
+
   let result: SkillResult;
   try {
     result = await fn(params);
@@ -40,10 +43,11 @@ export async function runSkill<P, R extends SkillResult>(
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[skill ${name}] threw:`, err);
     result = { ok: false, message: `${name} crashed: ${message}` };
+  } finally {
+    state?.currentTool.end();
   }
 
   if (result.ok && !ACTION_LOG_DENYLIST.has(name)) {
-    const state = getBotState(bot.username);
     state?.actions.record(result.message);
   }
 
