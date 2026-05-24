@@ -1,9 +1,10 @@
 /**
  * Ring-buffer logger. Monkey-patches `console.log/info/warn/error` so every
  * line the orchestrator writes to stdout/stderr also lands in a fixed-size
- * in-memory buffer. The dashboard's log pane (phase 3) reads from this
- * buffer; the original console output keeps flowing for non-dashboard runs
- * and for redirected logs (e.g. `npm run dev | tee`).
+ * in-memory buffer. The snapshot writer (`src/snapshot-writer.ts`) reads the
+ * tail of this buffer into `.bot-runtime/snapshot.json` for the out-of-process
+ * dashboard. Original console output also keeps flowing to stdout (captured
+ * by `scripts/botInit.sh` in `.bot-runtime/bot.log`).
  *
  * Scope (MVP per ROADMAP "stdout capture" risk):
  *  - Captures everything routed through the four console methods, including
@@ -29,7 +30,6 @@ const MAX_ENTRIES = 500;
 const buffer: LogEntry[] = [];
 const subscribers = new Set<(entry: LogEntry) => void>();
 let installed = false;
-let forwardToConsole = true;
 
 export function installLogBuffer(): void {
   if (installed) return;
@@ -45,7 +45,7 @@ export function installLogBuffer(): void {
   for (const level of ["log", "info", "warn", "error"] as const) {
     console[level] = (...args: unknown[]): void => {
       pushEntry(level, util.format(...args));
-      if (forwardToConsole) original[level](...args);
+      original[level](...args);
     };
   }
 }
@@ -71,16 +71,6 @@ function pushEntry(level: LogLevel, text: string): void {
 export function subscribeToLog(fn: (entry: LogEntry) => void): () => void {
   subscribers.add(fn);
   return () => subscribers.delete(fn);
-}
-
-/**
- * When the dashboard is mounted, blessed owns the terminal — forwarding
- * console output to stdout would corrupt the alt-screen render. Call
- * `setLogForwarding(false)` to suppress; everything still lands in the
- * ring buffer for the log pane. Restore on unmount.
- */
-export function setLogForwarding(forward: boolean): void {
-  forwardToConsole = forward;
 }
 
 /**

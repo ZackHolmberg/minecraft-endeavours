@@ -1,3 +1,6 @@
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+
 import { NpcAgent, registerAgent, unregisterAgent } from "./agent/npc-agent.js";
 import { loadConfig } from "./config.js";
 import {
@@ -8,11 +11,18 @@ import {
 } from "./mineflayer-glue/bot-factory.js";
 import { attachBotEventHooks } from "./mineflayer-glue/event-hooks.js";
 import { installLogBuffer } from "./observability/log-buffer.js";
+import { PID_PATH, SNAPSHOT_PATH } from "./runtime-paths.js";
+import { startSnapshotWriter } from "./snapshot-writer.js";
 import { createBotState, registerBotState, unregisterBotState } from "./state/index.js";
 
 // Patch console.* so every line we write is also retained for the dashboard
 // log pane. Must run before any other module logs.
 installLogBuffer();
+
+// Drop our own PID so `scripts/botStop.sh` and the viewer scripts can find
+// us — bypasses the npm/tsx wrapper PID problem.
+mkdirSync(dirname(PID_PATH), { recursive: true });
+writeFileSync(PID_PATH, String(process.pid));
 
 const config = loadConfig();
 console.log(
@@ -45,16 +55,28 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
   return supervisor;
 });
 
+// Stream every bot's state to disk so the out-of-process dashboard
+// (`scripts/dashboard.sh`) can render without sharing memory with us.
+const stopSnapshotWriter = startSnapshotWriter(SNAPSHOT_PATH);
+
 let shuttingDown = false;
 const shutdown = async (signal: string): Promise<void> => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`orchestrator: received ${signal}, disconnecting bots`);
+  stopSnapshotWriter();
   await Promise.all(supervisors.map((s) => s.stop()));
   await Promise.all(supervisors.map((s) => unregisterAgent(s.username)));
   for (const s of supervisors) {
     unregisterBotState(s.username);
     unregisterSupervisor(s.username);
+  }
+  for (const path of [PID_PATH, SNAPSHOT_PATH]) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // already gone — fine
+    }
   }
   console.log("orchestrator: bye");
   process.exit(0);
@@ -62,17 +84,3 @@ const shutdown = async (signal: string): Promise<void> => {
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
-
-// Optional dashboard. Single-process model — quitting the dashboard SIGINTs
-// the orchestrator. Dynamic import so the blessed/blessed-contrib trees only
-// load when actually needed.
-if (process.env.DASHBOARD === "1") {
-  if (allBotUsernames.length === 0) {
-    console.warn("DASHBOARD=1 set but no bots configured");
-  } else {
-    void import("./dashboard/index.js").then(({ mountDashboard }) => {
-      // No-arg form pulls every registered bot; the dashboard cycles via Tab.
-      mountDashboard();
-    });
-  }
-}

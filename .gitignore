@@ -9,5 +9,8 @@ backups/
 node_modules/
 dist/
 
+# Bot orchestrator runtime state (PID, log, snapshot) — written by scripts/botInit.sh
+.bot-runtime/
+
 # Claude Code
 CLAUDE.md

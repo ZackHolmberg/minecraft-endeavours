@@ -1,6 +1,8 @@
 /**
- * Multi-bot terminal dashboard. Polls `getBotSnapshot()` for the active bot
- * every ~500ms and renders into a `blessed-contrib` grid:
+ * Multi-bot terminal dashboard. Runs as a standalone process — not in the
+ * orchestrator's address space. The orchestrator (`scripts/botInit.sh`)
+ * writes `.bot-runtime/snapshot.json` every 500ms via `src/snapshot-writer.ts`;
+ * this client polls that file and renders into a `blessed-contrib` grid:
  *
  *   ┌── [1/N] bot · Tab to cycle ───────────┬── 5h Pro window · Tokens ─┐
  *   │ STATE / DOING / POS / HP+FOOD / ...   │ status / util / resets    │
@@ -13,21 +15,20 @@
  *   │ Log (orchestrator-wide; error/warn lines colorized)               │
  *   └───────────────────────────────────────────────────────────────────┘
  *
- * Mounted by `src/index.ts` when `DASHBOARD=1`. Tab / Shift-Tab cycle bots.
- * Quit with q / Esc / Ctrl+C — SIGINTs the orchestrator (single-process).
+ * Launched by `scripts/dashboard.sh` (which gates on MC server + bot PID).
+ * Tab / Shift-Tab cycle bots. Quit with q / Esc / Ctrl+C — only kills this
+ * viewer; the bot keeps running.
  */
+
+import { readFileSync, statSync } from "node:fs";
 
 import blessed from "blessed";
 import contrib from "blessed-contrib";
 
-import { listSupervisors } from "../mineflayer-glue/bot-factory.js";
-import {
-  getRecentLogs,
-  setLogForwarding,
-  subscribeToLog,
-  type LogEntry,
-} from "../observability/log-buffer.js";
-import { getBotSnapshot, type BotSnapshot } from "../observability/snapshot.js";
+import type { LogEntry, LogLevel } from "../observability/log-buffer.js";
+import type { BotSnapshot } from "../observability/snapshot.js";
+import { SNAPSHOT_PATH } from "../runtime-paths.js";
+import type { SnapshotFilePayload } from "../snapshot-writer.js";
 
 const POLL_MS = 500;
 const ACTIONS_MAX = 50;
@@ -35,32 +36,27 @@ const LOG_BACKFILL = 80;
 const CACHE_HISTORY_MAX = 30;
 const ERROR_BANNER_TTL_MS = 5 * 60 * 1000;
 
-export interface DashboardHandle {
-  unmount(): void;
+function readSnapshotFile(): SnapshotFilePayload | null {
+  try {
+    statSync(SNAPSHOT_PATH);
+  } catch {
+    return null;
+  }
+  try {
+    const raw = readFileSync(SNAPSHOT_PATH, "utf8");
+    return JSON.parse(raw) as SnapshotFilePayload;
+  } catch {
+    // Atomic rename means we shouldn't see partial writes, but a JSON parse
+    // failure (e.g. file briefly empty during boot) shouldn't kill the
+    // dashboard — just skip this tick.
+    return null;
+  }
 }
 
-/**
- * Mount the dashboard. With no args, cycles through every registered bot.
- * For deterministic testing, pass an explicit list.
- */
-export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
-  const initial =
-    usernames && usernames.length > 0
-      ? [...usernames]
-      : listSupervisors().map((s) => s.username);
-
-  if (initial.length === 0) {
-    console.warn("dashboard: no bots registered; aborting mount");
-    return { unmount: () => undefined };
-  }
-
-  // Blessed owns the terminal once the screen is created — stop letting
-  // console.log writes paint over the alt-screen render.
-  setLogForwarding(false);
-
+function mountDashboard(): void {
   const screen = blessed.screen({
     smartCSR: true,
-    title: `minecraft-endeavours · ${initial[0]}`,
+    title: "minecraft-endeavours",
   });
 
   const grid = new contrib.grid({ rows: 12, cols: 12, screen });
@@ -104,34 +100,25 @@ export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
     fg: "white",
   });
 
-  for (const entry of getRecentLogs(LOG_BACKFILL)) {
-    logPane.log(formatLogLine(entry));
-  }
-
-  const unsubscribeLog = subscribeToLog((entry) => {
-    logPane.log(formatLogLine(entry));
-    screen.render();
-  });
-
   // ─── Multi-bot state ──────────────────────────────────────────────────────
-  let usernamesView: string[] = [...initial];
+  let usernamesView: string[] = [];
   let activeIndex = 0;
   // Per-bot cache-hit history (last N turns).
   const cacheHistory = new Map<string, number[]>();
   // Per-bot last seen turn count — used to detect when a new turn lands.
   const lastSeenTurns = new Map<string, number>();
-  for (const u of usernamesView) {
-    cacheHistory.set(u, []);
-    lastSeenTurns.set(u, 0);
-  }
+  // Track the last log entry we rendered so we only append fresh lines on
+  // subsequent polls. Matched on (at, level, text) — Date.now() can repeat.
+  let lastLogKey: string | null = null;
+  // Show initial backfill exactly once.
+  let backfilled = false;
 
-  const refreshUsernames = (): void => {
-    // Pick up bots added later (none today, but future-proof).
-    const fresh = listSupervisors().map((s) => s.username);
-    if (fresh.length === 0) return;
-    const merged = [...new Set([...usernamesView, ...fresh])].filter((u) =>
-      fresh.includes(u),
-    );
+  const logKeyFor = (entry: LogEntry): string =>
+    `${entry.at}|${entry.level}|${entry.text}`;
+
+  const syncUsernames = (snapshots: BotSnapshot[]): void => {
+    const fresh = snapshots.map((s) => s.username);
+    const merged = fresh.filter((u) => fresh.includes(u));
     if (merged.join("|") !== usernamesView.join("|")) {
       usernamesView = merged;
       for (const u of usernamesView) {
@@ -142,8 +129,34 @@ export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
     }
   };
 
+  const appendNewLogs = (logs: LogEntry[]): void => {
+    if (logs.length === 0) return;
+
+    if (!backfilled) {
+      const tail = logs.slice(-LOG_BACKFILL);
+      for (const entry of tail) logPane.log(formatLogLine(entry));
+      lastLogKey = tail.length > 0 ? logKeyFor(tail[tail.length - 1]!) : null;
+      backfilled = true;
+      return;
+    }
+
+    let cutoff = -1;
+    if (lastLogKey !== null) {
+      for (let i = logs.length - 1; i >= 0; i--) {
+        if (logKeyFor(logs[i]!) === lastLogKey) {
+          cutoff = i;
+          break;
+        }
+      }
+    }
+    const fresh = logs.slice(cutoff + 1);
+    for (const entry of fresh) logPane.log(formatLogLine(entry));
+    if (fresh.length > 0) {
+      lastLogKey = logKeyFor(fresh[fresh.length - 1]!);
+    }
+  };
+
   const cycle = (delta: number): void => {
-    refreshUsernames();
     if (usernamesView.length === 0) return;
     activeIndex =
       (activeIndex + delta + usernamesView.length) % usernamesView.length;
@@ -152,17 +165,29 @@ export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
 
   // ─── Render tick ──────────────────────────────────────────────────────────
   const tick = (): void => {
-    refreshUsernames();
-    const username = usernamesView[activeIndex];
-    if (!username) {
+    const payload = readSnapshotFile();
+
+    if (!payload) {
+      statusBox.setContent(
+        "\n  {yellow-fg}waiting for orchestrator snapshot…{/}\n  {gray-fg}(is the bot running? `./scripts/botInit.sh`){/}",
+      );
+      screen.render();
+      return;
+    }
+
+    syncUsernames(payload.snapshots);
+    appendNewLogs(payload.recentLogs);
+
+    if (usernamesView.length === 0) {
       statusBox.setContent("\n  {red-fg}no bots registered{/}");
       screen.render();
       return;
     }
 
+    const username = usernamesView[activeIndex]!;
     statusBox.setLabel(renderStatusLabel(username, activeIndex, usernamesView.length));
 
-    const snap = getBotSnapshot(username);
+    const snap = payload.snapshots.find((s) => s.username === username);
     if (!snap) {
       statusBox.setContent(`\n  {red-fg}unknown bot: ${username}{/}`);
       tokenBox.setContent("");
@@ -174,7 +199,7 @@ export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
 
     // Update cache-hit history for every bot whenever a new turn lands, not
     // just the active one — so switching tabs shows a populated sparkline.
-    updateCacheHistoryForAllBots(cacheHistory, lastSeenTurns);
+    updateCacheHistoryForAllBots(payload.snapshots, cacheHistory, lastSeenTurns);
 
     statusBox.setContent(renderStatusPanel(snap));
     tokenBox.setContent(renderTokenPanel(snap));
@@ -187,25 +212,19 @@ export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
   tick();
   const interval = setInterval(tick, POLL_MS);
 
-  let unmounted = false;
   const unmount = (): void => {
-    if (unmounted) return;
-    unmounted = true;
     clearInterval(interval);
-    unsubscribeLog();
     screen.destroy();
-    setLogForwarding(true);
   };
 
   screen.key(["q", "C-c", "escape"], () => {
     unmount();
-    process.kill(process.pid, "SIGINT");
+    process.exit(0);
   });
   screen.key(["tab"], () => cycle(1));
   screen.key(["S-tab"], () => cycle(-1));
 
   screen.render();
-  return { unmount };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,25 +234,25 @@ export function mountDashboard(usernames?: readonly string[]): DashboardHandle {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function updateCacheHistoryForAllBots(
+  snapshots: BotSnapshot[],
   cacheHistory: Map<string, number[]>,
   lastSeenTurns: Map<string, number>,
 ): void {
-  for (const username of cacheHistory.keys()) {
-    const snap = getBotSnapshot(username);
-    if (!snap?.agent) continue;
+  for (const snap of snapshots) {
+    if (!snap.agent) continue;
     const turns = snap.agent.sessionUsage.turns;
-    const prevTurns = lastSeenTurns.get(username) ?? 0;
+    const prevTurns = lastSeenTurns.get(snap.username) ?? 0;
     if (turns <= prevTurns) continue;
 
-    lastSeenTurns.set(username, turns);
+    lastSeenTurns.set(snap.username, turns);
     const t = snap.agent.lastTurnUsage;
     if (!t) continue;
     const totalIn = t.input_tokens + t.cache_creation_input_tokens + t.cache_read_input_tokens;
     const pct = totalIn > 0 ? (t.cache_read_input_tokens / totalIn) * 100 : 0;
-    const history = cacheHistory.get(username) ?? [];
+    const history = cacheHistory.get(snap.username) ?? [];
     history.push(Math.round(pct));
     while (history.length > CACHE_HISTORY_MAX) history.shift();
-    cacheHistory.set(username, history);
+    cacheHistory.set(snap.username, history);
   }
 }
 
@@ -373,12 +392,14 @@ function formatLogLine(entry: LogEntry): string {
   const mm = pad2(t.getMinutes());
   const ss = pad2(t.getSeconds());
   const ts = `{gray-fg}${hh}:${mm}:${ss}{/}`;
-  const color =
-    entry.level === "error" ? "red-fg" :
-    entry.level === "warn" ? "yellow-fg" :
-    "white-fg";
+  const color: Record<LogLevel, string> = {
+    error: "red-fg",
+    warn: "yellow-fg",
+    info: "white-fg",
+    log: "white-fg",
+  };
   const text = entry.text.replace(/\r/g, "").replace(/\n/g, " ");
-  return `${ts} {${color}}${text}{/}`;
+  return `${ts} {${color[entry.level]}}${text}{/}`;
 }
 
 function formatDuration(ms: number): string {
@@ -402,3 +423,5 @@ function formatTokens(n: number): string {
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${n}`;
 }
+
+mountDashboard();

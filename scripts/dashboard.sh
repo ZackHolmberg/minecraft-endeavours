@@ -1,34 +1,40 @@
 #!/bin/bash
-# Dashboard launcher: same as dev.sh but mounts the TUI dashboard alongside
-# the orchestrator. No tsx watch (blessed and hot reload don't mix). Quit
-# with q / Esc / Ctrl+C from the dashboard.
+# Mount the read-only TUI dashboard against the running bot. Does not start
+# the MC server or the bot — use `./scripts/start.sh` and
+# `./scripts/botInit.sh` for that. Quitting the dashboard (q / Esc / Ctrl+C)
+# only kills this viewer; the bot keeps running.
 set -e
 cd "$(dirname "$0")/.."
 
-# Source .env so the orchestrator inherits MC_VERSION (and friends) from the
-# same file docker-compose uses — keeps server and bot client in lockstep.
-if [ -f .env ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . ./.env
-  set +a
+PID_FILE=".bot-runtime/bot.pid"
+SNAPSHOT_FILE=".bot-runtime/snapshot.json"
+
+if ! nc -z localhost 25565 2>/dev/null; then
+  echo "dashboard: Minecraft server is not running on localhost:25565 — start it with ./scripts/start.sh."
+  exit 1
 fi
 
-echo "Ensuring Minecraft server is up..."
-docker compose up -d minecraft
+if [ ! -f "$PID_FILE" ]; then
+  echo "dashboard: no bot is running — start one with ./scripts/botInit.sh."
+  exit 1
+fi
 
-echo "Waiting for server to accept connections on :25565..."
-for i in $(seq 1 60); do
-  if nc -z localhost 25565 2>/dev/null; then
-    echo "Server is reachable."
-    break
-  fi
-  if [ "$i" -eq 60 ]; then
-    echo "Timed out waiting for server. Check 'docker compose logs minecraft'."
+BOT_PID="$(cat "$PID_FILE")"
+if [ -z "$BOT_PID" ] || ! kill -0 "$BOT_PID" 2>/dev/null; then
+  echo "dashboard: stale PID file (process $BOT_PID is gone) — restart with ./scripts/botInit.sh."
+  exit 1
+fi
+
+# Wait briefly for the first snapshot. The dashboard itself also tolerates a
+# missing snapshot file, but exiting here gives a clearer error message if
+# the orchestrator never gets that far.
+for i in $(seq 1 25); do
+  [ -f "$SNAPSHOT_FILE" ] && break
+  if [ "$i" -eq 25 ]; then
+    echo "dashboard: no snapshot at $SNAPSHOT_FILE after 5s — check ./scripts/botLogs.sh."
     exit 1
   fi
-  sleep 2
+  sleep 0.2
 done
 
-echo "Starting orchestrator + dashboard (q / Esc / Ctrl+C to stop; MC server keeps running)..."
 exec npm run dashboard

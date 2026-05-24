@@ -5,9 +5,8 @@
   "description": "AI NPC orchestrator for the Paper Minecraft server",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "dashboard": "DASHBOARD=1 tsx src/index.ts",
+    "dashboard": "tsx src/dashboard/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

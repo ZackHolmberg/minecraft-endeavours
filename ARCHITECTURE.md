@@ -84,10 +84,15 @@ The orchestrator drives Claude through the **Claude Agent SDK** (`@anthropic-ai/
 ### Orchestrator process model
 **Hybrid (Option C).** Host process for development, Docker Compose service for steady-state — same code, different launcher.
 
-- **Dev:** `./scripts/dev.sh` brings up the MC server (`docker compose up -d`, idempotent), then runs the orchestrator with `npm run dev` in the foreground for live logs and quick restart. MC server stays up across orchestrator restarts.
-- **Steady-state:** Once the loop and skills stabilize, add a Dockerfile and an `orchestrator` service to `docker-compose.yml`. `./scripts/start.sh` then brings up everything together with no script change.
+Lifecycle is split across three pairs of scripts, each with a single job — no script controls anything outside its lane:
 
-A `package.json` at the repo root will define `dev` (nodemon-based hot reload) and `start` (plain `node`) scripts.
+- **Server control:** `./scripts/start.sh` / `./scripts/stop.sh` (docker compose).
+- **Bot control:** `./scripts/botInit.sh` is the *only* entry point for starting the orchestrator. It refuses to run if the MC server isn't reachable on `:25565` or if a previous orchestrator is still alive, then detaches `npm run start` into the background with stdout/stderr captured in `.bot-runtime/bot.log`. `./scripts/botStop.sh` sends SIGTERM and waits for graceful shutdown.
+- **Viewers (read-only):** `./scripts/botLogs.sh` (tails `.bot-runtime/bot.log`) and `./scripts/dashboard.sh` (mounts the TUI). Both refuse to run if the MC server or the bot isn't already up. Quitting either viewer never stops anything.
+
+Runtime state lives under `./.bot-runtime/` (gitignored): `bot.pid` (orchestrator writes its own to avoid npm/tsx wrapper PID issues), `bot.log` (orchestrator stdout/stderr), `snapshot.json` (500ms dump via `src/snapshot-writer.ts`, consumed by the dashboard client).
+
+**Steady-state:** Once the loop and skills stabilize, add a Dockerfile and an `orchestrator` service to `docker-compose.yml`. `./scripts/start.sh` then brings up everything together with no script change.
 
 ## Configuration
 
@@ -314,19 +319,23 @@ src/
     world-knowledge.ts      # read/write per-bot world.json (pois[] auto-captured on utility-block proximity; containers[] auto-captured via windowOpen/windowClose hook)
   observability/
     log-buffer.ts           # ring buffer wrapping console.log/info/warn/error; subscribe + forwarding toggle
-    snapshot.ts             # getBotSnapshot(username) → plain JSON-serializable struct; used by dashboard + future HTTP/WS
+    snapshot.ts             # getBotSnapshot(username) → plain JSON-serializable struct; used by snapshot-writer + future HTTP/WS
   dashboard/
-    index.ts                # multi-bot blessed-contrib TUI; Tab cycles bots; mounted when DASHBOARD=1
+    index.ts                # standalone blessed-contrib TUI; polls .bot-runtime/snapshot.json; Tab cycles bots
     blessed-contrib.d.ts    # ambient shim (no @types/blessed-contrib on DefinitelyTyped)
+  snapshot-writer.ts        # orchestrator-side: dumps getAllBotSnapshots() + recent logs to .bot-runtime/snapshot.json every 500ms
+  runtime-paths.ts          # shared on-disk paths (.bot-runtime/{bot.pid,bot.log,snapshot.json})
   config.ts                 # loads config/bots.yml, validates shape, MC_VERSION pin
   types.ts                  # cross-cutting types (BotConfig, ModelHint, …)
 config/
   bots.yml                  # versioned
 data/orchestrator/memory/<bot-username>/world.json   # per-bot world knowledge (gitignored via data/)
 scripts/
-  dev.sh                    # MC up + orchestrator (host, foreground, tsx watch)
-  dashboard.sh              # MC up + orchestrator with dashboard mounted (no watch — blessed and hot reload don't mix)
-  start.sh, stop.sh, backup.sh, console.sh           # existing
+  botInit.sh                # only entry point for starting the bot — refuses if MC down or bot already up; detaches orchestrator
+  botStop.sh                # SIGTERM the running orchestrator; waits for clean shutdown
+  botLogs.sh                # tail -F .bot-runtime/bot.log (read-only viewer)
+  dashboard.sh              # mount TUI dashboard against the running bot (read-only viewer)
+  start.sh, stop.sh, backup.sh, console.sh           # server control (docker compose) + existing
 spikes/
   sdk-spike.ts              # pinned SDK answers — see SDK_NOTES.md
   dashboard-spike.ts        # v0.3 phase 0 — confirmed blessed-contrib renders before wiring real data
@@ -374,8 +383,9 @@ See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearin
 | Interaction routing | Name-mention + `/msg` + `@all` (ambient deferred) | Covers explicit tasking; ambient cut to fit Pro token budget |
 | Claude runtime | Claude Agent SDK + Pro subscription auth | No new billing; built-in agent loop; tradeoff is 5-hour rolling rate limits |
 | Default model | Sonnet 4.6 main / Haiku 4.5 background / Opus 4.7 opt-in | Cost/quality balance; reserved escalation for hard tasks |
-| Orchestrator process | Hybrid: host `npm run dev` for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
-| Launcher scripts | `dev.sh` (host, foreground) + existing `start.sh` (compose, unchanged) | One command per mode; no double-edit of `start.sh` |
+| Orchestrator process | Hybrid: host `botInit.sh` (detached) for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
+| Launcher scripts | Three lanes: server (`start.sh`/`stop.sh`), bot (`botInit.sh`/`botStop.sh`), viewers (`botLogs.sh`/`dashboard.sh`) | Each script does one thing; viewers can't accidentally start the server or the bot |
+| Dashboard ↔ orchestrator coupling | Out-of-process via `.bot-runtime/snapshot.json` (500ms dump) | Quitting the dashboard never disturbs the bot; future HTTP/WS API has the same shape |
 | Skill scope | 28 registered skills across perception / chat / movement / world / inventory / interaction / crafting / combat / storage / survival / meta; 4 pending (`findBlock`, `findEntity`, `lookAt`, `wait` — all low-value). See [SKILLS.md](SKILLS.md) status table. | Capable from day one |
 | Architecture principle | "Push work down the stack" — middleware does anything deterministic; Claude only handles judgment | Lower latency, lower token spend, more reliable behavior |
 | Bot state | Recent-actions log (rolling 5-min), player-presence tracking, task queue — all surfaced in `observeSurroundings` | Claude reads pre-computed state instead of reconstructing from chat history |
