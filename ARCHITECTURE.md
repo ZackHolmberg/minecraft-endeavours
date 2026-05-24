@@ -135,10 +135,14 @@ Each skill is a JS function exposed to Claude as a tool. Skills take **specific,
 | World | `placeBlock` | `type, position` | Place from inventory. |
 | World | `activateBlock` | `position` | Doors, chests, levers, buttons. |
 | Inventory | `pickUpNearby` | `maxDist?` | Collect dropped items in range. |
-| Inventory | `equipItem` | `item, slot?` | Hand / armor slot. |
+| Inventory | `equipItem` | `item, slot?` | Hand / armor / off-hand slot. |
 | Inventory | `dropItem` | `item, count?` | Drop on ground. |
 | Inventory | `giveItemTo` | `player, item, count?` | Walk to player and hand off. |
-| Crafting | `craft` | `item, count?` | Handles crafting-table proximity. |
+| Inventory | `checkInventory` | — | Pre-aggregated grouped inventory (main + hotbar + armor + off-hand) with durabilities. |
+| Interaction | `activateBlock` | `position, with?` | Right-click on a block (hoe-till, bucket fill/place, flint-and-steel, plant seeds, doors, levers). |
+| Interaction | `useOnEntity` | `entity, with?` | Right-click on a mob/player (shears sheep, bucket-milk cow, name tag, dye sheep, lead, saddle). |
+| Crafting | `craft` | `item, count?, tablePos?` | Handles 2×2 inventory vs 3×3 table; falls back to remembered crafting_table from world memory. |
+| Crafting | `smelt` | `input, fuel?, count?, furnacePos?` | Composite: open furnace (auto-found or remembered), put input + fuel, take output. |
 | Combat | `attack` | `entity` | Basic melee. |
 | Combat | `flee` | `from, dist?` | Path away from threat. |
 | Chat | `say` | `message` | Public chat. |
@@ -278,8 +282,9 @@ src/
     perception.ts           # observeSurroundings (surfaces knownStorage + knownUtilities from world.json)
     movement.ts             # goTo, stop, followPlayer
     world.ts                # mineBlock, placeBlock
-    inventory.ts            # pickUpNearby, dropItem, giveItemTo
-    crafting.ts             # craft (with knownUtilities fallback for remembered tables)
+    inventory.ts            # pickUpNearby, dropItem, giveItemTo, checkInventory, equipItem
+    interaction.ts          # activateBlock, useOnEntity — right-click semantics for tool use
+    crafting.ts             # craft, smelt (both with knownUtilities fallback for remembered tables/furnaces)
     combat.ts               # attack, flee
     storage.ts              # depositToChest, withdrawFromChest
     meta.ts                 # remember, setTaskQueue, advanceTaskQueue

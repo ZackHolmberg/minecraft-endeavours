@@ -11,6 +11,29 @@ import type { Coords, SkillResult } from "./types.js";
 const TABLE_SEARCH_RADIUS = 32;
 const TABLE_REACH = 3;
 
+const FURNACE_SEARCH_RADIUS = 32;
+const FURNACE_REACH = 3;
+const SMELT_POLL_MS = 500;
+const SMELT_MS_PER_ITEM = 12_000; // 10s server-side + 2s headroom for network jitter
+
+/**
+ * Items-smelted-per-fuel-unit lookup. Anything not listed falls through to
+ * `FUEL_DEFAULT_BURN` — most plant materials (wood, planks, sticks-ish) burn
+ * for one item at minimum, so undercounting is safer than overrunning out
+ * of fuel mid-batch. Numbers from the vanilla Minecraft wiki (burn-time /
+ * 200 ticks per smelt).
+ */
+const FUEL_BURN_PER_UNIT: ReadonlyMap<string, number> = new Map([
+  ["coal", 8],
+  ["charcoal", 8],
+  ["coal_block", 80],
+  ["lava_bucket", 100],
+  ["dried_kelp_block", 20],
+  ["blaze_rod", 12],
+]);
+const FUEL_DEFAULT_BURN = 1;
+const FUEL_PREFERENCE_ORDER = ["coal", "charcoal", "coal_block", "blaze_rod", "dried_kelp_block"];
+
 interface BotWithPathfinder extends Bot {
   pathfinder: Pathfinder;
 }
@@ -203,4 +226,231 @@ function ensureMovements(bot: BotWithPathfinder): void {
 
 function fmt(v: { x: number; y: number; z: number }): string {
   return `(${Math.round(v.x)}, ${Math.round(v.y)}, ${Math.round(v.z)})`;
+}
+
+export interface SmeltParams {
+  /** Item ID to smelt, e.g. "raw_iron", "raw_copper", "sand". */
+  input: string;
+  /** Fuel item ID. If omitted, the bot picks the best available from inventory. */
+  fuel?: string;
+  /** How many to smelt. Default 1. */
+  count?: number;
+  /** Optional explicit furnace position. Otherwise auto-resolves (nearby → remembered POI). */
+  furnacePos?: Coords;
+}
+
+/**
+ * Composite smelting. Closes the multi-step production loop alongside
+ * `craft`: mine ore → walk to remembered furnace → `smelt` → walk to
+ * crafting table → `craft`. Same furnace-resolution fallback as `craft`'s
+ * table resolution (caller → nearby 32 blocks → remembered POI from
+ * world.json) so the bot can return to a remembered furnace from deep in
+ * a cave.
+ *
+ * Fuel auto-pick: when `fuel` is omitted, prefers coal → charcoal →
+ * coal_block → blaze_rod → dried_kelp_block. Falls back to "any burnable in
+ * inventory" assumption of 1 item per unit if nothing in the preference
+ * list is available.
+ */
+export async function smelt(
+  bot: Bot,
+  { input, fuel, count = 1, furnacePos }: SmeltParams,
+): Promise<SkillResult> {
+  if (!input) return { ok: false, message: "input is required" };
+  if (count < 1) return { ok: false, message: `count must be >= 1, got ${count}` };
+
+  const inputData = bot.registry.itemsByName[input];
+  if (!inputData) return { ok: false, message: `unknown input item "${input}"` };
+  const haveInput = bot.inventory.count(inputData.id, null);
+  if (haveInput < count) {
+    return {
+      ok: false,
+      message: `cannot smelt ${count} ${input}: only ${haveInput} in inventory`,
+    };
+  }
+
+  // Resolve fuel — either caller-provided or auto-pick.
+  const fuelResolved = resolveFuel(bot, fuel, count);
+  if (!fuelResolved.ok) return fuelResolved;
+  const { item: fuelItem, units: fuelUnits } = fuelResolved;
+
+  // Resolve furnace.
+  const furnaceResolution = await resolveFurnace(bot, furnacePos);
+  if (!furnaceResolution.ok) return furnaceResolution;
+  const { block: furnaceBlock, source } = furnaceResolution;
+
+  // Walk to furnace.
+  const pBot = bot as BotWithPathfinder;
+  ensureMovements(pBot);
+  try {
+    await pBot.pathfinder.goto(
+      new goals.GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, FURNACE_REACH),
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `couldn't reach ${furnaceBlock.name} at ${fmt(furnaceBlock.position)} (${source}): ${message}` };
+  }
+
+  // Open furnace.
+  let furnace;
+  try {
+    furnace = await bot.openFurnace(furnaceBlock);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `failed to open furnace at ${fmt(furnaceBlock.position)}: ${message}` };
+  }
+
+  let collected = 0;
+  try {
+    // Put input first so progress can start as soon as fuel hits.
+    try {
+      await furnace.putInput(inputData.id, null, count);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `putInput ${count} ${input} failed: ${message}` };
+    }
+    try {
+      await furnace.putFuel(fuelItem.type, null, fuelUnits);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `putFuel ${fuelUnits} ${fuelItem.name} failed: ${message}` };
+    }
+
+    // Poll for output. Each smelt is ~10s server-side; budget 12s per item.
+    const deadline = Date.now() + count * SMELT_MS_PER_ITEM;
+    while (collected < count) {
+      if (Date.now() > deadline) {
+        return {
+          ok: false,
+          message: `smelt timeout: collected ${collected} of ${count} ${input} from furnace at ${fmt(furnaceBlock.position)}`,
+          state: { collected },
+        };
+      }
+      await sleep(SMELT_POLL_MS);
+      const output = furnace.outputItem();
+      if (output && output.count > 0) {
+        try {
+          const taken = await furnace.takeOutput();
+          collected += taken.count;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            ok: false,
+            message: `takeOutput from furnace at ${fmt(furnaceBlock.position)} failed: ${message}`,
+            state: { collected },
+          };
+        }
+      }
+    }
+  } finally {
+    furnace.close();
+  }
+
+  return {
+    ok: true,
+    message: `smelted ${collected} ${input} at furnace ${fmt(furnaceBlock.position)} (${source})`,
+    state: { collected, furnace: furnaceBlock.name, pos: { x: furnaceBlock.position.x, y: furnaceBlock.position.y, z: furnaceBlock.position.z } },
+  };
+}
+
+type FuelResolution =
+  | { ok: true; item: { type: number; name: string }; units: number }
+  | { ok: false; message: string };
+
+function resolveFuel(bot: Bot, fuelName: string | undefined, smeltCount: number): FuelResolution {
+  if (fuelName) {
+    const fuelData = bot.registry.itemsByName[fuelName];
+    if (!fuelData) return { ok: false, message: `unknown fuel "${fuelName}"` };
+    const per = FUEL_BURN_PER_UNIT.get(fuelName) ?? FUEL_DEFAULT_BURN;
+    const units = Math.ceil(smeltCount / per);
+    const have = bot.inventory.count(fuelData.id, null);
+    if (have < units) {
+      return {
+        ok: false,
+        message: `not enough fuel: need ${units} ${fuelName} (smelts ${per}/unit), have ${have}`,
+      };
+    }
+    return { ok: true, item: { type: fuelData.id, name: fuelName }, units };
+  }
+
+  // Auto-pick. Walk the preference order; first one with enough wins.
+  for (const candidate of FUEL_PREFERENCE_ORDER) {
+    const data = bot.registry.itemsByName[candidate];
+    if (!data) continue;
+    const per = FUEL_BURN_PER_UNIT.get(candidate) ?? FUEL_DEFAULT_BURN;
+    const units = Math.ceil(smeltCount / per);
+    const have = bot.inventory.count(data.id, null);
+    if (have >= units) return { ok: true, item: { type: data.id, name: candidate }, units };
+  }
+  return {
+    ok: false,
+    message: `no fuel in inventory; tried ${FUEL_PREFERENCE_ORDER.join(", ")}`,
+  };
+}
+
+type FurnaceResolution =
+  | { ok: true; block: Block; source: "caller" | "nearby" | "remembered" }
+  | { ok: false; message: string };
+
+async function resolveFurnace(bot: Bot, furnacePos?: Coords): Promise<FurnaceResolution> {
+  if (furnacePos) {
+    const block = bot.blockAt(new Vec3(furnacePos.x, furnacePos.y, furnacePos.z));
+    if (!block) {
+      return {
+        ok: false,
+        message: `chunk at ${fmt(new Vec3(furnacePos.x, furnacePos.y, furnacePos.z))} isn't loaded — walk closer first`,
+      };
+    }
+    if (!isFurnaceFamily(block.name)) {
+      return {
+        ok: false,
+        message: `block at ${fmt(block.position)} is ${block.name}, not a furnace`,
+      };
+    }
+    return { ok: true, block, source: "caller" };
+  }
+
+  const ids = ["furnace", "blast_furnace", "smoker"]
+    .map((n) => bot.registry.blocksByName[n]?.id)
+    .filter((id): id is number => id !== undefined);
+  if (ids.length > 0) {
+    const nearby = bot.findBlock({
+      point: bot.entity.position,
+      matching: ids,
+      maxDistance: FURNACE_SEARCH_RADIUS,
+    });
+    if (nearby) return { ok: true, block: nearby, source: "nearby" };
+  }
+
+  const world = await readWorldKnowledge(bot.username);
+  const remembered = world.pois
+    .filter((p) => isFurnaceFamily(p.type))
+    .map((p) => ({ p, dist: bot.entity.position.distanceTo(new Vec3(p.position.x, p.position.y, p.position.z)) }))
+    .sort((a, b) => a.dist - b.dist)[0];
+
+  if (remembered) {
+    const block = bot.blockAt(
+      new Vec3(remembered.p.position.x, remembered.p.position.y, remembered.p.position.z),
+    );
+    if (block && isFurnaceFamily(block.name)) {
+      return { ok: true, block, source: "remembered" };
+    }
+    return {
+      ok: false,
+      message: `nearest remembered ${remembered.p.type} is at ${fmt(new Vec3(remembered.p.position.x, remembered.p.position.y, remembered.p.position.z))} (~${Math.round(remembered.dist)} blocks away) but the chunk isn't loaded — walk closer first`,
+    };
+  }
+
+  return {
+    ok: false,
+    message: `no furnace within ${FURNACE_SEARCH_RADIUS} blocks and none remembered in world memory`,
+  };
+}
+
+function isFurnaceFamily(name: string): boolean {
+  return name === "furnace" || name === "blast_furnace" || name === "smoker";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

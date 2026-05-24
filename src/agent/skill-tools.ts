@@ -16,11 +16,14 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import type { Bot } from "mineflayer";
 import { z } from "zod";
 import {
+  activateBlock,
   advanceTaskQueue,
   attack,
+  checkInventory,
   craft,
   depositToChest,
   dropItem,
+  equipItem,
   flee,
   followPlayer,
   giveItemTo,
@@ -32,7 +35,9 @@ import {
   remember,
   say,
   setTaskQueue,
+  smelt,
   stop,
+  useOnEntity,
   whisper,
   withdrawFromChest,
 } from "../skills/index.js";
@@ -43,6 +48,7 @@ export const MCP_SERVER_NAME = "minecraft-skills";
 
 const SKILL_NAMES = [
   "observeSurroundings",
+  "checkInventory",
   "say",
   "whisper",
   "goTo",
@@ -53,7 +59,11 @@ const SKILL_NAMES = [
   "pickUpNearby",
   "dropItem",
   "giveItemTo",
+  "equipItem",
+  "activateBlock",
+  "useOnEntity",
   "craft",
+  "smelt",
   "attack",
   "flee",
   "depositToChest",
@@ -184,6 +194,45 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
       ),
 
       tool(
+        "checkInventory",
+        "Read-only inventory report. Returns a grouped list of every item in main inventory + hotbar + armor + off-hand, with stack counts, durability for tools, and equipped-slot annotations. Call this BEFORE trying to use a specific tool — observeSurroundings only shows the currently-held item, not what else is available.",
+        {},
+        async () => toToolResult(await runSkill(bot, "checkInventory", undefined, () => checkInventory(bot))),
+      ),
+
+      tool(
+        "equipItem",
+        "Equip an item from inventory to a slot. Slot defaults to 'hand'. Most item-use skills (activateBlock, useOnEntity) accept an optional `with` parameter that calls this internally — use equipItem directly when you need to equip armor or off-hand items, or to set up before a sequence of skills that all use the same tool.",
+        {
+          item: z.string().min(1).describe("Item ID, e.g. 'iron_pickaxe', 'shears', 'iron_helmet'"),
+          slot: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]).optional(),
+        },
+        async (args) => toToolResult(await runSkill(bot, "equipItem", args, (p) => equipItem(bot, p))),
+      ),
+
+      tool(
+        "activateBlock",
+        "Right-click on a block at the given position. Covers hoe → till dirt to farmland, flint_and_steel → ignite, bucket → fill from water/lava source, water_bucket/lava_bucket → place liquid, bone_meal → grow crop, seeds → plant on farmland, doors/trapdoors/levers/buttons → toggle, jukebox → insert disc. Pass `with` to auto-equip the tool first.",
+        {
+          position: posSchema,
+          with: z.string().optional().describe("Item ID to equip to hand before activating (e.g. 'iron_hoe', 'bucket')"),
+        },
+        async (args) =>
+          toToolResult(await runSkill(bot, "activateBlock", args, (p) => activateBlock(bot, p))),
+      ),
+
+      tool(
+        "useOnEntity",
+        "Right-click on an entity (mob or player). Covers shears → sheep (collect wool without killing), bucket → cow (milk), name_tag → entity (rename), dye → sheep (color wool), lead → animal, saddle → horse, glass_bottle → cow (honey/water from sources). Pass `with` to auto-equip the tool first.",
+        {
+          entity: z.string().min(1).describe("Mob type ('sheep', 'cow', 'pig') or player username"),
+          with: z.string().optional().describe("Item ID to equip to hand before using (e.g. 'shears', 'bucket')"),
+        },
+        async (args) =>
+          toToolResult(await runSkill(bot, "useOnEntity", args, (p) => useOnEntity(bot, p))),
+      ),
+
+      tool(
         "craft",
         "Craft `count` of `item`. Composite: resolve a recipe, walk to a crafting table if the recipe needs one (2×2 recipes use inventory; 3×3 need a table), call bot.craft. Table resolution order: caller-supplied `tablePos` → crafting_table within 32 blocks → nearest remembered crafting_table from world memory. Failure messages name the missing ingredient and shortfall count.",
         {
@@ -192,6 +241,18 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
           tablePos: posSchema.optional().describe("Explicit crafting table position; omit to auto-find"),
         },
         async (args) => toToolResult(await runSkill(bot, "craft", args, (p) => craft(bot, p))),
+      ),
+
+      tool(
+        "smelt",
+        "Smelt `count` of `input` in a furnace. Composite: resolve furnace (caller-supplied → nearby 32 blocks → nearest remembered furnace POI), walk to it, put input + fuel, wait for output, take it. Fuel is auto-picked from inventory when omitted (prefers coal → charcoal → coal_block → blaze_rod → dried_kelp_block). Closes the iron-armor loop: mine raw_iron → smelt → craft.",
+        {
+          input: z.string().min(1).describe("Item ID to smelt, e.g. 'raw_iron', 'raw_copper', 'sand', 'beef'"),
+          fuel: z.string().optional().describe("Fuel item ID; omit to auto-pick best fuel from inventory"),
+          count: z.number().int().min(1).max(64).optional().describe("How many to smelt (default 1)"),
+          furnacePos: posSchema.optional().describe("Explicit furnace position; omit to auto-find"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "smelt", args, (p) => smelt(bot, p))),
       ),
 
       tool(

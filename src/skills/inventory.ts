@@ -1,7 +1,8 @@
-import type { Bot } from "mineflayer";
+import type { Bot, EquipmentDestination } from "mineflayer";
 import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 
 const { goals, Movements } = pathfinderPkg;
+import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { goTo } from "./movement.js";
 import type { SkillResult } from "./types.js";
@@ -11,6 +12,20 @@ const PICKUP_MAX_RADIUS = 32;
 const PICKUP_PER_ITEM_WAIT_MS = 350;
 const POST_GOTO_PICKUP_WAIT_MS = 250;
 const GIVE_DROP_REACH = 2;
+
+// Slot indices inside the player's own inventory window (prismarine-windows
+// PlayerWin layout): 5–8 are armor (head/torso/legs/feet), 45 is the off-hand.
+const ARMOR_SLOTS = { head: 5, torso: 6, legs: 7, feet: 8 } as const;
+const OFFHAND_SLOT = 45;
+
+const EQUIPMENT_DESTINATIONS = new Set<EquipmentDestination>([
+  "hand",
+  "off-hand",
+  "head",
+  "torso",
+  "legs",
+  "feet",
+]);
 
 interface BotWithPathfinder extends Bot {
   pathfinder: Pathfinder;
@@ -235,4 +250,168 @@ function ensureMovements(bot: BotWithPathfinder): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface CheckInventoryParams {
+  // No params — always returns the full grouped view.
+}
+
+interface InventoryGroup {
+  name: string;
+  count: number;
+  /** Number of slots this item occupies (separate stacks). */
+  stacks: number;
+  /** Percent durability remaining, only for damageable items. */
+  durabilityPct?: number;
+  /** Where this item is equipped, if anywhere. */
+  equippedAt?: EquipmentDestination;
+}
+
+/**
+ * Read-only inventory report. Aggregates main inventory + hotbar + armor +
+ * off-hand into a flat grouped list, with durability for damageable items
+ * and equipped-slot annotations. Without this skill the model only sees
+ * `heldItem` via observeSurroundings — it can't know whether shears /
+ * buckets / hoes / etc. are available before trying to use them.
+ */
+export async function checkInventory(bot: Bot, _params: CheckInventoryParams = {}): Promise<SkillResult> {
+  void _params;
+  const slots = bot.inventory.slots;
+  const armorSlots = bot.inventory.slots;
+
+  const heldStackIndex = bot.heldItem ? bot.inventory.hotbarStart + bot.quickBarSlot : -1;
+
+  type Entry = InventoryGroup & { _slots: number[] };
+  const groups = new Map<string, Entry>();
+
+  const recordItem = (item: Item, slotIdx: number, equippedAt?: EquipmentDestination): void => {
+    let entry = groups.get(item.name);
+    if (!entry) {
+      entry = {
+        name: item.name,
+        count: 0,
+        stacks: 0,
+        _slots: [],
+      };
+      groups.set(item.name, entry);
+    }
+    entry.count += item.count;
+    entry.stacks += 1;
+    entry._slots.push(slotIdx);
+    if (item.maxDurability && item.maxDurability > 0) {
+      const used = item.durabilityUsed ?? 0;
+      const pct = Math.max(0, Math.round(((item.maxDurability - used) / item.maxDurability) * 100));
+      // For multi-stack tools, take the freshest durability we've seen.
+      if (entry.durabilityPct === undefined || pct > entry.durabilityPct) {
+        entry.durabilityPct = pct;
+      }
+    }
+    if (equippedAt && entry.equippedAt === undefined) entry.equippedAt = equippedAt;
+  };
+
+  // Main inventory + hotbar — bot.inventory.items() returns just these.
+  for (const item of bot.inventory.items()) {
+    const slotIdx = item.slot;
+    const equippedAt: EquipmentDestination | undefined = slotIdx === heldStackIndex ? "hand" : undefined;
+    recordItem(item, slotIdx, equippedAt);
+  }
+
+  // Armor + off-hand are outside items(); read by slot index.
+  for (const [name, slotIdx] of Object.entries(ARMOR_SLOTS) as Array<[keyof typeof ARMOR_SLOTS, number]>) {
+    const item = armorSlots[slotIdx] as Item | null | undefined;
+    if (!item) continue;
+    recordItem(item, slotIdx, name);
+  }
+  const offhand = armorSlots[OFFHAND_SLOT] as Item | null | undefined;
+  if (offhand) recordItem(offhand, OFFHAND_SLOT, "off-hand");
+
+  const groupsOut: InventoryGroup[] = [...groups.values()]
+    .map(({ _slots, ...rest }) => {
+      void _slots;
+      return rest;
+    })
+    .sort((a, b) => b.count - a.count);
+
+  // ~36 main+hotbar slots; off-hand and armor are separate.
+  const mainCapacity = bot.inventory.inventoryEnd - bot.inventory.inventoryStart + 9;
+  const occupied = bot.inventory.items().length;
+
+  const summary = groupsOut
+    .slice(0, 6)
+    .map((g) =>
+      g.durabilityPct !== undefined
+        ? `${g.name} (${g.durabilityPct}%)`
+        : g.count > 1
+          ? `${g.count} ${g.name}`
+          : g.name,
+    )
+    .join(", ");
+  const message = groupsOut.length === 0
+    ? "inventory empty"
+    : `${summary}${groupsOut.length > 6 ? ` (+${groupsOut.length - 6} more)` : ""}; ${occupied}/${mainCapacity} slots used`;
+
+  return {
+    ok: true,
+    message,
+    state: {
+      groups: groupsOut,
+      heldItem: bot.heldItem ? { name: bot.heldItem.name, count: bot.heldItem.count } : null,
+      occupiedSlots: occupied,
+      mainCapacity,
+    },
+  };
+}
+
+export interface EquipItemParams {
+  item: string;
+  slot?: EquipmentDestination;
+}
+
+/**
+ * Explicit equip to a destination slot. Defaults to `hand`. Lookup is by
+ * item name across the entire inventory (main + hotbar + already-equipped
+ * armor). Failures distinguish "not in inventory" from "equip API rejected".
+ */
+export async function equipItem(
+  bot: Bot,
+  { item, slot = "hand" }: EquipItemParams,
+): Promise<SkillResult> {
+  if (!item) return { ok: false, message: "item is required" };
+  if (!EQUIPMENT_DESTINATIONS.has(slot)) {
+    return {
+      ok: false,
+      message: `slot must be one of hand / off-hand / head / torso / legs / feet; got "${slot}"`,
+    };
+  }
+
+  const itemData = bot.registry.itemsByName[item];
+  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
+
+  // Already in the requested slot? Skip the API call.
+  if (slot === "hand" && bot.heldItem?.type === itemData.id) {
+    return { ok: true, message: `already holding ${item}`, state: { equipped: item, slot } };
+  }
+
+  const stack = bot.inventory.items().find((i) => i.type === itemData.id);
+  // Also check armor slots — re-equipping armor that's already worn is a no-op
+  // path the API handles, but we want a specific message either way.
+  const allSlots = bot.inventory.slots;
+  const armorStack = !stack
+    ? Object.values(ARMOR_SLOTS).map((idx) => allSlots[idx]).find((i) => i?.type === itemData.id)
+    : null;
+  const offhandStack = !stack && !armorStack && (allSlots[OFFHAND_SLOT] as Item | null | undefined)?.type === itemData.id
+    ? (allSlots[OFFHAND_SLOT] as Item)
+    : null;
+  const found = stack ?? armorStack ?? offhandStack;
+  if (!found) {
+    return { ok: false, message: `no ${item} in inventory to equip` };
+  }
+
+  try {
+    await bot.equip(found, slot);
+    return { ok: true, message: `equipped ${item} (${slot})`, state: { equipped: item, slot } };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `equip ${item} → ${slot} failed: ${message}` };
+  }
 }

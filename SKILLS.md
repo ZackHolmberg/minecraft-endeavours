@@ -27,7 +27,8 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `remember`, `setTaskQueue`, `advanceTaskQueue` | ✅ Implemented in slice 3 (phase 2) |
 | `stop`, `followPlayer`, `placeBlock`, `pickUpNearby`, `dropItem`, `giveItemTo` | ✅ Implemented in v0.3+ priority batch |
 | `craft`, `attack`, `flee`, `depositToChest`, `withdrawFromChest` | ✅ Implemented in v0.3+ follow-on batch |
-| `findBlock`, `findEntity`, `checkInventory`, `lookAt`, `activateBlock`, `equipItem`, `wait` | ⏳ Pending |
+| `checkInventory`, `equipItem`, `activateBlock`, `useOnEntity`, `smelt` | ✅ Implemented in v0.3+ tool-use slice |
+| `findBlock`, `findEntity`, `lookAt`, `useItem`, `eat`, `fish`, `sleepIn`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
 
@@ -288,6 +289,104 @@ Drops from every matching inventory stack until `count` is satisfied. If `count`
 |---|---|
 | Success | `dropped <K> <item>` |
 | Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no <item> in inventory to drop` · `dropped <K> of <N> <item>; toss failed: <msg>` · `dropped <K> of <N> <item>; only <M> were available` |
+
+---
+
+### `checkInventory` — grouped inventory report
+
+```ts
+checkInventory(bot, {}): Promise<SkillResult>
+```
+
+Read-only. Aggregates main inventory + hotbar + armor + off-hand into a grouped list: per-item name, total count, stack count, durability percent for damageable items, and the equipped-slot annotation when worn/held. `observeSurroundings` only returns `heldItem` — call this before any tool-use chain to know what's actually available.
+
+| | |
+|---|---|
+| Success | `inventory empty` · `<summary>; <occupied>/<capacity> slots used` (e.g. `64 cobblestone, iron_pickaxe (65%), 24 oak_log; 14/36 slots used`) |
+| Failures | None expected — read-only. Exceptions become `checkInventory crashed: <msg>` via the harness. |
+
+**State shape:** `{ groups: InventoryGroup[], heldItem, occupiedSlots, mainCapacity }`. Each group: `{ name, count, stacks, durabilityPct?, equippedAt? }`.
+
+---
+
+### `equipItem` — explicit equip to hand / armor / off-hand
+
+```ts
+equipItem(bot, { item: string, slot?: "hand" | "off-hand" | "head" | "torso" | "legs" | "feet" }): Promise<SkillResult>
+```
+
+Defaults `slot` to `hand`. Lookup is by item name across main + hotbar + already-equipped slots. No-ops when the requested item is already in the requested slot.
+
+The natural one-shot pattern for tool use is `activateBlock({ ..., with })` or `useOnEntity({ ..., with })`, which call this internally. Reach for `equipItem` directly when:
+- equipping armor (`{ item: "iron_helmet", slot: "head" }`),
+- equipping off-hand (`{ item: "shield", slot: "off-hand" }`),
+- holding a tool for many subsequent calls without re-equipping each time.
+
+| | |
+|---|---|
+| Success | `equipped <item> (<slot>)` · `already holding <item>` |
+| Failures | `item is required` · `slot must be one of hand / off-hand / head / torso / legs / feet; got "<x>"` · `unknown item "<name>"` · `no <item> in inventory to equip` · `equip <item> → <slot> failed: <msg>` |
+
+---
+
+### `activateBlock` — right-click on a block
+
+```ts
+activateBlock(bot, { position: Coords, with?: string }): Promise<SkillResult>
+```
+
+Wraps `bot.activateBlock`. Walks within 3 blocks of the target, optionally equips `with` first, then right-clicks. Validates that the chunk is loaded and the target isn't air.
+
+Coverage (the common item / block combinations the model is expected to reach for):
+- Doors / trapdoors / levers / buttons → toggle (no `with` needed).
+- Hoe → till dirt to farmland.
+- Flint and steel → ignite the target face.
+- Empty bucket on a water/lava source → fills the bucket.
+- Water/lava bucket → place the liquid at the target.
+- Bone meal on a crop → instant growth tick.
+- Seeds on farmland → plant.
+- Jukebox, composter, brewing stand-style passive opens.
+
+| | |
+|---|---|
+| Success | `activated <block> at (x, y, z)` · `activated <block> at (x, y, z) with <held>` |
+| Failures | `position is required` · `chunk at (x, y, z) isn't loaded — walk closer first` · `block at (x, y, z) is air — nothing to activate` · `couldn't reach <block> at (x, y, z): <msg>` · `cannot activate with "<item>": <equip failure>` · `activate <block> at (x, y, z) [with <item>] failed: <msg>` |
+
+---
+
+### `useOnEntity` — right-click on an entity
+
+```ts
+useOnEntity(bot, { entity: string, with?: string }): Promise<SkillResult>
+```
+
+Wraps `bot.useOn`. Walks within 3 blocks of the entity's last-known position, optionally equips `with`, faces the entity, then right-clicks. Re-resolves the entity post-walk in case it moved or despawned.
+
+Coverage: shears → sheep (wool), bucket → cow (milk), name tag → entity (rename), dye → sheep (color), lead → animal, saddle → horse, armor → horse, glass bottle → cow / other.
+
+| | |
+|---|---|
+| Success | `used <held> on <entity>` · `used empty hand on <entity>` |
+| Failures | `entity is required` · `entity "<name>" not visible to the bot` · `couldn't reach <entity>: <msg>` · `cannot use on <entity> with "<item>": <equip failure>` · `lost sight of <entity> after walking` · `useOn <entity> [with <item>] failed: <msg>` |
+
+---
+
+### `smelt` — composite smelting (closes the iron-armor loop)
+
+```ts
+smelt(bot, { input: string, fuel?: string, count?: number, furnacePos?: Coords }): Promise<SkillResult>
+```
+
+Furnace resolution mirrors `craft`'s table resolution: caller-supplied → nearest within 32 blocks → nearest remembered furnace POI from world memory. This is what lets the bot return from a cave to a remembered furnace at base, smelt, then walk to a remembered crafting table.
+
+Fuel resolution: caller-supplied wins; otherwise auto-picks the highest-preference fuel actually in inventory, walking `coal → charcoal → coal_block → blaze_rod → dried_kelp_block`. Fuel-per-unit assumed: coal/charcoal = 8 items, coal_block = 80, blaze_rod = 12, dried_kelp_block = 20, lava_bucket = 100; anything else falls back to 1 item per unit (conservative).
+
+Polls `furnace.outputItem()` every 500ms with a 12s budget per smelted item.
+
+| | |
+|---|---|
+| Success | `smelted <N> <input> at furnace (x, y, z) (<source>)` |
+| Failures | `input is required` · `count must be >= 1, got <n>` · `unknown input item "<name>"` · `cannot smelt <N> <input>: only <K> in inventory` · `unknown fuel "<name>"` · `not enough fuel: need <K> <fuel> (smelts <per>/unit), have <H>` · `no fuel in inventory; tried coal, charcoal, coal_block, blaze_rod, dried_kelp_block` · `block at (x, y, z) is <name>, not a furnace` · `no furnace within 32 blocks and none remembered in world memory` · `nearest remembered <type> is at (x, y, z) (~D blocks away) but the chunk isn't loaded — walk closer first` · `couldn't reach <furnace> at (x, y, z) (<source>): <msg>` · `failed to open furnace at (x, y, z): <msg>` · `putInput <N> <input> failed: <msg>` · `putFuel <K> <fuel> failed: <msg>` · `smelt timeout: collected <K> of <N> <input> from furnace at (x, y, z)` · `takeOutput from furnace at (x, y, z) failed: <msg>` |
 
 ---
 
