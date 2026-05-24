@@ -82,6 +82,52 @@ export async function activateBlock(
   };
 }
 
+export interface UseItemParams {
+  /** Optional item to equip before using. */
+  with?: string;
+  /** Use the off-hand item instead of the main-hand. Defaults to main-hand. */
+  offhand?: boolean;
+}
+
+/**
+ * Right-click in mid-air with the held item. Wraps `bot.activateItem`. Use
+ * for fire-and-forget interactions that don't target a block or entity:
+ * throwing an ender pearl, throwing a splash / lingering potion, casting
+ * the fishing rod manually (prefer the dedicated `fish` skill instead),
+ * charging a bow or crossbow.
+ *
+ * Eating food and drinking potions go through the dedicated `eat` skill
+ * which handles the equip + activate + consume cycle in one shot. Don't
+ * use `useItem` for those — it starts the action but doesn't finish it.
+ */
+export async function useItem(
+  bot: Bot,
+  { with: withItem, offhand = false }: UseItemParams = {},
+): Promise<SkillResult> {
+  if (withItem) {
+    const equip = await equipItem(bot, { item: withItem, slot: offhand ? "off-hand" : "hand" });
+    if (!equip.ok) return { ok: false, message: `cannot use "${withItem}": ${equip.message}` };
+  }
+  const held = offhand ? bot.inventory.slots[45] : bot.heldItem;
+  if (!held) {
+    return {
+      ok: false,
+      message: offhand ? "off-hand is empty" : "hand is empty — equip something first or pass `with`",
+    };
+  }
+  try {
+    bot.activateItem(offhand);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `activateItem ${held.name} failed: ${message}` };
+  }
+  return {
+    ok: true,
+    message: `used ${held.name}${offhand ? " (off-hand)" : ""}`,
+    state: { used: held.name, offhand },
+  };
+}
+
 export interface UseOnEntityParams {
   entity: string;
   /** Optional item to equip before using. See ActivateBlockParams.with. */

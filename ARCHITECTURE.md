@@ -141,8 +141,12 @@ Each skill is a JS function exposed to Claude as a tool. Skills take **specific,
 | Inventory | `checkInventory` | — | Pre-aggregated grouped inventory (main + hotbar + armor + off-hand) with durabilities. |
 | Interaction | `activateBlock` | `position, with?` | Right-click on a block (hoe-till, bucket fill/place, flint-and-steel, plant seeds, doors, levers). |
 | Interaction | `useOnEntity` | `entity, with?` | Right-click on a mob/player (shears sheep, bucket-milk cow, name tag, dye sheep, lead, saddle). |
+| Interaction | `useItem` | `with?, offhand?` | Right-click in mid-air (throw pearl, throw splash potion, charge bow). Not for food — use `eat`. |
 | Crafting | `craft` | `item, count?, tablePos?` | Handles 2×2 inventory vs 3×3 table; falls back to remembered crafting_table from world memory. |
 | Crafting | `smelt` | `input, fuel?, count?, furnacePos?` | Composite: open furnace (auto-found or remembered), put input + fuel, take output. |
+| Survival | `eat` | `item?` | Composite: equip food, consume. Auto-picks best food when `item` omitted. |
+| Survival | `fish` | — | Wraps bot.fish; cancellable; 5-minute timeout. Requires fishing_rod in hand. |
+| Survival | `sleepIn` | `pos?` | Wraps bot.sleep with the same fallback ladder (caller → nearby `*_bed` 32 blocks → remembered bed POI). |
 | Combat | `attack` | `entity` | Basic melee. |
 | Combat | `flee` | `from, dist?` | Path away from threat. |
 | Chat | `say` | `message` | Public chat. |
@@ -283,10 +287,12 @@ src/
     movement.ts             # goTo, stop, followPlayer
     world.ts                # mineBlock, placeBlock
     inventory.ts            # pickUpNearby, dropItem, giveItemTo, checkInventory, equipItem
-    interaction.ts          # activateBlock, useOnEntity — right-click semantics for tool use
+    interaction.ts          # activateBlock, useOnEntity, useItem — right-click semantics for tool use
     crafting.ts             # craft, smelt (both with knownUtilities fallback for remembered tables/furnaces)
     combat.ts               # attack, flee
     storage.ts              # depositToChest, withdrawFromChest
+    survival.ts             # eat, fish, sleepIn
+    item-naming.ts          # normalize + did-you-mean lookup for item/block IDs (shared helper)
     meta.ts                 # remember, setTaskQueue, advanceTaskQueue
   state/
     index.ts                # BotState bundle + per-bot registry

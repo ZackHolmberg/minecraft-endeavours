@@ -23,7 +23,9 @@ import {
   craft,
   depositToChest,
   dropItem,
+  eat,
   equipItem,
+  fish,
   flee,
   followPlayer,
   giveItemTo,
@@ -35,8 +37,10 @@ import {
   remember,
   say,
   setTaskQueue,
+  sleepIn,
   smelt,
   stop,
+  useItem,
   useOnEntity,
   whisper,
   withdrawFromChest,
@@ -62,6 +66,10 @@ const SKILL_NAMES = [
   "equipItem",
   "activateBlock",
   "useOnEntity",
+  "useItem",
+  "eat",
+  "fish",
+  "sleepIn",
   "craft",
   "smelt",
   "attack",
@@ -230,6 +238,41 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
         },
         async (args) =>
           toToolResult(await runSkill(bot, "useOnEntity", args, (p) => useOnEntity(bot, p))),
+      ),
+
+      tool(
+        "useItem",
+        "Right-click in mid-air with the held item (or off-hand item). Fire-and-forget — does not wait for any animation to complete. Use for: throwing an ender pearl, throwing a splash/lingering potion, starting to charge a bow or crossbow, casting a fishing rod manually (prefer the `fish` skill). DO NOT use for eating food or drinking potions — use the `eat` skill instead, which handles the full activate-then-consume cycle.",
+        {
+          with: z.string().optional().describe("Item ID to equip first (e.g. 'ender_pearl', 'bow')"),
+          offhand: z.boolean().optional().describe("Use the off-hand item instead of main-hand"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "useItem", args, (p) => useItem(bot, p))),
+      ),
+
+      tool(
+        "eat",
+        "Eat food. Composite: equip the food → call bot.consume which handles the activate-then-finish cycle. When `item` is omitted, picks the best available food from inventory (cooked > raw, higher saturation first). Won't eat when food is already 20/20 unless an explicit `item` was passed.",
+        {
+          item: z.string().optional().describe("Specific food item; omit to auto-pick best from inventory"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "eat", args, (p) => eat(bot, p))),
+      ),
+
+      tool(
+        "fish",
+        "Cast a fishing rod and wait for a bite. Requires fishing_rod in main-hand (equipItem first if needed) and water within casting range. Cancellable via the `stop` skill or the chat side-channel — reels in early on cancel. Times out after 5 minutes with no bite.",
+        {},
+        async () => toToolResult(await runSkill(bot, "fish", undefined, () => fish(bot))),
+      ),
+
+      tool(
+        "sleepIn",
+        "Sleep in a bed. Bed resolution: caller-supplied `pos` → nearest *_bed within 32 blocks → nearest remembered bed POI from world memory. Walks within reach, then calls bot.sleep. Vanilla preconditions apply: must be night (or thunderstorm), bed not obstructed; mineflayer's error messages surface as-is.",
+        {
+          pos: posSchema.optional().describe("Explicit bed position; omit to auto-find"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "sleepIn", args, (p) => sleepIn(bot, p))),
       ),
 
       tool(

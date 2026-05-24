@@ -28,7 +28,8 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `stop`, `followPlayer`, `placeBlock`, `pickUpNearby`, `dropItem`, `giveItemTo` | ✅ Implemented in v0.3+ priority batch |
 | `craft`, `attack`, `flee`, `depositToChest`, `withdrawFromChest` | ✅ Implemented in v0.3+ follow-on batch |
 | `checkInventory`, `equipItem`, `activateBlock`, `useOnEntity`, `smelt` | ✅ Implemented in v0.3+ tool-use slice |
-| `findBlock`, `findEntity`, `lookAt`, `useItem`, `eat`, `fish`, `sleepIn`, `wait` | ⏳ Pending |
+| `useItem`, `eat`, `fish`, `sleepIn` | ✅ Implemented in v0.3+ survival slice |
+| `findBlock`, `findEntity`, `lookAt`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
 
@@ -387,6 +388,68 @@ Polls `furnace.outputItem()` every 500ms with a 12s budget per smelted item.
 |---|---|
 | Success | `smelted <N> <input> at furnace (x, y, z) (<source>)` |
 | Failures | `input is required` · `count must be >= 1, got <n>` · `unknown input item "<name>"` · `cannot smelt <N> <input>: only <K> in inventory` · `unknown fuel "<name>"` · `not enough fuel: need <K> <fuel> (smelts <per>/unit), have <H>` · `no fuel in inventory; tried coal, charcoal, coal_block, blaze_rod, dried_kelp_block` · `block at (x, y, z) is <name>, not a furnace` · `no furnace within 32 blocks and none remembered in world memory` · `nearest remembered <type> is at (x, y, z) (~D blocks away) but the chunk isn't loaded — walk closer first` · `couldn't reach <furnace> at (x, y, z) (<source>): <msg>` · `failed to open furnace at (x, y, z): <msg>` · `putInput <N> <input> failed: <msg>` · `putFuel <K> <fuel> failed: <msg>` · `smelt timeout: collected <K> of <N> <input> from furnace at (x, y, z)` · `takeOutput from furnace at (x, y, z) failed: <msg>` |
+
+---
+
+### `useItem` — right-click in mid-air with held item
+
+```ts
+useItem(bot, { with?: string, offhand?: boolean }): Promise<SkillResult>
+```
+
+Wraps `bot.activateItem`. Fire-and-forget — does not wait for any animation. Use for: ender pearl throw, splash / lingering potion throw, charge bow / crossbow, manual fishing rod cast (prefer `fish` skill). DO NOT use for food / drink potions — `eat` handles the full cycle.
+
+| | |
+|---|---|
+| Success | `used <item>` · `used <item> (off-hand)` |
+| Failures | `cannot use "<item>": <equip failure>` · `hand is empty — equip something first or pass \`with\`` · `off-hand is empty` · `activateItem <item> failed: <msg>` |
+
+---
+
+### `eat` — composite eat (auto-pick best food + activate + consume)
+
+```ts
+eat(bot, { item?: string }): Promise<SkillResult>
+```
+
+Composite: equip the food → `bot.consume()` (which handles the full activate-then-finish cycle). When `item` is omitted, picks the best available food from a preference list (cooked > raw, higher saturation first): `cooked_beef, cooked_porkchop, cooked_mutton, cooked_salmon, cooked_chicken, cooked_rabbit, cooked_cod, baked_potato, bread, …` falling through to raw meats and rotten_flesh as last resort.
+
+Won't eat when `bot.food >= 20` unless an explicit `item` is passed (so the model doesn't waste cooked food on a full bot, but explicit player intent like "drink a golden apple" is honored).
+
+| | |
+|---|---|
+| Success | `ate <item> (food: <before> → <after>, +<delta>)` |
+| Failures | `item is required` (when explicit `item` is empty) · `no <item> in inventory to eat` · `food is full (20/20) — pass an explicit item if you want to eat anyway` · `no food in inventory; tried cooked_beef, cooked_porkchop, …` · `cannot eat <item>: <equip failure>` · `eating <item> failed: <msg>` |
+
+---
+
+### `fish` — cast a fishing rod and wait for a bite
+
+```ts
+fish(bot, {}): Promise<SkillResult>
+```
+
+Wraps `bot.fish()`. Requires `fishing_rod` in main-hand (call `equipItem` first if needed) and water within casting range of the bot's current view direction. Cancellable: races the fish promise against the per-bot cancellation flag, so `stop` / chat side-channel reels in early. Times out after 5 minutes with no bite.
+
+| | |
+|---|---|
+| Success | `caught a fish` · `stopped fishing` |
+| Failures | `must be holding a fishing_rod to fish; equip one first` · `fishing timed out after 5 minutes with no bite` · `fishing failed: <msg>` |
+
+---
+
+### `sleepIn` — sleep in a bed (with bed-POI fallback)
+
+```ts
+sleepIn(bot, { pos?: Coords }): Promise<SkillResult>
+```
+
+Bed resolution: caller-supplied → nearest `*_bed` within 32 blocks → nearest remembered bed POI from world memory. Walks within 2 blocks, then `bot.sleep(bedBlock)`. Vanilla preconditions apply: must be night (or thunderstorm), bed not obstructed; mineflayer surfaces those errors as-is. Beds are added to `UTILITY_BLOCK_TYPES` so the proximity scan in `event-hooks.ts` auto-captures their positions to `pois[]`.
+
+| | |
+|---|---|
+| Success | `sleeping in <bed_color>_bed at (x, y, z) (<source>)` |
+| Failures | `chunk at (x, y, z) isn't loaded — walk closer first` · `block at (x, y, z) is <name>, not a bed` · `no bed within 32 blocks and none remembered in world memory` · `nearest remembered <name> is at (x, y, z) (~D blocks) but the chunk isn't loaded — walk closer first` · `couldn't reach <bed> at (x, y, z) (<source>): <msg>` · `sleep in <bed> at (x, y, z) failed: <msg>` (mineflayer message — common cases: not night, bed obstructed, monsters nearby) |
 
 ---
 

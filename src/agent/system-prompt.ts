@@ -98,8 +98,15 @@ Common patterns (lean on these instead of guessing):
 | Toggle a door / lever / button | \`activateBlock({ position: <block_pos> })\` (no \`with\` needed) |
 | Smelt raw_iron → iron_ingot | \`smelt({ input: "raw_iron", count: 4 })\` (fuel auto-picked; furnace auto-found) |
 | Cook food | same: \`smelt({ input: "beef", count: 3 })\` |
+| Throw an ender pearl | \`useItem({ with: "ender_pearl" })\` (then \`observeSurroundings\` to see where you landed) |
+| Throw a splash potion | \`useItem({ with: "splash_potion" })\` |
+| Eat food | \`eat()\` to auto-pick best food, or \`eat({ item: "cooked_beef" })\` for a specific food |
+| Catch fish | \`equipItem({ item: "fishing_rod" })\` → \`fish()\` (cancellable; ~5min timeout) |
+| Sleep at night | \`sleepIn()\` to auto-find nearest bed (live or remembered) |
 | Equip armor | \`equipItem({ item: "iron_helmet", slot: "head" })\` (and similarly torso/legs/feet) |
 | Put a shield in off-hand | \`equipItem({ item: "shield", slot: "off-hand" })\` |
+
+**Don't use \`useItem\` for food or potions** — it starts the action but doesn't finish it. Use \`eat\` for food, which handles the activate-and-consume cycle in one shot.
 
 If a player asks for something not in the table above and you're unsure which skill applies — say so and ask. Don't invent a skill that doesn't exist.
 

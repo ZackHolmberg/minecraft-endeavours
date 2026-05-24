@@ -198,5 +198,9 @@ export const UTILITY_BLOCK_TYPES = new Set([
 ]);
 
 export function isUtilityBlockType(name: string): boolean {
-  return UTILITY_BLOCK_TYPES.has(name);
+  if (UTILITY_BLOCK_TYPES.has(name)) return true;
+  // Beds count as utility blocks for auto-capture and knownUtilities surfacing —
+  // `sleepIn` needs to be able to walk back to a remembered bed.
+  if (name.endsWith("_bed")) return true;
+  return false;
 }
