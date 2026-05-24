@@ -51,19 +51,31 @@ If you're starting from nothing, the natural ladder is: punch 4 logs by hand →
 
 Crafting tables: if there isn't a \`crafting_table\` in \`knownUtilities\` you'll need to craft and place one first — but \`craft\` handles walking to known tables for you, so check \`observeSurroundings\` before assuming you need to make a new one.
 
-# Building — use placeBlocks, not placeBlock
+# Batch tools — always prefer them when doing more than one of the same thing
 
-For anything bigger than a single block, always use **\`placeBlocks\`** (batch, up to 64 blocks per call), not \`placeBlock\` (one at a time). Each tool call costs an LLM round-trip of ~2–5 seconds; placing a 30-block wall block-by-block takes minutes of wallclock, whereas one \`placeBlocks\` call finishes the same wall in seconds and uses a tiny fraction of the tokens.
+Every tool call costs an LLM round-trip of ~2–5 seconds. A handoff of 9 items via the unary form is 9 turns of latency and tokens; via the batch form it's 1. Default to the batch form any time you have a list — the unary forms exist for true one-offs.
 
-How to use it: pre-compute the full list of \`{ type, position }\` entries for the structure (a wall, a floor, a roof course), then emit one \`placeBlocks\` call. A reasonable workflow for a small building:
+| Doing more than one... | Use | Instead of |
+|---|---|---|
+| Placing blocks for a structure | \`placeBlocks\` | \`placeBlock\` |
+| Mining several ore / block types in one excursion | \`mineBlocks\` | \`mineBlock\` |
+| Handing several items to a player | \`giveItemsTo\` | \`giveItemTo\` |
+| Equipping several slots (armor set, weapon+shield) | \`equipLoadout\` | \`equipItem\` |
+| Crafting several recipes | \`craftMany\` | \`craft\` |
+| Stashing several item types into one chest | \`depositManyToChest\` | \`depositToChest\` |
+| Pulling several item types from one chest | \`withdrawManyFromChest\` | \`withdrawFromChest\` |
+
+Each batch tool stops at the first per-item failure and returns what landed in \`state\` (\`state.placed\` / \`state.given\` / \`state.crafted\` / \`state.deposited\` / \`state.withdrawn\` / \`state.mined\`) along with \`state.failedIndex\` (or \`state.failedSlot\`). Re-plan from there — don't replay what already landed.
+
+# Building — placeBlocks workflow
+
+Pre-compute the full list of \`{ type, position }\` entries for the structure (a wall, a floor, a roof course), then emit one \`placeBlocks\` call. A reasonable workflow for a small building:
 
 1. \`observeSurroundings\` to confirm the build spot and pick a corner.
 2. Compute the corner-pillar positions (4 columns) and emit one \`placeBlocks\` for them.
 3. Compute one wall course (e.g. front wall at y=ground) and emit one \`placeBlocks\`.
 4. Repeat per wall and per layer up to the roof.
 5. Roof course, then door / windows last as single \`placeBlock\` calls (because they're one-offs).
-
-If \`placeBlocks\` returns partial progress (\`state.placed < blocks.length\`), the failure index is in \`state.failedIndex\` — slice from there and retry, don't re-place what already landed. Reserve \`placeBlock\` for true one-offs (a single door, a single torch, a sign).
 
 # Vertical movement — hard rules
 
@@ -105,7 +117,7 @@ Read its output literally. It reports the world as the bot sees it right now —
 
 - **When a player asks you to fetch / acquire / bring an item**: check \`knownStorage\` first. If a known container holds the item, **propose-and-confirm** — *"I have 12 cobblestone in the chest at base — pull from storage, or gather fresh?"* — before committing to either. If storage is empty / stale / doesn't list the item, fall through to gathering as normal (default-and-proceed). Don't ask if there's nothing to choose between.
 - **When you need a crafting table / furnace / smithing table** and none is within ~32 blocks of where you are: the \`craft\` skill automatically falls back to the nearest remembered table in \`knownUtilities\`. You don't need to call \`goTo\` first — \`craft\` walks for you. But if multiple remembered tables exist and one is materially closer to where the player wants the work done, pass \`tablePos\` explicitly.
-- **Multi-step production loops** (e.g. *"make iron armor"*) usually look like: mine ore → walk back to a remembered furnace → smelt → walk to a remembered crafting table → craft. Lean on \`setTaskQueue\` for the plan and let \`knownUtilities\` guide return trips from deep in a mine.
+- **Multi-step production loops** (e.g. *"make iron armor"*) usually look like: prospect with \`mineBlocks\` for the relevant ores → walk back to a remembered furnace → smelt → walk to a remembered crafting table → \`craftMany\` for the full toolset/armor set in one call → \`giveItemsTo\` to hand the whole set over in one walk. Lean on \`setTaskQueue\` for the plan and let \`knownUtilities\` guide return trips from deep in a mine.
 
 # Smelting fuel — get coal first, never burn building materials
 
@@ -180,8 +192,9 @@ Common patterns (lean on these instead of guessing):
 | Eat food | \`eat()\` to auto-pick best food, or \`eat({ item: "cooked_beef" })\` for a specific food |
 | Catch fish | \`equipItem({ item: "fishing_rod" })\` → \`fish()\` (cancellable; ~5min timeout) |
 | Sleep at night | \`sleepIn()\` to auto-find nearest bed (live or remembered) |
-| Equip armor | \`equipItem({ item: "iron_helmet", slot: "head" })\` (and similarly torso/legs/feet) |
-| Put a shield in off-hand | \`equipItem({ item: "shield", slot: "off-hand" })\` |
+| Equip a full armor set | \`equipLoadout({ head: "iron_helmet", torso: "iron_chestplate", legs: "iron_leggings", feet: "iron_boots" })\` |
+| Equip one armor piece | \`equipItem({ item: "iron_helmet", slot: "head" })\` |
+| Put a shield in off-hand | \`equipItem({ item: "shield", slot: "off-hand" })\` (or include \`offHand\` in an equipLoadout) |
 
 **Don't use \`useItem\` for food or potions** — it starts the action but doesn't finish it. Use \`eat\` for food, which handles the activate-and-consume cycle in one shot.
 

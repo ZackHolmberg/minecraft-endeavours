@@ -21,16 +21,21 @@ import {
   attack,
   checkInventory,
   craft,
+  craftMany,
+  depositManyToChest,
   depositToChest,
   dropItem,
   eat,
   equipItem,
+  equipLoadout,
   fish,
   flee,
   followPlayer,
+  giveItemsTo,
   giveItemTo,
   goTo,
   mineBlock,
+  mineBlocks,
   observeSurroundings,
   pickUpNearby,
   placeBlock,
@@ -45,6 +50,7 @@ import {
   useOnEntity,
   whisper,
   withdrawFromChest,
+  withdrawManyFromChest,
 } from "../skills/index.js";
 import { runSkill } from "../skills/harness.js";
 import type { SkillResult } from "../skills/types.js";
@@ -60,12 +66,15 @@ const SKILL_NAMES = [
   "stop",
   "followPlayer",
   "mineBlock",
+  "mineBlocks",
   "placeBlock",
   "placeBlocks",
   "pickUpNearby",
   "dropItem",
   "giveItemTo",
+  "giveItemsTo",
   "equipItem",
+  "equipLoadout",
   "activateBlock",
   "useOnEntity",
   "useItem",
@@ -73,11 +82,14 @@ const SKILL_NAMES = [
   "fish",
   "sleepIn",
   "craft",
+  "craftMany",
   "smelt",
   "attack",
   "flee",
   "depositToChest",
+  "depositManyToChest",
   "withdrawFromChest",
+  "withdrawManyFromChest",
   "remember",
   "setTaskQueue",
   "advanceTaskQueue",
@@ -157,12 +169,38 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
 
       tool(
         "mineBlock",
-        "Mine N blocks of a specific type. Composite: find → path → equip best tool → dig → sweep dropped items. Fails fast (before any movement) if the required tool tier isn't in inventory. Partial progress is reported in state.mined on failure.",
+        "Mine N blocks of ONE specific type. PREFER `mineBlocks` for prospecting (mining several ore types in one excursion) — that variant scans for any of N types nearest-first and adapts as the bot moves. Reserve `mineBlock` for true single-type gathering (a stack of wood, a count of cobblestone).",
         {
           type: z.string().min(1).describe("Block ID, e.g. 'oak_log', 'stone', 'iron_ore'"),
           count: z.number().int().min(1).max(64).optional(),
         },
         async (args) => toToolResult(await runSkill(bot, "mineBlock", args, (p) => mineBlock(bot, p))),
+      ),
+
+      tool(
+        "mineBlocks",
+        "Multi-type mining sweep — the right call for *'mine any ores you can find down there'*. Searches for the nearest instance of ANY type in `types`, walks to it, mines it, repeats until `maxCount` or no candidates remain. Tool-tier preflight per type: types the bot can't harvest are skipped (reported in state.skipped), not fatal — a mixed `[iron_ore, coal_ore, diamond_ore]` request with only a stone pickaxe still gathers iron + coal and tells you why diamond was skipped. Returns state.mined (total) + state.byType (per-type counts).",
+        {
+          types: z
+            .array(z.string().min(1))
+            .min(1)
+            .describe("Block IDs to look for, e.g. ['iron_ore', 'coal_ore', 'diamond_ore']"),
+          maxCount: z
+            .number()
+            .int()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe("Total blocks across all types (default 32, max 128)"),
+          maxDistance: z
+            .number()
+            .int()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe("Search radius per scan (default 64)"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "mineBlocks", args, (p) => mineBlocks(bot, p))),
       ),
 
       tool(
@@ -211,13 +249,31 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
 
       tool(
         "giveItemTo",
-        "Walk within drop range of a player, face them, and toss the item so the natural pickup radius pulls it in. Composite: goTo(player) → lookAt → dropItem. Fails if the player isn't visible, can't be reached, or the bot doesn't have the item.",
+        "Hand off ONE item type to a player. PREFER `giveItemsTo` for any multi-item handoff (full toolset, full armor set) — that variant walks once and tosses each item in sequence. Reserve `giveItemTo` for true single-item handoffs.",
         {
           player: z.string().min(1),
           item: z.string().min(1),
           count: z.number().int().min(1).max(2304).optional(),
         },
         async (args) => toToolResult(await runSkill(bot, "giveItemTo", args, (p) => giveItemTo(bot, p))),
+      ),
+
+      tool(
+        "giveItemsTo",
+        "Hand off SEVERAL items to a player in one walk. One LLM round-trip walks to the player once, looks at them, and tosses each item from `items` in sequence (each `count` defaults to every matching stack). Use for any multi-item ask: 'give me a full iron set', 'drop me food and a pickaxe'. Stops at the first per-item failure and returns state.given[] + state.failedIndex so you can re-plan from where it stopped.",
+        {
+          player: z.string().min(1),
+          items: z
+            .array(
+              z.object({
+                item: z.string().min(1),
+                count: z.number().int().min(1).max(2304).optional(),
+              }),
+            )
+            .min(1)
+            .max(36),
+        },
+        async (args) => toToolResult(await runSkill(bot, "giveItemsTo", args, (p) => giveItemsTo(bot, p))),
       ),
 
       tool(
@@ -229,12 +285,26 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
 
       tool(
         "equipItem",
-        "Equip an item from inventory to a slot. Slot defaults to 'hand'. Most item-use skills (activateBlock, useOnEntity) accept an optional `with` parameter that calls this internally — use equipItem directly when you need to equip armor or off-hand items, or to set up before a sequence of skills that all use the same tool.",
+        "Equip ONE item to a slot (default 'hand'). PREFER `equipLoadout` when changing multiple slots at once (full armor set, weapon+shield combo). Most item-use skills (activateBlock, useOnEntity) accept an optional `with` parameter that calls this internally — reach for `equipItem` directly for a single armor / off-hand swap or to set up before a sequence sharing one tool.",
         {
           item: z.string().min(1).describe("Item ID, e.g. 'iron_pickaxe', 'shears', 'iron_helmet'"),
           slot: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]).optional(),
         },
         async (args) => toToolResult(await runSkill(bot, "equipItem", args, (p) => equipItem(bot, p))),
+      ),
+
+      tool(
+        "equipLoadout",
+        "Equip several slots in one call. Pass any subset of {head, torso, legs, feet, hand, offHand}; omitted slots are left alone. One round-trip covers a full armor-up (head+torso+legs+feet) or a combat loadout (hand+offHand). Stops at the first per-slot failure with state.equipped[] + state.failedSlot for re-planning.",
+        {
+          head: z.string().min(1).optional().describe("Helmet, e.g. 'iron_helmet'"),
+          torso: z.string().min(1).optional().describe("Chestplate, e.g. 'iron_chestplate'"),
+          legs: z.string().min(1).optional().describe("Leggings, e.g. 'iron_leggings'"),
+          feet: z.string().min(1).optional().describe("Boots, e.g. 'iron_boots'"),
+          hand: z.string().min(1).optional().describe("Main-hand item, e.g. 'iron_sword'"),
+          offHand: z.string().min(1).optional().describe("Off-hand item, e.g. 'shield'"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "equipLoadout", args, (p) => equipLoadout(bot, p))),
       ),
 
       tool(
@@ -296,13 +366,31 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
 
       tool(
         "craft",
-        "Craft `count` of `item`. Composite: resolve a recipe, walk to a crafting table if the recipe needs one (2×2 recipes use inventory; 3×3 need a table), call bot.craft. Table resolution order: caller-supplied `tablePos` → crafting_table within 32 blocks → nearest remembered crafting_table from world memory. Failure messages name the missing ingredient and shortfall count.",
+        "Craft ONE recipe (item × count). PREFER `craftMany` for any multi-recipe ask (full toolset, full armor set, sticks+planks+chest in one go) — that variant walks to a table at most once and runs each recipe in order. Reserve `craft` for true single-recipe asks.",
         {
           item: z.string().min(1).describe("Item ID, e.g. 'oak_planks', 'iron_pickaxe'"),
           count: z.number().int().min(1).max(64).optional(),
           tablePos: posSchema.optional().describe("Explicit crafting table position; omit to auto-find"),
         },
         async (args) => toToolResult(await runSkill(bot, "craft", args, (p) => craft(bot, p))),
+      ),
+
+      tool(
+        "craftMany",
+        "Craft SEVERAL recipes in one call. The table is resolved lazily — if every item has a 2×2 recipe, no table walk happens; otherwise the bot walks once on the first 3×3 recipe and stays there for the rest. ORDER MATTERS: earlier crafts consume ingredients later ones may need (sticks → pickaxe → sword is fine; sword → pickaxe → sticks isn't). On per-item failure (shortfall, no recipe, etc.) returns state.crafted[] + state.failedIndex so you can re-plan from that point.",
+        {
+          items: z
+            .array(
+              z.object({
+                item: z.string().min(1).describe("Item ID"),
+                count: z.number().int().min(1).max(64).optional(),
+              }),
+            )
+            .min(1)
+            .max(36),
+          tablePos: posSchema.optional().describe("Explicit crafting table position; omit to auto-find"),
+        },
+        async (args) => toToolResult(await runSkill(bot, "craftMany", args, (p) => craftMany(bot, p))),
       ),
 
       tool(
@@ -336,7 +424,7 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
 
       tool(
         "depositToChest",
-        "Walk to a chest and deposit items. When `pos` is omitted, picks the nearest known container from world memory. When `count` is omitted, deposits every matching stack in inventory. Container auto-capture snapshots the chest's new contents into world memory automatically.",
+        "Deposit ONE item type into a chest. PREFER `depositManyToChest` when stashing several item types into the same chest (post-mining haul, cleanup runs) — that variant opens the chest once and runs each deposit in sequence. Reserve `depositToChest` for true single-item stashes.",
         {
           item: z.string().min(1).describe("Item ID to deposit"),
           count: z.number().int().min(1).max(2304).optional(),
@@ -347,8 +435,27 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
       ),
 
       tool(
+        "depositManyToChest",
+        "Deposit SEVERAL item types into one chest in a single trip. Walks + opens + closes once; each item's `count` defaults to every matching stack. Container auto-capture snapshots on close, so memory updates once per batch (not once per item). Stops at first per-item failure with state.deposited[] + state.failedIndex.",
+        {
+          items: z
+            .array(
+              z.object({
+                item: z.string().min(1),
+                count: z.number().int().min(1).max(2304).optional(),
+              }),
+            )
+            .min(1)
+            .max(36),
+          pos: posSchema.optional().describe("Explicit chest position; omit to use nearest known container"),
+        },
+        async (args) =>
+          toToolResult(await runSkill(bot, "depositManyToChest", args, (p) => depositManyToChest(bot, p))),
+      ),
+
+      tool(
         "withdrawFromChest",
-        "Walk to a chest and withdraw items. When `pos` is omitted, picks the nearest known container whose remembered contents include the requested item. Verifies the chest actually has the item on open and adjusts the take count if memory was stale.",
+        "Withdraw ONE item type from a chest. PREFER `withdrawManyFromChest` when pulling several item types out of the same chest. Reserve this for true single-item pulls.",
         {
           item: z.string().min(1).describe("Item ID to withdraw"),
           count: z.number().int().min(1).max(2304).optional(),
@@ -356,6 +463,25 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
         },
         async (args) =>
           toToolResult(await runSkill(bot, "withdrawFromChest", args, (p) => withdrawFromChest(bot, p))),
+      ),
+
+      tool(
+        "withdrawManyFromChest",
+        "Withdraw SEVERAL item types from one chest in a single trip. Walks + opens + closes once. When `pos` is omitted, finds the chest by the FIRST requested item (so all items should live in the same chest — split into multiple calls if they span chests). Each per-item count is clamped to what's actually in the chest; partial pulls land in the success message rather than failing. Stops only on a per-item zero-stock or transfer error: state.withdrawn[] + state.failedIndex.",
+        {
+          items: z
+            .array(
+              z.object({
+                item: z.string().min(1),
+                count: z.number().int().min(1).max(2304).optional(),
+              }),
+            )
+            .min(1)
+            .max(36),
+          pos: posSchema.optional().describe("Explicit chest position; omit to resolve via the first item"),
+        },
+        async (args) =>
+          toToolResult(await runSkill(bot, "withdrawManyFromChest", args, (p) => withdrawManyFromChest(bot, p))),
       ),
 
       tool(

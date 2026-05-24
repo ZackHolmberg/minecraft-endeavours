@@ -182,44 +182,79 @@ export interface GiveItemToParams {
 }
 
 /**
- * Composite: walk within drop range of `player`, face them, drop the items.
- * The natural item-attraction radius (~1.5 blocks) pulls the stack into the
- * player. Fails if the player isn't visible, the bot can't reach them, or
- * the bot doesn't have the requested item.
+ * Single-item handoff. Thin wrapper around `giveItemsTo` so size-1 calls
+ * share exactly the batch code path — see that skill for the full
+ * walk-and-toss flow.
  */
 export async function giveItemTo(
   bot: Bot,
   { player, item, count }: GiveItemToParams,
 ): Promise<SkillResult> {
+  return giveItemsTo(bot, {
+    player,
+    items: [count !== undefined ? { item, count } : { item }],
+  });
+}
+
+export interface GiveItemsToParams {
+  player: string;
+  items: Array<{ item: string; count?: number }>;
+}
+
+/**
+ * Walk within drop range of `player` once, face them, then toss each item
+ * in `items` in sequence. The natural ~1.5-block item-attraction radius
+ * pulls each stack into the player. One LLM round-trip covers an
+ * arbitrarily-large handoff (full iron toolset, full armor set, etc.) —
+ * the unary `giveItemTo` is a wrapper around this.
+ *
+ * Failure model mirrors `placeBlocks`: pre-resolves every item (so a typo
+ * fails before walking), stops at the first per-item failure, and returns
+ * `state.given[]` with what landed plus `state.failedIndex` for re-planning.
+ */
+export async function giveItemsTo(
+  bot: Bot,
+  { player, items }: GiveItemsToParams,
+): Promise<SkillResult> {
   if (!player) return { ok: false, message: "player name required" };
-  const r = resolveItem(bot, item);
-  if (!r.ok) return { ok: false, message: `item ${r.message}` };
-  const itemData = r.data;
-  const name = r.normalized;
+  if (!Array.isArray(items) || items.length === 0) {
+    return { ok: false, message: "items must be a non-empty array" };
+  }
 
   const playerInfo = bot.players[player];
   if (!playerInfo?.entity) {
     return { ok: false, message: `player "${player}" is not visible to the bot` };
   }
 
-  const have = bot.inventory.items().filter((i) => i.type === itemData.id);
-  if (have.length === 0) {
-    return { ok: false, message: `no ${name} in inventory to give to ${player}` };
+  // Pre-resolve every item + verify inventory has stock. Fail fast before
+  // walking so a typo or missing-item doesn't waste a trip.
+  type Resolved = { name: string; itemId: number; want?: number };
+  const resolved: Resolved[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const entry = items[i]!;
+    const r = resolveItem(bot, entry.item);
+    if (!r.ok) return { ok: false, message: `items[${i}] ${r.message}` };
+    if (entry.count !== undefined && entry.count < 1) {
+      return { ok: false, message: `items[${i}] count must be >= 1, got ${entry.count}` };
+    }
+    if (bot.inventory.count(r.data.id, null) === 0) {
+      return { ok: false, message: `items[${i}] no ${r.normalized} in inventory to give to ${player}` };
+    }
+    resolved.push({ name: r.normalized, itemId: r.data.id, want: entry.count });
   }
 
   const pBot = bot as BotWithPathfinder;
   ensureMovements(pBot);
-
   const playerPos = playerInfo.entity.position;
-  const goal = new goals.GoalNear(playerPos.x, playerPos.y, playerPos.z, GIVE_DROP_REACH);
   try {
-    await pBot.pathfinder.goto(goal);
+    await pBot.pathfinder.goto(
+      new goals.GoalNear(playerPos.x, playerPos.y, playerPos.z, GIVE_DROP_REACH),
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `couldn't reach ${player} to hand off ${item}: ${message}` };
+    return { ok: false, message: `couldn't reach ${player} for handoff: ${message}` };
   }
 
-  // Refresh the player position post-walk; they may have moved.
   const liveEntity = bot.players[player]?.entity;
   if (liveEntity) {
     try {
@@ -229,15 +264,30 @@ export async function giveItemTo(
     }
   }
 
-  const drop = await dropItem(bot, count !== undefined ? { item: name, count } : { item: name });
-  if (!drop.ok) {
-    return { ok: false, message: `reached ${player} but: ${drop.message}`, state: drop.state };
+  const given: Array<{ item: string; count: number }> = [];
+  for (let i = 0; i < resolved.length; i++) {
+    const r = resolved[i]!;
+    const drop = await dropItem(
+      bot,
+      r.want !== undefined ? { item: r.name, count: r.want } : { item: r.name },
+    );
+    if (!drop.ok) {
+      return {
+        ok: false,
+        message: `giveItemsTo failed at items[${i}] (${r.name}) after giving ${given.length} of ${resolved.length}: ${drop.message}`,
+        state: { given, failedIndex: i, failedItem: r.name },
+      };
+    }
+    given.push({ item: r.name, count: (drop.state as { dropped: number }).dropped });
   }
-  const droppedCount = (drop.state as { dropped: number }).dropped;
+
+  const summary = given.map((g) => `${g.count} ${g.item}`).join(", ");
   return {
     ok: true,
-    message: `gave ${droppedCount} ${name} to ${player}`,
-    state: drop.state,
+    message: given.length === 1
+      ? `gave ${summary} to ${player}`
+      : `gave ${given.length} stacks (${summary}) to ${player}`,
+    state: { given },
   };
 }
 
@@ -407,4 +457,71 @@ export async function equipItem(
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, message: `equip ${name} → ${slot} failed: ${message}` };
   }
+}
+
+export interface EquipLoadoutParams {
+  head?: string;
+  torso?: string;
+  legs?: string;
+  feet?: string;
+  hand?: string;
+  offHand?: string;
+}
+
+/**
+ * Equip several slots in one call. Slots are an object (not an array)
+ * because the destinations are a closed set — keeps the call site
+ * self-documenting (`{ head: "iron_helmet", torso: "iron_chestplate", ... }`)
+ * and lets the agent omit slots it doesn't care about.
+ *
+ * Stops at the first per-slot failure and returns `state.equipped[]` plus
+ * `state.failedSlot` for re-planning. Order is fixed (head → torso → legs
+ * → feet → hand → off-hand) — Minecraft doesn't care about armor order, but
+ * the deterministic order makes failures predictable to debug.
+ *
+ * `equipItem` (single slot) stays as a separate skill: it's still the right
+ * call for "equip my pickaxe" and is used internally by `activateBlock` /
+ * `useOnEntity` via their `with` parameter.
+ */
+export async function equipLoadout(
+  bot: Bot,
+  { head, torso, legs, feet, hand, offHand }: EquipLoadoutParams = {},
+): Promise<SkillResult> {
+  const requested: Array<{ slot: EquipmentDestination; item: string }> = [];
+  if (head !== undefined) requested.push({ slot: "head", item: head });
+  if (torso !== undefined) requested.push({ slot: "torso", item: torso });
+  if (legs !== undefined) requested.push({ slot: "legs", item: legs });
+  if (feet !== undefined) requested.push({ slot: "feet", item: feet });
+  if (hand !== undefined) requested.push({ slot: "hand", item: hand });
+  if (offHand !== undefined) requested.push({ slot: "off-hand", item: offHand });
+
+  if (requested.length === 0) {
+    return {
+      ok: false,
+      message: "at least one slot must be specified (head, torso, legs, feet, hand, offHand)",
+    };
+  }
+
+  const equipped: Array<{ slot: EquipmentDestination; item: string }> = [];
+  for (let i = 0; i < requested.length; i++) {
+    const { slot, item } = requested[i]!;
+    const result = await equipItem(bot, { item, slot });
+    if (!result.ok) {
+      return {
+        ok: false,
+        message: `equipLoadout failed at slot "${slot}" (${item}) after equipping ${equipped.length} of ${requested.length}: ${result.message}`,
+        state: { equipped, failedSlot: slot, failedItem: item },
+      };
+    }
+    equipped.push({ slot, item });
+  }
+
+  const summary = equipped.map((e) => `${e.item} (${e.slot})`).join(", ");
+  return {
+    ok: true,
+    message: equipped.length === 1
+      ? `equipped ${summary}`
+      : `equipped ${equipped.length} slots: ${summary}`,
+    state: { equipped },
+  };
 }

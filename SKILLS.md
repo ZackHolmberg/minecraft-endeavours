@@ -29,6 +29,7 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `craft`, `attack`, `flee`, `depositToChest`, `withdrawFromChest` | ✅ Implemented in v0.3+ follow-on batch |
 | `checkInventory`, `equipItem`, `activateBlock`, `useOnEntity`, `smelt` | ✅ Implemented in v0.3+ tool-use slice |
 | `useItem`, `eat`, `fish`, `sleepIn` | ✅ Implemented in v0.3+ survival slice |
+| `mineBlocks`, `giveItemsTo`, `equipLoadout`, `craftMany`, `depositManyToChest`, `withdrawManyFromChest` | ✅ Implemented in v0.4 batch-variant slice (see [Batch variants](#batch-variants)) |
 | `findBlock`, `findEntity`, `lookAt`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
@@ -555,6 +556,28 @@ Composite: `goTo(player)` via pathfinder `GoalNear(reach=2)`, then `lookAt` the 
 |---|---|
 | Success | `gave <K> <item> to <player>` |
 | Failures | `player name required` · `item is required` · `player "<name>" is not visible to the bot` · `unknown item "<name>"` · `no <item> in inventory to give to <player>` · `couldn't reach <player> to hand off <item>: <msg>` · `reached <player> but: <dropItem failure message>` |
+
+## Batch variants
+
+v0.4 added batch siblings for every unary skill that had a realistic multi-target pattern. Each batch tool walks once, opens / equips once, runs the per-item operation in sequence, and returns a partial-result payload on first failure (mirroring `placeBlocks`). The unary siblings are **thin wrappers** around the batch siblings — calling the unary form with a list of one is exactly the batch path, no performance gap.
+
+| Unary | Batch | Use the batch form for |
+|---|---|---|
+| `mineBlock({ type, count? })` | `mineBlocks({ types[], maxCount?, maxDistance? })` | Prospecting — *"mine any ores you can find down there"*. Per-type tool-tier preflight; types the bot can't harvest are skipped and reported, not fatal. |
+| `giveItemTo({ player, item, count? })` | `giveItemsTo({ player, items[] })` | Multi-item handoffs — full toolset, full armor set, food drop. One walk, many tosses. |
+| `equipItem({ item, slot? })` | `equipLoadout({ head?, torso?, legs?, feet?, hand?, offHand? })` | Multi-slot equips — armor set, weapon+shield. Object (not array) because the slots are a closed set. |
+| `craft({ item, count?, tablePos? })` | `craftMany({ items[], tablePos? })` | Multi-recipe crafts. Table is resolved lazily; if every item is 2×2, no table walk happens. Order matters — earlier recipes consume ingredients later ones may need. |
+| `depositToChest({ item, count?, pos? })` | `depositManyToChest({ items[], pos? })` | Multi-item stash. Auto-capture snapshots once per batch (on close), not once per item. |
+| `withdrawFromChest({ item, count?, pos? })` | `withdrawManyFromChest({ items[], pos? })` | Multi-item pull. `pos`-less default resolves by the first item; split into per-chest calls when items span chests. |
+
+**Failure shape (common across all six).** On the first per-item failure, returns `{ ok: false, message, state }` where `state` includes:
+- the partial-result array (`placed[]` / `mined` total + `byType` / `given[]` / `equipped[]` / `crafted[]` / `deposited[]` / `withdrawn[]`),
+- `failedIndex` (or `failedSlot` for equipLoadout),
+- `failedItem` (the item name that broke the batch).
+
+The agent's correct move on partial-failure is to slice from `failedIndex + 1` and retry — not re-run the whole batch.
+
+---
 
 ## Exercising skills
 

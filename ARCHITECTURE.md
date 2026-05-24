@@ -140,21 +140,28 @@ Pending skills are marked ⏳; everything else is shipped. Per-skill reference (
 | Movement | `followPlayer` | `player, dist?` | Sustained follow until cancelled. |
 | Movement | `stop` | — | Flips the per-bot cancellation flag and cancels active pathfinder goals. |
 | Movement | `lookAt` ⏳ | `target` | Face a target. |
-| World | `mineBlock` | `type, count?` | Composite: find → path → equip → dig → `pickUpNearby` sweep. |
+| World | `mineBlock` | `type, count?` | Single-type variant. Wrapper around `mineBlocks` for one-type asks. |
+| World | `mineBlocks` | `types[], maxCount?, maxDistance?` | Multi-type prospecting — "any of these ores you can find". Per-type tool-tier preflight; unmineable types skipped, not fatal. |
 | World | `placeBlock` | `type, position` | Probes 6 adjacent positions for a solid reference block, derives face vector, equips, places. |
+| World | `placeBlocks` | `blocks[]` | Batch placement (up to 64). One round-trip for a whole wall course. |
 | Inventory | `pickUpNearby` | `maxDist?` | Collect dropped items in range. Snapshot-at-entry. |
 | Inventory | `equipItem` | `item, slot?` | Hand / off-hand / armor slot. Looks across main + hotbar + already-equipped. |
+| Inventory | `equipLoadout` | `head?, torso?, legs?, feet?, hand?, offHand?` | Multi-slot equip in one call. Object (not array) — slots are a closed set. |
 | Inventory | `dropItem` | `item, count?` | Drop on ground. |
-| Inventory | `giveItemTo` | `player, item, count?` | Walk to player and hand off (composite: `goTo` → `lookAt` → `dropItem`). |
+| Inventory | `giveItemTo` | `player, item, count?` | Single-item handoff. Wrapper around `giveItemsTo`. |
+| Inventory | `giveItemsTo` | `player, items[]` | Multi-item handoff — full toolset / armor set in one walk. |
 | Interaction | `activateBlock` | `position, with?` | Right-click on a block (hoe-till, bucket fill / place, flint-and-steel, plant seeds, bone meal, doors, levers). |
 | Interaction | `useOnEntity` | `entity, with?` | Right-click on a mob / player (shears sheep, bucket-milk cow, name tag, dye sheep, lead, saddle). |
 | Interaction | `useItem` | `with?, offhand?` | Right-click in mid-air (throw pearl, throw splash potion, charge bow). Not for food — use `eat`. |
-| Crafting | `craft` | `item, count?, tablePos?` | 2×2 inventory recipes or 3×3 table; table resolution falls back to `knownUtilities` remembered crafting_table. |
-| Crafting | `smelt` | `input, fuel?, count?, furnacePos?` | Open furnace (caller → nearby → remembered POI), put input + fuel, take output. Closes the iron-armor production loop. |
+| Crafting | `craft` | `item, count?, tablePos?` | Single-recipe variant. Wrapper around `craftMany`. |
+| Crafting | `craftMany` | `items[], tablePos?` | Multi-recipe craft. Table resolved lazily (no walk if every item is 2×2). |
+| Crafting | `smelt` | `input, fuel?, count?, furnacePos?` | Open furnace (caller → nearby → remembered POI), put input + fuel, take output. Auto-refuels mid-batch from inventory; folds leftover same-type input into the goal. Closes the iron-armor production loop. |
 | Combat | `attack` | `entity` | Tick-loop melee with weapon auto-equip. Cancellable. |
 | Combat | `flee` | `from, dist?` | Path away from threat until `dist` separation. Cancellable; re-paths every ~1.5s. |
-| Storage | `depositToChest` | `item, count?, pos?` | Walk to chest, deposit. `pos`-less default: nearest known container. Auto-capture hook snapshots contents on close. |
-| Storage | `withdrawFromChest` | `item, count?, pos?` | Walk to chest, withdraw. `pos`-less default: nearest known container whose remembered contents include the item. |
+| Storage | `depositToChest` | `item, count?, pos?` | Single-item stash. Wrapper around `depositManyToChest`. |
+| Storage | `depositManyToChest` | `items[], pos?` | Multi-item stash. Open + close once; auto-capture snapshots once per batch. |
+| Storage | `withdrawFromChest` | `item, count?, pos?` | Single-item pull. Wrapper around `withdrawManyFromChest`. |
+| Storage | `withdrawManyFromChest` | `items[], pos?` | Multi-item pull. `pos`-less default resolves via the first item. |
 | Survival | `eat` | `item?` | Equip food, `bot.consume()`. Auto-picks best food when `item` omitted. |
 | Survival | `fish` | — | Wraps `bot.fish()`; cancellable; 5-minute timeout. Requires `fishing_rod` in hand. |
 | Survival | `sleepIn` | `pos?` | Wraps `bot.sleep`; same fallback ladder (caller → nearby `*_bed` 32 blocks → remembered bed POI). |
@@ -168,6 +175,7 @@ Pending skills are marked ⏳; everything else is shipped. Per-skill reference (
 - **Structured result.** Every skill returns `{ ok, message, state? }`. Failure messages must be specific enough for Claude to adapt: `"no oak_log within 64 blocks"`, `"inventory full"`, `"path blocked by water"`.
 - **Sync / blocking.** Skills run to completion or failure; no progress streaming. Long-running tick-loop skills (`followPlayer`, `attack`, `flee`, `fish`) are cancellable via the per-bot cancellation flag (see *Bot state*).
 - **Composite skills accepted.** `mineBlock(oak_log, 10)` hides 5–6 primitives — saves tokens but Claude can't intervene mid-skill on non-cancellable skills. Acceptable tradeoff; revisit if it bites.
+- **Batch siblings for every unary skill with a real multi-target use case.** `mineBlocks` / `giveItemsTo` / `equipLoadout` / `craftMany` / `depositManyToChest` / `withdrawManyFromChest`. Each unary skill is a one-line wrapper around its batch sibling — guarantees parity for size-1 calls and halves the maintenance surface. Common failure shape: stop at first per-item failure, return `state.<thing-done>[]` + `state.failedIndex` so the agent re-plans from that index without replaying what landed.
 
 ### `observeSurroundings()` output shape
 The bot's primary "look around". Load-bearing because Claude's defaults for vague requests depend on it.
@@ -299,12 +307,12 @@ src/
     chat.ts                 # say, whisper
     perception.ts           # observeSurroundings (surfaces knownStorage + knownUtilities from world.json)
     movement.ts             # goTo, stop, followPlayer
-    world.ts                # mineBlock, placeBlock
-    inventory.ts            # pickUpNearby, dropItem, giveItemTo, checkInventory, equipItem
+    world.ts                # mineBlock, mineBlocks, placeBlock, placeBlocks
+    inventory.ts            # pickUpNearby, dropItem, giveItemTo, giveItemsTo, checkInventory, equipItem, equipLoadout
     interaction.ts          # activateBlock, useOnEntity, useItem — right-click semantics for tool use
-    crafting.ts             # craft, smelt (both with knownUtilities fallback for remembered tables/furnaces)
+    crafting.ts             # craft, craftMany, smelt (both with knownUtilities fallback for remembered tables/furnaces)
     combat.ts               # attack, flee
-    storage.ts              # depositToChest, withdrawFromChest
+    storage.ts              # depositToChest, depositManyToChest, withdrawFromChest, withdrawManyFromChest
     survival.ts             # eat, fish, sleepIn
     item-naming.ts          # normalize + did-you-mean lookup for item/block IDs (shared helper)
     meta.ts                 # remember, setTaskQueue, advanceTaskQueue
@@ -386,7 +394,7 @@ See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearin
 | Orchestrator process | Hybrid: host `botStart.sh` (detached) for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
 | Launcher scripts | Three lanes: server (`start.sh`/`stop.sh`), bot (`botStart.sh`/`botStop.sh`), viewers (`botLogs.sh`/`dashboard.sh`) | Each script does one thing; viewers can't accidentally start the server or the bot |
 | Dashboard ↔ orchestrator coupling | Out-of-process via `.bot-runtime/snapshot.json` (500ms dump) | Quitting the dashboard never disturbs the bot; future HTTP/WS API has the same shape |
-| Skill scope | 28 registered skills across perception / chat / movement / world / inventory / interaction / crafting / combat / storage / survival / meta; 4 pending (`findBlock`, `findEntity`, `lookAt`, `wait` — all low-value). See [SKILLS.md](SKILLS.md) status table. | Capable from day one |
+| Skill scope | 34 registered skills across perception / chat / movement / world / inventory / interaction / crafting / combat / storage / survival / meta (28 in v0.3 + 6 batch siblings in v0.4); 4 pending (`findBlock`, `findEntity`, `lookAt`, `wait` — all low-value). See [SKILLS.md](SKILLS.md) status table. | Capable from day one |
 | Architecture principle | "Push work down the stack" — middleware does anything deterministic; Claude only handles judgment | Lower latency, lower token spend, more reliable behavior |
 | Bot state | Recent-actions log (rolling 5-min), player-presence tracking, task queue — all surfaced in `observeSurroundings` | Claude reads pre-computed state instead of reconstructing from chat history |
 | Memory architecture | Two-tier: structured world knowledge (per-bot JSON, mostly auto-captured) + conversation memory (Claude-managed) | Cheap, exact, composable facts; Claude does only what Claude is good at |

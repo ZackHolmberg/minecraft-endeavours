@@ -14,6 +14,8 @@ import type { Coords, SkillResult } from "./types.js";
 const PLACE_BLOCKS_MAX_BATCH = 64;
 
 const SEARCH_RADIUS = 64;
+const MINE_BLOCKS_DEFAULT_MAX_COUNT = 32;
+const MINE_BLOCKS_MAX_COUNT_CAP = 128;
 const POST_DIG_PICKUP_RADIUS = 4;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
 // Hard ceiling on a single dig. mineflayer resolves dig via a local
@@ -40,45 +42,149 @@ export interface MineBlockParams {
   count?: number;
 }
 
+/**
+ * Single-type mine. Thin wrapper around `mineBlocks` so size-1 calls share
+ * exactly the batch code path.
+ */
 export async function mineBlock(
   bot: Bot,
   { type, count = 1 }: MineBlockParams,
 ): Promise<SkillResult> {
-  if (count < 1) return { ok: false, message: `count must be >= 1, got ${count}` };
+  return mineBlocks(bot, { types: [type], maxCount: count });
+}
+
+export interface MineBlocksParams {
+  /** Block IDs to look for. The bot mines whichever instance of any of these is nearest, repeating until maxCount or no candidates remain. */
+  types: string[];
+  /** Total blocks to mine across all types. Defaults to 32, capped at 128. */
+  maxCount?: number;
+  /** Search radius for any one block. Defaults to the 64-block standard. */
+  maxDistance?: number;
+}
+
+/**
+ * Multi-type mine. The natural use case is *"go to the mine and grab any
+ * ores you find"* — the bot scans for any block matching any of `types`,
+ * walks to the nearest, mines it, and repeats. One LLM round-trip covers
+ * a whole prospecting run; the unary `mineBlock` is a wrapper around this.
+ *
+ * Tool-tier preflight: for each requested type, probe a sample block (if
+ * any are visible right now) and check we have a tool that can harvest it.
+ * Types the bot can't mine are *skipped*, not fatal — a request for
+ * `[iron_ore, coal_ore, diamond_ore]` with only a stone pickaxe still
+ * mines iron + coal, and the skipped diamond is reported in the result.
+ * Types with no visible sample are kept in the search (we may walk into
+ * range mid-batch); `equipBestHarvestTool` is the safety net if a tool
+ * mismatch surfaces at dig time.
+ *
+ * Failure model: a fatal mid-batch error (path failure, dig timeout, same-
+ * block retry exhaustion) returns ok:false with `state.mined` (total) +
+ * `state.byType` so the agent can re-plan. Running out of candidates is
+ * ok:true if anything landed.
+ */
+export async function mineBlocks(
+  bot: Bot,
+  {
+    types,
+    maxCount = MINE_BLOCKS_DEFAULT_MAX_COUNT,
+    maxDistance = SEARCH_RADIUS,
+  }: MineBlocksParams,
+): Promise<SkillResult> {
+  if (!Array.isArray(types) || types.length === 0) {
+    return { ok: false, message: "types must be a non-empty array" };
+  }
+  if (maxCount < 1 || maxCount > MINE_BLOCKS_MAX_COUNT_CAP) {
+    return {
+      ok: false,
+      message: `maxCount must be between 1 and ${MINE_BLOCKS_MAX_COUNT_CAP}, got ${maxCount}`,
+    };
+  }
+  if (maxDistance < 1) {
+    return { ok: false, message: `maxDistance must be >= 1, got ${maxDistance}` };
+  }
 
   const pBot = bot as BotWithPathfinder;
   ensureMovements(pBot);
 
-  const r = resolveBlock(bot, type);
-  if (!r.ok) return { ok: false, message: `type ${r.message}` };
-  const blockId = r.data.id;
-  const name = r.normalized;
+  type Resolved = { name: string; id: number };
+  const mineable: Resolved[] = [];
+  const skipped: Array<{ name: string; reason: string }> = [];
+  for (let i = 0; i < types.length; i++) {
+    const r = resolveBlock(bot, types[i]!);
+    if (!r.ok) {
+      skipped.push({ name: types[i]!, reason: r.message });
+      continue;
+    }
+    const sample = bot.findBlock({
+      point: bot.entity.position,
+      matching: r.data.id,
+      maxDistance,
+    });
+    if (sample) {
+      const toolCheck = checkHarvestability(bot, sample);
+      if (!toolCheck.ok) {
+        skipped.push({ name: r.normalized, reason: toolCheck.message });
+        continue;
+      }
+    }
+    // Either a mineable sample exists, or no sample is in range right now
+    // (kept in the search; equipBestHarvestTool will catch a tool mismatch
+    // if we walk into one later).
+    mineable.push({ name: r.normalized, id: r.data.id });
+  }
 
-  // Probe a sample block to check tool feasibility before any movement.
-  const sample = bot.findBlock({
-    point: bot.entity.position,
-    matching: blockId,
-    maxDistance: SEARCH_RADIUS,
-  });
-  if (!sample) return { ok: false, message: `no ${name} within ${SEARCH_RADIUS} blocks` };
+  if (mineable.length === 0) {
+    const reasons = skipped.map((s) => `${s.name}: ${s.reason}`).join("; ");
+    return {
+      ok: false,
+      message: types.length === 1
+        ? skipped[0]!.reason
+        : `cannot mine any requested type — ${reasons}`,
+      state: { mined: 0, byType: {}, skipped },
+    };
+  }
 
-  const toolCheck = checkHarvestability(bot, sample);
-  if (!toolCheck.ok) return toolCheck;
+  const idList = mineable.map((m) => m.id);
+  const nameById = new Map(mineable.map((m) => [m.id, m.name]));
+  const minedByType: Record<string, number> = {};
+  for (const m of mineable) minedByType[m.name] = 0;
+
+  const formatByType = (): string =>
+    mineable
+      .map((m) => `${minedByType[m.name] ?? 0} ${m.name}`)
+      .filter((s) => !s.startsWith("0 ") || mineable.length === 1)
+      .join(", ");
 
   let mined = 0;
   let lastTargetKey: string | null = null;
   let sameBlockRetries = 0;
-  while (mined < count) {
+
+  while (mined < maxCount) {
     const block = bot.findBlock({
       point: bot.entity.position,
-      matching: blockId,
-      maxDistance: SEARCH_RADIUS,
+      matching: idList,
+      maxDistance,
     });
     if (!block) {
+      const summary = formatByType();
+      const skippedNote = skipped.length > 0
+        ? ` (skipped: ${skipped.map((s) => s.name).join(", ")})`
+        : "";
+      if (mined === 0) {
+        return {
+          ok: false,
+          message: types.length === 1
+            ? `no ${mineable[0]!.name} within ${maxDistance} blocks`
+            : `no mineable blocks within ${maxDistance} blocks${skippedNote}`,
+          state: { mined, byType: minedByType, skipped },
+        };
+      }
       return {
-        ok: false,
-        message: `mined ${mined} of ${count} ${name}; no more within ${SEARCH_RADIUS} blocks`,
-        state: { mined },
+        ok: true,
+        message: types.length === 1
+          ? `mined ${mined} ${mineable[0]!.name}; no more within ${maxDistance} blocks`
+          : `mined ${mined} blocks (${summary}); no more within ${maxDistance} blocks${skippedNote}`,
+        state: { mined, byType: minedByType, skipped },
       };
     }
 
@@ -87,10 +193,17 @@ export async function mineBlock(
     if (targetKey === lastTargetKey) {
       sameBlockRetries += 1;
       if (sameBlockRetries >= SAME_BLOCK_RETRY_LIMIT) {
+        const summary = formatByType();
         return {
           ok: false,
-          message: `mined ${mined} of ${count} ${name}; stuck retargeting same block at ${fmt(block.position.x, block.position.y, block.position.z)} (server likely rejecting dig — wrong face, out of reach, or wrong tool)`,
-          state: { mined, stuckAt: { x: block.position.x, y: block.position.y, z: block.position.z } },
+          message: types.length === 1
+            ? `mined ${mined} of ${maxCount} ${mineable[0]!.name}; stuck retargeting same block at ${fmt(block.position.x, block.position.y, block.position.z)} (server likely rejecting dig — wrong face, out of reach, or wrong tool)`
+            : `mined ${mined} blocks (${summary}); stuck retargeting same block at ${fmt(block.position.x, block.position.y, block.position.z)} (server likely rejecting dig — wrong face, out of reach, or wrong tool)`,
+          state: {
+            mined,
+            byType: minedByType,
+            stuckAt: { x: block.position.x, y: block.position.y, z: block.position.z },
+          },
         };
       }
     } else {
@@ -98,64 +211,97 @@ export async function mineBlock(
       lastTargetKey = targetKey;
     }
 
-    const moveResult = await pathToBlock(pBot, block);
-    if (!moveResult.ok) return { ...moveResult, state: { mined } };
-
-    // Avoid the vanilla 5× mid-air dig penalty (prismarine-block applies
-    // /5 when !bot.entity.onGround). First wait briefly in case pathfinder
-    // just landed; if still airborne, try to pillar up from a filler block
-    // so the dig runs at normal speed.
-    if (!bot.entity.onGround) {
-      await waitForGrounded(bot, 800);
-      if (!bot.entity.onGround) {
-        const pillar = await tryPillarUp(bot);
-        if (pillar.ok) {
-          console.log(`[${bot.username}] pillared before dig: ${pillar.message}`);
-        } else {
-          console.warn(
-            `[${bot.username}] dig will run at 5× slow (mid-air, no pillar): ${pillar.message}`,
-          );
-        }
-      }
-    }
-
-    const equipResult = await equipBestHarvestTool(bot, block);
-    if (!equipResult.ok) return { ...equipResult, state: { mined } };
-
-    const digDiag = describeDigSetup(bot, block);
-    const digStart = Date.now();
-    try {
-      await digWithTimeout(bot, block);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const elapsed = Date.now() - digStart;
-      console.warn(
-        `[${bot.username}] dig FAILED at ${digDiag.targetPos} after ${elapsed}ms — ${message} | ${digDiag.summary}`,
-      );
+    const thisName = nameById.get(block.type) ?? block.name;
+    const oneResult = await mineOneBlock(pBot, block, thisName);
+    if (!oneResult.ok) {
+      const summary = formatByType();
       return {
         ok: false,
-        message: `dig failed at ${fmt(block.position.x, block.position.y, block.position.z)} after ${elapsed}ms: ${message}`,
-        state: { mined },
+        message: types.length === 1
+          ? `${oneResult.message} (mined ${mined} of ${maxCount} so far)`
+          : `${oneResult.message} (after ${mined} mined: ${summary})`,
+        state: { mined, byType: minedByType },
       };
     }
-    const elapsed = Date.now() - digStart;
-    // Log every dig at debug level so a live repro of the "stuck" bug shows
-    // its symptom (very-short or very-long durations) right in bot.log.
-    console.log(
-      `[${bot.username}] dig OK ${name} at ${digDiag.targetPos} in ${elapsed}ms | ${digDiag.summary}`,
-    );
 
-    // Explicit pickup sweep — replaces the unreliable post-dig wait that
-    // missed drops for blocks like sand in the slice-3 smoke test.
-    await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
+    minedByType[thisName] = (minedByType[thisName] ?? 0) + 1;
     mined += 1;
   }
 
+  const summary = formatByType();
+  const skippedNote = skipped.length > 0
+    ? ` (skipped: ${skipped.map((s) => `${s.name} — ${s.reason}`).join("; ")})`
+    : "";
   return {
     ok: true,
-    message: `mined ${mined} ${name}`,
-    state: { mined },
+    message: types.length === 1
+      ? `mined ${mined} ${mineable[0]!.name}`
+      : `mined ${mined} blocks (${summary})${skippedNote}`,
+    state: { mined, byType: minedByType, skipped },
   };
+}
+
+/**
+ * Mine a single, already-targeted block: path → grounded check (with
+ * optional pillar) → equip best tool → dig → pickup sweep. Extracted so
+ * both the single-target and multi-target search loops share the dig
+ * sequence verbatim.
+ */
+async function mineOneBlock(
+  pBot: BotWithPathfinder,
+  block: Block,
+  blockNameForMsg: string,
+): Promise<SkillResult> {
+  const bot = pBot as Bot;
+
+  const moveResult = await pathToBlock(pBot, block);
+  if (!moveResult.ok) return moveResult;
+
+  // Avoid the vanilla 5× mid-air dig penalty (prismarine-block applies
+  // /5 when !bot.entity.onGround). First wait briefly in case pathfinder
+  // just landed; if still airborne, try to pillar up from a filler block
+  // so the dig runs at normal speed.
+  if (!bot.entity.onGround) {
+    await waitForGrounded(bot, 800);
+    if (!bot.entity.onGround) {
+      const pillar = await tryPillarUp(bot);
+      if (pillar.ok) {
+        console.log(`[${bot.username}] pillared before dig: ${pillar.message}`);
+      } else {
+        console.warn(
+          `[${bot.username}] dig will run at 5× slow (mid-air, no pillar): ${pillar.message}`,
+        );
+      }
+    }
+  }
+
+  const equipResult = await equipBestHarvestTool(bot, block);
+  if (!equipResult.ok) return equipResult;
+
+  const digDiag = describeDigSetup(bot, block);
+  const digStart = Date.now();
+  try {
+    await digWithTimeout(bot, block);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const elapsed = Date.now() - digStart;
+    console.warn(
+      `[${bot.username}] dig FAILED at ${digDiag.targetPos} after ${elapsed}ms — ${message} | ${digDiag.summary}`,
+    );
+    return {
+      ok: false,
+      message: `dig failed at ${fmt(block.position.x, block.position.y, block.position.z)} after ${elapsed}ms: ${message}`,
+    };
+  }
+  const elapsed = Date.now() - digStart;
+  console.log(
+    `[${bot.username}] dig OK ${blockNameForMsg} at ${digDiag.targetPos} in ${elapsed}ms | ${digDiag.summary}`,
+  );
+
+  // Explicit pickup sweep — replaces the unreliable post-dig wait that
+  // missed drops for blocks like sand in the slice-3 smoke test.
+  await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
+  return { ok: true, message: `mined ${blockNameForMsg}` };
 }
 
 export interface PlaceBlockParams {

@@ -73,77 +73,145 @@ export interface CraftParams {
 }
 
 /**
- * Composite craft. Resolve a recipe for `item` × `count`, walk to a crafting
- * table if the recipe needs one (2×2 recipes can be made in inventory), and
- * call bot.craft. Specific failure messages cover the three things players
- * will hit: missing ingredients (with shortfall counts), no nearby table,
- * and "this item has no known recipe at all" (different actionability).
- *
- * Table resolution order, when needed:
- *   1. caller-supplied `tablePos`
- *   2. nearest crafting_table within 32 blocks (live search via findBlock)
- *   3. nearest crafting_table POI in world.json (remembered from prior visit)
- *
- * Option 3 is what makes the iron-armor loop work: bot mined deep in a cave,
- * needs to walk home to its remembered crafting table — Claude sees the
- * known-utility entry in observeSurroundings and the skill walks to it.
+ * Single-item craft. Thin wrapper around `craftMany` so size-1 calls share
+ * exactly the batch code path.
  */
 export async function craft(
   bot: Bot,
   { item, count = 1, tablePos }: CraftParams,
 ): Promise<SkillResult> {
-  if (count < 1) return { ok: false, message: `count must be >= 1, got ${count}` };
-  const r = resolveItem(bot, item);
-  if (!r.ok) return { ok: false, message: `item ${r.message}` };
-  const itemData = r.data;
-  const name = r.normalized;
+  return craftMany(bot, { items: [{ item, count }], tablePos });
+}
 
-  // Try inventory-only first (2×2 grid). Cheap shortcut for planks, sticks,
-  // torches, etc. and avoids any walking.
-  const inventoryRecipes = bot.recipesFor(itemData.id, null, count, null);
-  if (inventoryRecipes.length > 0) {
-    return await runCraft(bot, name, count, inventoryRecipes[0]!, null);
+export interface CraftManyParams {
+  items: Array<{ item: string; count?: number }>;
+  tablePos?: Coords;
+}
+
+/**
+ * Batch craft. Resolves a crafting table lazily — only walks to one when
+ * the first 3×3 recipe in the list demands it — then runs each recipe in
+ * order. One LLM round-trip covers an arbitrary toolset / armor set; the
+ * unary `craft` is a wrapper around this.
+ *
+ * Table resolution order, when needed:
+ *   1. caller-supplied `tablePos`
+ *   2. nearest crafting_table within 32 blocks
+ *   3. nearest crafting_table POI in world.json
+ *
+ * Failure model: stops at the first per-item failure with
+ * `state.crafted[]` (what landed) and `state.failedIndex`. Order matters
+ * — earlier crafts consume ingredients that later ones may need, so a
+ * shortfall mid-batch means re-plan from that index, not retry the lot.
+ */
+export async function craftMany(
+  bot: Bot,
+  { items, tablePos }: CraftManyParams,
+): Promise<SkillResult> {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { ok: false, message: "items must be a non-empty array" };
   }
 
-  // Inventory crafting failed — either the recipe needs a table or we don't
-  // have ingredients. Distinguish via recipesAll (ignores inventory).
-  const inventoryAllRecipes = bot.recipesAll(itemData.id, null, false);
-  if (inventoryAllRecipes.length > 0) {
-    // Recipe exists for 2×2; we're short on ingredients.
-    return shortfallResult(bot, name, count, inventoryAllRecipes[0]!);
-  }
-
-  // 3×3 recipe — needs a crafting table.
-  const tableResolution = await resolveCraftingTable(bot, tablePos);
-  if (!tableResolution.ok) return tableResolution;
-  const { block: table, source } = tableResolution;
-
-  // Walk within reach. The table block's position is the click target.
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
-  try {
-    await pBot.pathfinder.goto(
-      new goals.GoalNear(table.position.x, table.position.y, table.position.z, TABLE_REACH),
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      ok: false,
-      message: `couldn't reach crafting_table at ${fmt(table.position)} (${source}): ${message}`,
-    };
-  }
-
-  // Now check recipes with the table available.
-  const tableRecipes = bot.recipesFor(itemData.id, null, count, table);
-  if (tableRecipes.length === 0) {
-    const all = bot.recipesAll(itemData.id, null, table);
-    if (all.length === 0) {
-      return { ok: false, message: `no known recipe for "${name}"` };
+  // Pre-resolve all names + counts so a typo fails before walking.
+  type Resolved = { name: string; itemId: number; count: number };
+  const resolved: Resolved[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const entry = items[i]!;
+    const r = resolveItem(bot, entry.item);
+    if (!r.ok) return { ok: false, message: `items[${i}] ${r.message}` };
+    const count = entry.count ?? 1;
+    if (count < 1) {
+      return { ok: false, message: `items[${i}] count must be >= 1, got ${count}` };
     }
-    return shortfallResult(bot, name, count, all[0]!);
+    resolved.push({ name: r.normalized, itemId: r.data.id, count });
   }
 
-  return await runCraft(bot, name, count, tableRecipes[0]!, table);
+  let table: Block | null = null;
+  let tableSource: "caller" | "nearby" | "remembered" | null = null;
+  const crafted: Array<{ item: string; count: number }> = [];
+
+  const failAt = (i: number, name: string, msg: string): SkillResult => ({
+    ok: false,
+    message: `craftMany failed at items[${i}] (${name}) after crafting ${crafted.length} of ${resolved.length}: ${msg}`,
+    state: { crafted, failedIndex: i, failedItem: name },
+  });
+
+  for (let i = 0; i < resolved.length; i++) {
+    const r = resolved[i]!;
+
+    // Try inventory-only first (2×2). Cheap shortcut for sticks, planks,
+    // torches; if every item in the batch is 2×2, we never walk to a table.
+    const invRecipes = bot.recipesFor(r.itemId, null, r.count, null);
+    if (invRecipes.length > 0) {
+      const result = await runCraft(bot, r.name, r.count, invRecipes[0]!, null);
+      if (!result.ok) return failAt(i, r.name, result.message);
+      crafted.push({ item: r.name, count: r.count });
+      continue;
+    }
+
+    // Inventory-only failed — distinguish "needs table" from "short on
+    // ingredients" via recipesAll. If a 2×2 recipe exists at all, it's a
+    // shortfall and walking to a table won't help.
+    const invAll = bot.recipesAll(r.itemId, null, false);
+    if (invAll.length > 0) {
+      const shortfall = shortfallResult(bot, r.name, r.count, invAll[0]!);
+      return failAt(i, r.name, shortfall.message);
+    }
+
+    // 3×3 recipe — needs a table. Resolve and walk once, on first demand.
+    if (!table) {
+      const tableResolution = await resolveCraftingTable(bot, tablePos);
+      if (!tableResolution.ok) return failAt(i, r.name, tableResolution.message);
+      const resolvedTable = tableResolution.block;
+      const resolvedSource = tableResolution.source;
+      const pBot = bot as BotWithPathfinder;
+      ensureMovements(pBot);
+      try {
+        await pBot.pathfinder.goto(
+          new goals.GoalNear(
+            resolvedTable.position.x,
+            resolvedTable.position.y,
+            resolvedTable.position.z,
+            TABLE_REACH,
+          ),
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return failAt(
+          i,
+          r.name,
+          `couldn't reach crafting_table at ${fmt(resolvedTable.position)} (${resolvedSource}): ${message}`,
+        );
+      }
+      table = resolvedTable;
+      tableSource = resolvedSource;
+    }
+
+    // Table-aware retry.
+    const tableRecipes = bot.recipesFor(r.itemId, null, r.count, table);
+    if (tableRecipes.length === 0) {
+      const tableAll = bot.recipesAll(r.itemId, null, table);
+      if (tableAll.length === 0) {
+        return failAt(i, r.name, `no known recipe for "${r.name}"`);
+      }
+      const shortfall = shortfallResult(bot, r.name, r.count, tableAll[0]!);
+      return failAt(i, r.name, shortfall.message);
+    }
+
+    const result = await runCraft(bot, r.name, r.count, tableRecipes[0]!, table);
+    if (!result.ok) return failAt(i, r.name, result.message);
+    crafted.push({ item: r.name, count: r.count });
+  }
+
+  const summary = crafted.map((c) => `${c.count} ${c.item}`).join(", ");
+  const tableNote = table ? ` at crafting_table ${fmt(table.position)} (${tableSource})` : "";
+  return {
+    ok: true,
+    message: crafted.length === 1
+      ? `crafted ${summary}${tableNote}`
+      : `crafted ${crafted.length} item types (${summary})${tableNote}`,
+    state: { crafted, usedTable: table !== null },
+  };
 }
 
 async function runCraft(
@@ -291,15 +359,18 @@ export async function smelt(
     };
   }
 
-  // Resolve fuel — either caller-provided or auto-pick.
-  const fuelResolved = resolveFuel(bot, fuel, count);
-  if (!fuelResolved.ok) return fuelResolved;
-  const { item: fuelItem, units: fuelUnits } = fuelResolved;
+  // Pre-flight fuel check at the requested count, so we don't walk to a
+  // furnace we can't use. After opening we re-resolve against the *real*
+  // goal (which may include leftover input from a prior interrupted smelt),
+  // and that second resolution can still fail — that's fine.
+  const preflightFuel = resolveFuel(bot, fuel, count);
+  if (!preflightFuel.ok) return preflightFuel;
 
   // Resolve furnace.
   const furnaceResolution = await resolveFurnace(bot, furnacePos);
   if (!furnaceResolution.ok) return furnaceResolution;
   const { block: furnaceBlock, source } = furnaceResolution;
+  const pos = { x: furnaceBlock.position.x, y: furnaceBlock.position.y, z: furnaceBlock.position.z };
 
   // Walk to furnace.
   const pBot = bot as BotWithPathfinder;
@@ -323,8 +394,40 @@ export async function smelt(
   }
 
   let collected = 0;
+  let goal = count;
+  let leftoverAtStart = 0;
   try {
-    // Put input first so progress can start as soon as fuel hits.
+    // Account for input already in the furnace from a prior (interrupted)
+    // smelt. Policy: if it's the same type, fold the leftover into the goal
+    // and provision fuel for the combined total — interrupted smelts are
+    // common and a clean re-entry is friendlier than forcing the agent to
+    // drain the slot first. If it's a different type, bail with a clear
+    // message; we can't usefully share the slot.
+    const existingInput = furnace.inputItem();
+    if (existingInput && existingInput.count > 0) {
+      if (existingInput.type !== inputData.id) {
+        const existingName = bot.registry.items[existingInput.type]?.name ?? `item#${existingInput.type}`;
+        return {
+          ok: false,
+          message: `furnace at ${fmt(furnaceBlock.position)} has ${existingInput.count} ${existingName} in input slot; collect it before smelting ${inputName}`,
+          state: { existingInputType: existingName, existingInputCount: existingInput.count, position: pos },
+        };
+      }
+      leftoverAtStart = existingInput.count;
+      goal = count + leftoverAtStart;
+    }
+
+    // Resolve fuel against the real goal (may exceed pre-flight if leftover
+    // existed). Keeps fuel name/units in scope for the refuel path below.
+    const fuelResolved = resolveFuel(bot, fuel, goal);
+    if (!fuelResolved.ok) return fuelResolved;
+    const { item: fuelItem, units: fuelUnits } = fuelResolved;
+    const fuelPer = FUEL_BURN_PER_UNIT.get(fuelItem.name) ?? FUEL_DEFAULT_BURN;
+
+    // Put input first so progress can start as soon as fuel hits. (Skipped
+    // when count is 0 — only happens via the leftover-only path, which can't
+    // actually occur today since count >= 1, but the guard keeps the
+    // arithmetic honest.)
     try {
       await furnace.putInput(inputData.id, null, count);
     } catch (err) {
@@ -339,13 +442,14 @@ export async function smelt(
     }
 
     // Poll for output. Each smelt is ~10s server-side; budget 12s per item.
-    const deadline = Date.now() + count * SMELT_MS_PER_ITEM;
-    while (collected < count) {
+    const deadline = Date.now() + goal * SMELT_MS_PER_ITEM;
+    while (collected < goal) {
       if (Date.now() > deadline) {
+        const stillIn = furnace.inputItem()?.count ?? 0;
         return {
           ok: false,
-          message: `smelt timeout: collected ${collected} of ${count} ${inputName} from furnace at ${fmt(furnaceBlock.position)}`,
-          state: { collected },
+          message: `smelt timeout: collected ${collected} of ${goal} ${inputName} from furnace at ${fmt(furnaceBlock.position)}; ${stillIn} still in input slot`,
+          state: { collected, goal, leftoverInput: stillIn, position: pos },
         };
       }
       await sleep(SMELT_POLL_MS);
@@ -359,7 +463,38 @@ export async function smelt(
           return {
             ok: false,
             message: `takeOutput from furnace at ${fmt(furnaceBlock.position)} failed: ${message}`,
-            state: { collected },
+            state: { collected, goal, position: pos },
+          };
+        }
+      }
+      if (collected >= goal) break;
+
+      // Detect fuel exhaustion mid-batch: fuel slot empty with input still
+      // to burn. The currently-burning item may finish a few more, but
+      // topping up early is harmless and avoids the silent timeout-and-
+      // partial-return the bug was about. If we're out of fuel in inventory
+      // too, surface a fuel-specific error so the agent re-fuels rather
+      // than (e.g.) re-mining ore.
+      const remainingInput = furnace.inputItem();
+      if (furnace.fuelItem() == null && remainingInput && remainingInput.count > 0) {
+        const needUnits = Math.ceil((goal - collected) / fuelPer);
+        const inInv = bot.inventory.count(fuelItem.type, null);
+        if (inInv === 0) {
+          return {
+            ok: false,
+            message: `furnace ran out of fuel: ${remainingInput.count} ${inputName} still in input slot at ${fmt(furnaceBlock.position)}; no more ${fuelItem.name} in inventory (collected ${collected}/${goal})`,
+            state: { collected, goal, leftoverInput: remainingInput.count, fuel: fuelItem.name, position: pos },
+          };
+        }
+        const topUp = Math.min(inInv, needUnits);
+        try {
+          await furnace.putFuel(fuelItem.type, null, topUp);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            ok: false,
+            message: `furnace ran out of fuel and refuel failed: ${message} (collected ${collected}/${goal}, ${remainingInput.count} ${inputName} still in input slot)`,
+            state: { collected, goal, leftoverInput: remainingInput.count, position: pos },
           };
         }
       }
@@ -368,10 +503,11 @@ export async function smelt(
     furnace.close();
   }
 
+  const leftoverNote = leftoverAtStart > 0 ? ` (includes ${leftoverAtStart} leftover from a prior batch)` : "";
   return {
     ok: true,
-    message: `smelted ${collected} ${inputName} at furnace ${fmt(furnaceBlock.position)} (${source})`,
-    state: { collected, furnace: furnaceBlock.name, pos: { x: furnaceBlock.position.x, y: furnaceBlock.position.y, z: furnaceBlock.position.z } },
+    message: `smelted ${collected} ${inputName} at furnace ${fmt(furnaceBlock.position)} (${source})${leftoverNote}`,
+    state: { collected, goal, furnace: furnaceBlock.name, pos },
   };
 }
 
