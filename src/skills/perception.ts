@@ -42,7 +42,7 @@ export interface ObserveSurroundingsState {
     nearest: { x: number; y: number; z: number; dist: number };
   }>;
   nearbyEntities: Array<{
-    type: "player" | "hostile" | "passive" | "other";
+    type: "player" | "hostile" | "passive" | "vehicle" | "object" | "other";
     name: string;
     pos: { x: number; y: number; z: number };
     dist: number;
@@ -58,6 +58,18 @@ export interface ObserveSurroundingsState {
     contents?: Array<{ item: string; count: number }>;
   }>;
   knownUtilities: Array<{
+    type: string;
+    pos: { x: number; y: number; z: number };
+    dist: number;
+    name?: string;
+  }>;
+  /**
+   * Named waypoints the bot has `remember`-ed that aren't utility blocks —
+   * mine entrances, named bases, portals, the surface above a deep cave, etc.
+   * Separate from `knownUtilities` because no skill auto-walks to these; they
+   * exist purely as navigation references for the agent to pass to `goTo`.
+   */
+  knownWaypoints: Array<{
     type: string;
     pos: { x: number; y: number; z: number };
     dist: number;
@@ -148,6 +160,20 @@ export async function observeSurroundings(
     })
     .sort((a, b) => a.dist - b.dist);
 
+  const knownWaypoints = world.pois
+    .filter((p) => !isUtilityBlockType(p.type))
+    .map((p) => {
+      const d = me.distanceTo(new Vec3(p.position.x, p.position.y, p.position.z));
+      const entry: ObserveSurroundingsState["knownWaypoints"][number] = {
+        type: p.type,
+        pos: p.position,
+        dist: round2(d),
+      };
+      if (p.name !== undefined) entry.name = p.name;
+      return entry;
+    })
+    .sort((a, b) => a.dist - b.dist);
+
   return {
     ok: true,
     message: `${nearbyBlocks.length} block group(s), ${nearbyEntities.length} entit(ies) within ${radius} blocks`,
@@ -171,6 +197,7 @@ export async function observeSurroundings(
       nearbyDroppedItems,
       knownStorage,
       knownUtilities,
+      knownWaypoints,
       recentActions: botState?.actions.recent() ?? [],
       recentlySeenPlayers: botState?.presence.recentlySeen() ?? [],
       currentTask: botState?.tasks.current() ?? null,
@@ -213,7 +240,7 @@ function collectEntities(bot: Bot, radius: number): ObserveSurroundingsState["ne
     if (entity.name === "item" || entity.name === "item_stack") continue;
 
     const type = classifyEntity(entity);
-    if (type === "other") continue;
+    if (type === null) continue; // pure noise — arrows, xp orbs, area effects, etc.
 
     const displayName = entity.username ?? entity.name ?? entity.displayName ?? "unknown";
     all.push({
@@ -228,7 +255,9 @@ function collectEntities(bot: Bot, radius: number): ObserveSurroundingsState["ne
     player: 0,
     hostile: 1,
     passive: 2,
-    other: 3,
+    vehicle: 3,
+    object: 4,
+    other: 5,
   };
   all.sort((a, b) => {
     const p = priority[a.type] - priority[b.type];
@@ -237,11 +266,56 @@ function collectEntities(bot: Bot, radius: number): ObserveSurroundingsState["ne
   return all.slice(0, MAX_ENTITIES);
 }
 
-function classifyEntity(entity: Entity): "player" | "hostile" | "passive" | "other" {
+/**
+ * Pure-noise entity names we never surface — projectiles, particle effects,
+ * physics state. Anything not in this denylist that also isn't a player /
+ * mob / vehicle / immobile-object falls through to "other".
+ */
+const ENTITY_NOISE_NAMES = new Set([
+  "arrow",
+  "spectral_arrow",
+  "trident",
+  "experience_orb",
+  "area_effect_cloud",
+  "falling_block",
+  "tnt",
+  "snowball",
+  "egg",
+  "ender_pearl",
+  "eye_of_ender",
+  "fireball",
+  "small_fireball",
+  "dragon_fireball",
+  "wither_skull",
+  "shulker_bullet",
+  "fishing_bobber",
+  "fishing_hook",
+  "leash_knot",
+  "lightning_bolt",
+  "evoker_fangs",
+]);
+
+/**
+ * Classify a world entity for the perception layer. Returns null for
+ * pure noise (projectiles, xp orbs, etc.) so the caller can drop it.
+ * Vehicles (boats, minecarts) and immobile objects (item_frame, painting,
+ * armor_stand) get their own categories so the bot can actually see player-
+ * placed decorations and means of transport — previously these were lumped
+ * into "other" and dropped entirely.
+ */
+function classifyEntity(
+  entity: Entity,
+): "player" | "hostile" | "passive" | "vehicle" | "object" | "other" | null {
   if (entity.type === "player") return "player";
+
+  const name = (entity.name ?? "").toLowerCase();
+  if (ENTITY_NOISE_NAMES.has(name)) return null;
+
   const kind = (entity.kind ?? "").toLowerCase();
   if (kind.includes("hostile")) return "hostile";
   if (kind.includes("passive") || kind.includes("animal")) return "passive";
+  if (kind.includes("vehicle")) return "vehicle";
+  if (kind.includes("immobile")) return "object";
   return "other";
 }
 

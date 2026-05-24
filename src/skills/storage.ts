@@ -1,12 +1,13 @@
 import type { Bot } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 import { noteContainerOpening } from "../mineflayer-glue/event-hooks.js";
 import { readWorldKnowledge, type Container } from "../memory/world-knowledge.js";
 import { resolveItem } from "./item-naming.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const CONTAINER_BLOCK_TYPES = new Set([
@@ -17,10 +18,6 @@ const CONTAINER_BLOCK_TYPES = new Set([
 ]);
 
 const CHEST_REACH = 2;
-
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
-}
 
 export interface DepositToChestParams {
   item: string;
@@ -250,12 +247,6 @@ async function walkToChest(bot: Bot, block: Block): Promise<SkillResult> {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, message: `couldn't reach ${block.name} at ${fmt(block.position)}: ${message}` };
-  }
-}
-
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
   }
 }
 

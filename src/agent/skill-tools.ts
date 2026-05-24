@@ -34,6 +34,7 @@ import {
   observeSurroundings,
   pickUpNearby,
   placeBlock,
+  placeBlocks,
   remember,
   say,
   setTaskQueue,
@@ -60,6 +61,7 @@ const SKILL_NAMES = [
   "followPlayer",
   "mineBlock",
   "placeBlock",
+  "placeBlocks",
   "pickUpNearby",
   "dropItem",
   "giveItemTo",
@@ -102,7 +104,7 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
     tools: [
       tool(
         "observeSurroundings",
-        "Look around. Returns nearby blocks (grouped by type with counts and nearest coords), nearby entities (players, mobs, dropped items), the bot's status (health, food, position, facing, time of day, weather), known storage from world memory, recent skill activity, recently-seen players, and the current task queue.",
+"Look around. Returns nearby blocks (grouped by type with counts and nearest coords), nearby entities (players, mobs, vehicles like boats/minecarts, immobile objects like item frames, dropped items), the bot's status (health, food, position, facing, time of day, weather), known storage from world memory, known utility blocks (crafting tables, furnaces, beds), known waypoints (any other POI you've `remember`-ed — mine entrances, named bases, etc.), recent skill activity, recently-seen players, and the current task queue.",
         { radius: z.number().int().min(1).max(64).optional().describe("Search radius in blocks (default 16)") },
         async (args) => {
           const result = await runSkill(bot, "observeSurroundings", args, (p) =>
@@ -165,12 +167,29 @@ export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
 
       tool(
         "placeBlock",
-        "Place a block of the given type at the target position. Requires the item in inventory and a solid neighbor at one of the six adjacent positions to click against. Fails with a specific message if either is missing.",
+        "Place a block of the given type at the target position. Requires the item in inventory and a solid neighbor at one of the six adjacent positions to click against. Fails with a specific message if either is missing. PREFER `placeBlocks` for any multi-block structure — placing one block per tool call costs an LLM round-trip each, so a 30-block wall takes minutes instead of seconds.",
         {
           type: z.string().min(1).describe("Block item ID, e.g. 'cobblestone', 'oak_planks'"),
           position: posSchema,
         },
         async (args) => toToolResult(await runSkill(bot, "placeBlock", args, (p) => placeBlock(bot, p))),
+      ),
+
+      tool(
+        "placeBlocks",
+        "Batch placement — place up to 64 blocks in one tool call. Use this for any contiguous structure (walls, floors, roofs, pillars, paths). One LLM round-trip places the whole batch, then mineflayer paces the placements at ~10 blocks/sec. Cancellable mid-batch via the `stop` skill or chat side-channel. On the first failure, returns ok:false with `state.placed` (how many landed) and `state.failedIndex` so you can re-plan from where it stopped.",
+        {
+          blocks: z
+            .array(
+              z.object({
+                type: z.string().min(1).describe("Block item ID, e.g. 'cobblestone'"),
+                position: posSchema,
+              }),
+            )
+            .min(1)
+            .max(64),
+        },
+        async (args) => toToolResult(await runSkill(bot, "placeBlocks", args, (p) => placeBlocks(bot, p))),
       ),
 
       tool(

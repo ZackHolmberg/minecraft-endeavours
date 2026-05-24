@@ -34,7 +34,15 @@ import { modelIdFor, RateLimitCooldown } from "./behavior.js";
 import { ALLOWED_TOOL_NAMES, MCP_SERVER_NAME, buildSkillsServer } from "./skill-tools.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 
-const MAX_TURNS_PER_EVENT = 8;
+// Max assistant turns the SDK will take per player message before terminating
+// with `error_max_turns`. Bumped from the spike-era 8 once we saw real builds
+// (gather → craft → place loops) routinely exceed it; the 5-hour rate window
+// remains the real safeguard against runaway loops.
+const MAX_TURNS_PER_EVENT = 100;
+// When per-event turn count crosses this fraction of the cap, the loop emits
+// a one-shot warn line so we notice approaching termination before the SDK
+// kills the turn silently.
+const TURN_WARN_FRACTION = 0.8;
 const DEFAULT_COOLDOWN_SECONDS = 5 * 60;
 
 /**
@@ -147,6 +155,8 @@ export class NpcAgent {
   private lastTurnUsage: TurnUsage | null = null;
   private latestRateLimitInfo: RateLimitInfo | null = null;
   private lastTurnError: LastTurnError | null = null;
+  private turnsThisEvent = 0;
+  private warnedThisEvent = false;
 
   constructor(private readonly opts: NpcAgentOptions) {
     this.start();
@@ -196,6 +206,8 @@ export class NpcAgent {
 
     switch (msg.type) {
       case "assistant": {
+        this.turnsThisEvent += 1;
+        const turnLabel = `[turn ${this.turnsThisEvent}/${MAX_TURNS_PER_EVENT}]`;
         const content = (msg.message?.content ?? []) as Array<{
           type: string;
           text?: string;
@@ -205,12 +217,21 @@ export class NpcAgent {
         for (const block of content) {
           if (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) {
             console.log(
-              `${tag} thinking: ${block.text.slice(0, 240).replace(/\s+/g, " ")}`,
+              `${tag} ${turnLabel} thinking: ${block.text.slice(0, 240).replace(/\s+/g, " ")}`,
             );
           }
           if (block.type === "tool_use") {
-            console.log(`${tag} → ${block.name}(${shortJson(block.input)})`);
+            console.log(`${tag} ${turnLabel} → ${shortToolName(block.name)}(${shortJson(block.input)})`);
           }
+        }
+        if (
+          !this.warnedThisEvent &&
+          this.turnsThisEvent >= Math.floor(MAX_TURNS_PER_EVENT * TURN_WARN_FRACTION)
+        ) {
+          this.warnedThisEvent = true;
+          console.warn(
+            `${tag} approaching max_turns (${this.turnsThisEvent}/${MAX_TURNS_PER_EVENT}); SDK will terminate this event soon`,
+          );
         }
         if (msg.error === "rate_limit") {
           this.startCooldown(null);
@@ -233,6 +254,9 @@ export class NpcAgent {
       }
 
       case "result": {
+        const turnsForEvent = this.turnsThisEvent;
+        this.turnsThisEvent = 0;
+        this.warnedThisEvent = false;
         if (msg.subtype === "success") {
           const usage = msg.usage as Partial<TurnUsage> | undefined;
           const totalCost = (msg as { total_cost_usd?: number | null }).total_cost_usd ?? null;
@@ -254,11 +278,11 @@ export class NpcAgent {
           this.sessionUsage.turns += 1;
           this.lastTurnError = null;
           console.log(
-            `${tag} turn complete (cache_read=${turn.cache_read_input_tokens}, out=${turn.output_tokens})`,
+            `${tag} event complete after ${turnsForEvent} turn(s) (cache_read=${turn.cache_read_input_tokens}, out=${turn.output_tokens})`,
           );
         } else {
           this.lastTurnError = { subtype: msg.subtype, at: Date.now() };
-          console.warn(`${tag} turn ended: ${msg.subtype}`);
+          console.warn(`${tag} event ended after ${turnsForEvent} turn(s): ${msg.subtype}`);
         }
         return;
       }
@@ -339,6 +363,20 @@ function formatUserMessage(event: ChatEvent, decision: RouteMatch): string {
   return `[${channelLabel} from ${event.sender}] ${event.message}
 
 (routed because: ${decision.reason}. reply via the ${replyTool} tool on the same channel.)`;
+}
+
+/**
+ * Strip the MCP server prefix so log lines read `mineBlock(...)` instead of
+ * `mcp__minecraft-skills__mineBlock(...)`. The full name still goes through
+ * the SDK; this only affects the human-facing log.
+ */
+function shortToolName(name: string | undefined): string {
+  if (!name) return "<unknown>";
+  const m = /^mcp__[^_]+(?:__[^_]+)*?__([^_].*)$/.exec(name);
+  if (m && m[1]) return m[1];
+  // Fallback: strip up to and including the last "__".
+  const idx = name.lastIndexOf("__");
+  return idx >= 0 ? name.slice(idx + 2) : name;
 }
 
 function shortJson(value: unknown): string {

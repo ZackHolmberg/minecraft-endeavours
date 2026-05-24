@@ -1,7 +1,7 @@
 import type { Bot } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
@@ -9,11 +9,8 @@ import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
 import { equipItem } from "./inventory.js";
 import { resolveItem } from "./item-naming.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { Coords, SkillResult } from "./types.js";
-
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
-}
 
 const BED_SEARCH_RADIUS = 32;
 const BED_REACH = 2;
@@ -301,12 +298,6 @@ async function resolveBed(bot: Bot, pos?: Coords): Promise<BedResolution> {
     ok: false,
     message: `no bed within ${BED_SEARCH_RADIUS} blocks and none remembered in world memory`,
   };
-}
-
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
-  }
 }
 
 function fmt(v: { x: number; y: number; z: number }): string {

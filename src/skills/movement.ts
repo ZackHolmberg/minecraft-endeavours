@@ -1,10 +1,11 @@
 import type { Bot } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
 import { resolveBlock } from "./item-naming.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 const DEFAULT_REACH = 1;
@@ -18,10 +19,6 @@ export interface GoToParams {
   target: GoToTarget;
   /** Stop when within this many blocks of the target. Defaults to 1. */
   reach?: number;
-}
-
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
 }
 
 export async function goTo(bot: Bot, { target, reach = DEFAULT_REACH }: GoToParams): Promise<SkillResult> {
@@ -166,12 +163,6 @@ function findEntityByName(bot: Bot, name: string) {
     if (!best || dist < best.dist) best = { entity, dist };
   }
   return best?.entity ?? null;
-}
-
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
-  }
 }
 
 function fmt(v: Vec3): string {

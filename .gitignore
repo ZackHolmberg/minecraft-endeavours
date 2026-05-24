@@ -9,7 +9,7 @@ backups/
 node_modules/
 dist/
 
-# Bot orchestrator runtime state (PID, log, snapshot) — written by scripts/botInit.sh
+# Bot orchestrator runtime state (PID, log, snapshot) — written by scripts/botStart.sh
 .bot-runtime/
 
 # Claude Code

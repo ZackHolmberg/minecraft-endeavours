@@ -1,11 +1,12 @@
 import type { Bot, EquipmentDestination } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { SkillResult } from "./types.js";
 
 const PICKUP_DEFAULT_RADIUS = 8;
@@ -27,10 +28,6 @@ const EQUIPMENT_DESTINATIONS = new Set<EquipmentDestination>([
   "legs",
   "feet",
 ]);
-
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
-}
 
 export interface PickUpNearbyParams {
   /** Search radius in blocks. Defaults to 8, max 32. */
@@ -242,12 +239,6 @@ export async function giveItemTo(
     message: `gave ${droppedCount} ${name} to ${player}`,
     state: drop.state,
   };
-}
-
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
-  }
 }
 
 function sleep(ms: number): Promise<void> {

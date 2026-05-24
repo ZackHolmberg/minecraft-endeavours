@@ -1,11 +1,12 @@
 import type { Bot } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import type { Entity } from "prismarine-entity";
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { SkillResult } from "./types.js";
 
 const ATTACK_REACH = 3;
@@ -20,9 +21,6 @@ const FLEE_REPATH_INTERVAL_MS = 1_500;
 // available weapon when entering combat.
 const WEAPON_TIERS = ["wooden", "stone", "golden", "iron", "diamond", "netherite"];
 
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
-}
 
 export interface AttackParams {
   entity: string;
@@ -208,12 +206,6 @@ function findEntityByName(bot: Bot, name: string): Entity | null {
     if (!best || d < best.dist) best = { entity, dist: d };
   }
   return best?.entity ?? null;
-}
-
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
-  }
 }
 
 function sleep(ms: number): Promise<void> {

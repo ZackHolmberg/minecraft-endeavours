@@ -1,7 +1,7 @@
 #!/bin/bash
 # Mount the read-only TUI dashboard against the running bot. Does not start
 # the MC server or the bot — use `./scripts/start.sh` and
-# `./scripts/botInit.sh` for that. Quitting the dashboard (q / Esc / Ctrl+C)
+# `./scripts/botStart.sh` for that. Quitting the dashboard (q / Esc / Ctrl+C)
 # only kills this viewer; the bot keeps running.
 set -e
 cd "$(dirname "$0")/.."
@@ -15,13 +15,13 @@ if ! nc -z localhost 25565 2>/dev/null; then
 fi
 
 if [ ! -f "$PID_FILE" ]; then
-  echo "dashboard: no bot is running — start one with ./scripts/botInit.sh."
+  echo "dashboard: no bot is running — start one with ./scripts/botStart.sh."
   exit 1
 fi
 
 BOT_PID="$(cat "$PID_FILE")"
 if [ -z "$BOT_PID" ] || ! kill -0 "$BOT_PID" 2>/dev/null; then
-  echo "dashboard: stale PID file (process $BOT_PID is gone) — restart with ./scripts/botInit.sh."
+  echo "dashboard: stale PID file (process $BOT_PID is gone) — restart with ./scripts/botStart.sh."
   exit 1
 fi
 

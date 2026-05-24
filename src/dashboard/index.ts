@@ -1,14 +1,14 @@
 /**
  * Multi-bot terminal dashboard. Runs as a standalone process — not in the
- * orchestrator's address space. The orchestrator (`scripts/botInit.sh`)
+ * orchestrator's address space. The orchestrator (`scripts/botStart.sh`)
  * writes `.bot-runtime/snapshot.json` every 500ms via `src/snapshot-writer.ts`;
  * this client polls that file and renders into a `blessed-contrib` grid:
  *
  *   ┌── [1/N] bot · Tab to cycle ───────────┬── 5h Pro window · Tokens ─┐
  *   │ STATE / DOING / POS / HP+FOOD / ...   │ status / util / resets    │
  *   │ TIME / TASK / QUEUE / TALK / NET      │ Last turn / Session       │
- *   │                                       ├── cache-hit % ────────────┤
- *   │                                       │ sparkline                 │
+ *   │                                       ├── Inventory ──────────────┤
+ *   │                                       │ name × N (grouped)        │
  *   ├───────────────────────────────────────┴───────────────────────────┤
  *   │ Recent actions (active bot)                                       │
  *   ├───────────────────────────────────────────────────────────────────┤
@@ -33,7 +33,6 @@ import type { SnapshotFilePayload } from "../snapshot-writer.js";
 const POLL_MS = 500;
 const ACTIONS_MAX = 50;
 const LOG_BACKFILL = 80;
-const CACHE_HISTORY_MAX = 30;
 const ERROR_BANNER_TTL_MS = 5 * 60 * 1000;
 
 function readSnapshotFile(): SnapshotFilePayload | null {
@@ -77,11 +76,14 @@ function mountDashboard(): void {
     padding: { left: 1, right: 1 },
   });
 
-  const sparkline = grid.set(4, 7, 2, 5, contrib.sparkline, {
-    label: " Cache hit % (per turn) ",
+  const inventoryBox = grid.set(4, 7, 2, 5, blessed.list, {
+    label: " Inventory ",
     tags: true,
-    style: { fg: "green", titleFg: "white" },
-    border: { type: "line", fg: "cyan" },
+    border: { type: "line" },
+    style: { border: { fg: "cyan" }, item: { fg: "white" } },
+    items: [],
+    scrollable: true,
+    interactive: false,
   });
 
   const actionsBox = grid.set(6, 0, 3, 12, blessed.list, {
@@ -103,10 +105,6 @@ function mountDashboard(): void {
   // ─── Multi-bot state ──────────────────────────────────────────────────────
   let usernamesView: string[] = [];
   let activeIndex = 0;
-  // Per-bot cache-hit history (last N turns).
-  const cacheHistory = new Map<string, number[]>();
-  // Per-bot last seen turn count — used to detect when a new turn lands.
-  const lastSeenTurns = new Map<string, number>();
   // Track the last log entry we rendered so we only append fresh lines on
   // subsequent polls. Matched on (at, level, text) — Date.now() can repeat.
   let lastLogKey: string | null = null;
@@ -121,10 +119,6 @@ function mountDashboard(): void {
     const merged = fresh.filter((u) => fresh.includes(u));
     if (merged.join("|") !== usernamesView.join("|")) {
       usernamesView = merged;
-      for (const u of usernamesView) {
-        if (!cacheHistory.has(u)) cacheHistory.set(u, []);
-        if (!lastSeenTurns.has(u)) lastSeenTurns.set(u, 0);
-      }
       if (activeIndex >= usernamesView.length) activeIndex = 0;
     }
   };
@@ -169,7 +163,7 @@ function mountDashboard(): void {
 
     if (!payload) {
       statusBox.setContent(
-        "\n  {yellow-fg}waiting for orchestrator snapshot…{/}\n  {gray-fg}(is the bot running? `./scripts/botInit.sh`){/}",
+        "\n  {yellow-fg}waiting for orchestrator snapshot…{/}\n  {gray-fg}(is the bot running? `./scripts/botStart.sh`){/}",
       );
       screen.render();
       return;
@@ -191,19 +185,15 @@ function mountDashboard(): void {
     if (!snap) {
       statusBox.setContent(`\n  {red-fg}unknown bot: ${username}{/}`);
       tokenBox.setContent("");
-      sparkline.setData(["cache %"], [[]]);
+      inventoryBox.setItems([]);
       actionsBox.setItems([]);
       screen.render();
       return;
     }
 
-    // Update cache-hit history for every bot whenever a new turn lands, not
-    // just the active one — so switching tabs shows a populated sparkline.
-    updateCacheHistoryForAllBots(payload.snapshots, cacheHistory, lastSeenTurns);
-
     statusBox.setContent(renderStatusPanel(snap));
     tokenBox.setContent(renderTokenPanel(snap));
-    sparkline.setData(["cache %"], [cacheHistory.get(username) ?? []]);
+    inventoryBox.setItems(renderInventoryLines(snap));
     actionsBox.setItems(snap.state.recentActions.slice(-ACTIONS_MAX).reverse());
     screen.title = `minecraft-endeavours · ${username}`;
     screen.render();
@@ -228,37 +218,25 @@ function mountDashboard(): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-bot cache-hit history. Polled rather than event-driven so we don't have
-// to thread a callback into the agent — the snapshot already tells us when
-// turn count increments.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function updateCacheHistoryForAllBots(
-  snapshots: BotSnapshot[],
-  cacheHistory: Map<string, number[]>,
-  lastSeenTurns: Map<string, number>,
-): void {
-  for (const snap of snapshots) {
-    if (!snap.agent) continue;
-    const turns = snap.agent.sessionUsage.turns;
-    const prevTurns = lastSeenTurns.get(snap.username) ?? 0;
-    if (turns <= prevTurns) continue;
-
-    lastSeenTurns.set(snap.username, turns);
-    const t = snap.agent.lastTurnUsage;
-    if (!t) continue;
-    const totalIn = t.input_tokens + t.cache_creation_input_tokens + t.cache_read_input_tokens;
-    const pct = totalIn > 0 ? (t.cache_read_input_tokens / totalIn) * 100 : 0;
-    const history = cacheHistory.get(snap.username) ?? [];
-    history.push(Math.round(pct));
-    while (history.length > CACHE_HISTORY_MAX) history.shift();
-    cacheHistory.set(snap.username, history);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Panel renderers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Group the snapshot's per-stack list by item name (so 64 + 12 dirt becomes
+ * one "dirt × 76" row), sort alphabetically, render as fixed-width lines.
+ * Returns a placeholder line when the inventory is empty.
+ */
+function renderInventoryLines(snap: BotSnapshot): string[] {
+  const items = snap.bot?.inventory;
+  if (!items || items.length === 0) return ["{gray-fg}(empty){/}"];
+  const totals = new Map<string, number>();
+  for (const stack of items) {
+    totals.set(stack.name, (totals.get(stack.name) ?? 0) + stack.count);
+  }
+  return Array.from(totals.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, count]) => `${name} {gray-fg}×{/} ${count}`);
+}
 
 function renderStatusLabel(username: string, index: number, total: number): string {
   if (total <= 1) return ` ${username} `;
@@ -303,7 +281,15 @@ function renderStatusPanel(snap: BotSnapshot): string {
 
   if (st.currentTask) {
     lines.push(`{bold}TASK{/}     ${st.currentTask}`);
-    lines.push(`{bold}QUEUE{/}    ${st.remainingTasks.length} remaining`);
+    if (st.remainingTasks.length === 0) {
+      lines.push(`{bold}QUEUE{/}    {gray-fg}(none){/}`);
+    } else {
+      lines.push(`{bold}QUEUE{/}    ${st.remainingTasks.length} remaining:`);
+      for (let i = 0; i < st.remainingTasks.length; i++) {
+        const num = String(i + 1).padStart(2, " ");
+        lines.push(`         {gray-fg}${num}.{/} ${truncate(st.remainingTasks[i]!, 60)}`);
+      }
+    }
   } else {
     lines.push(`{bold}TASK{/}     {gray-fg}—{/}`);
     lines.push(`{bold}QUEUE{/}    {gray-fg}empty{/}`);
@@ -422,6 +408,11 @@ function formatTokens(n: number): string {
 
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${n}`;
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
 }
 
 mountDashboard();

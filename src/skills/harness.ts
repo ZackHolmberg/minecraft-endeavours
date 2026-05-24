@@ -18,6 +18,16 @@ const ACTION_LOG_DENYLIST = new Set([
 ]);
 
 /**
+ * Skills whose result line we *don't* echo to bot.log. `observeSurroundings`
+ * returns a giant blob of world data — useful inside the agent loop, useless
+ * (and noisy) in the tail. Everything else is fair game so the operator can
+ * see what each tool actually returned, not just what was called.
+ */
+const RESULT_LOG_DENYLIST = new Set(["observeSurroundings", "checkInventory"]);
+
+const MAX_RESULT_LOG_CHARS = 220;
+
+/**
  * Wrap a skill in a try/catch so unexpected exceptions become
  * `{ ok: false, message }` results instead of taking down the bot, and
  * record successful results to the bot's recent-actions log.
@@ -55,7 +65,18 @@ export async function runSkill<P, R extends SkillResult>(
     maybeNoteQuestion(bot, name, params, result);
   }
 
+  if (!RESULT_LOG_DENYLIST.has(name)) {
+    const arrow = result.ok ? "←" : "✗";
+    const trimmed = truncate(result.message, MAX_RESULT_LOG_CHARS);
+    console.log(`[${bot.username}] ${arrow} ${name}: ${trimmed}`);
+  }
+
   return result;
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
 }
 
 /**

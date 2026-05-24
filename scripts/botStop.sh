@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop the orchestrator started by ./scripts/botInit.sh.
+# Stop the orchestrator started by ./scripts/botStart.sh.
 # Sends SIGTERM to the PID written in .bot-runtime/bot.pid; the orchestrator's
 # shutdown handler disconnects bots cleanly and removes the PID file itself.
 set -e

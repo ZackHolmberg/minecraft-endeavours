@@ -54,6 +54,13 @@ export interface BotFields {
   saturation: number;
   experience: number;
   heldItem: { name: string; count: number } | null;
+  /**
+   * Snapshot of every stack in main inventory + hotbar (one entry per stack).
+   * Same stack appearing in multiple slots stays as multiple entries — the
+   * dashboard groups by name at render time, so consumers can present
+   * "diamond × 3" or "diamond × 64 + 12" however they want.
+   */
+  inventory: Array<{ name: string; count: number }>;
   time: { timeOfDay: number; phase: "day" | "night" | "dusk" | "dawn" };
   weather: "clear" | "rain" | "thunder";
   onlinePlayers: string[];
@@ -127,6 +134,9 @@ function snapshotBotFields(bot: Bot | null): BotFields | null {
     saturation: round2(bot.foodSaturation ?? 0),
     experience: bot.experience?.level ?? 0,
     heldItem: held ? { name: held.name, count: held.count } : null,
+    inventory: bot.inventory
+      ? bot.inventory.items().map((i) => ({ name: i.name, count: i.count }))
+      : [],
     time: {
       timeOfDay: bot.time?.timeOfDay ?? 0,
       phase: timePhase(bot.time?.timeOfDay ?? 0),

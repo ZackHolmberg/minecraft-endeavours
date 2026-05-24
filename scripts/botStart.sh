@@ -27,8 +27,8 @@ fi
 # Refuse to start if the MC server isn't reachable — the bot would just spin
 # in its reconnect loop and dump confusing errors into the log.
 if ! nc -z localhost 25565 2>/dev/null; then
-  echo "botInit: Minecraft server is not reachable on localhost:25565."
-  echo "botInit: Start it first with ./scripts/start.sh, then re-run this."
+  echo "botStart: Minecraft server is not reachable on localhost:25565."
+  echo "botStart: Start it first with ./scripts/start.sh, then re-run this."
   exit 1
 fi
 
@@ -36,7 +36,7 @@ fi
 if [ -f "$PID_FILE" ]; then
   EXISTING_PID="$(cat "$PID_FILE")"
   if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
-    echo "botInit: bot already running (PID $EXISTING_PID). Use ./scripts/botStop.sh to stop it."
+    echo "botStart: bot already running (PID $EXISTING_PID). Use ./scripts/botStop.sh to stop it."
     exit 1
   fi
   # Stale PID file from a crash — clear it so we can boot fresh.
@@ -48,7 +48,7 @@ mkdir -p "$RUNTIME_DIR"
 : > "$LOG_FILE"
 rm -f "$SNAPSHOT_FILE"
 
-echo "botInit: starting orchestrator detached (logs → $LOG_FILE)..."
+echo "botStart: starting orchestrator detached (logs → $LOG_FILE)..."
 nohup npm run start >"$LOG_FILE" 2>&1 </dev/null &
 # `$!` is npm's PID; the orchestrator writes its own PID to $PID_FILE on boot.
 
@@ -57,14 +57,14 @@ for i in $(seq 1 50); do
   if [ -f "$PID_FILE" ]; then
     BOT_PID="$(cat "$PID_FILE")"
     if kill -0 "$BOT_PID" 2>/dev/null; then
-      echo "botInit: bot is up (PID $BOT_PID)."
-      echo "botInit: tail logs: ./scripts/botLogs.sh"
-      echo "botInit: dashboard: ./scripts/dashboard.sh"
+      echo "botStart: bot is up (PID $BOT_PID)."
+      echo "botStart: tail logs: ./scripts/botLogs.sh"
+      echo "botStart: dashboard: ./scripts/dashboard.sh"
       exit 0
     fi
   fi
   if [ "$i" -eq 50 ]; then
-    echo "botInit: orchestrator never wrote its PID — check $LOG_FILE for the failure."
+    echo "botStart: orchestrator never wrote its PID — check $LOG_FILE for the failure."
     exit 1
   fi
   sleep 0.2

@@ -1,12 +1,13 @@
 import type { Bot } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Recipe } from "prismarine-recipe";
 import { Vec3 } from "vec3";
 import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { resolveItem } from "./item-naming.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const TABLE_SEARCH_RADIUS = 32;
@@ -35,8 +36,34 @@ const FUEL_BURN_PER_UNIT: ReadonlyMap<string, number> = new Map([
 const FUEL_DEFAULT_BURN = 1;
 const FUEL_PREFERENCE_ORDER = ["coal", "charcoal", "coal_block", "blaze_rod", "dried_kelp_block"];
 
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
+/**
+ * Items the agent has been observed picking as "fuel" that vanilla allows
+ * but real players would never use because they burn for a fraction of an
+ * item — wooden slabs at 0.75/unit, saplings at 0.5/unit, buttons at 0.5,
+ * etc. Crafted from valuable wood and then thrown into a furnace for
+ * almost no return.
+ *
+ * The auto-pick path skips them (they're not in FUEL_PREFERENCE_ORDER), but
+ * the LLM can still pass them explicitly via the `fuel` param. We reject
+ * those with an actionable message so the agent reroutes to "get coal first"
+ * rather than torching its own building materials.
+ */
+const WASTEFUL_FUEL_SUFFIXES: ReadonlyArray<string> = [
+  "_slab",
+  "_sapling",
+  "_button",
+  "_trapdoor",
+  "_fence_gate",
+  "_pressure_plate",
+];
+const WASTEFUL_FUEL_EXACT: ReadonlySet<string> = new Set([
+  "bamboo",
+  "scaffolding",
+  "stick",
+]);
+function isWastefulExplicitFuel(name: string): boolean {
+  if (WASTEFUL_FUEL_EXACT.has(name)) return true;
+  return WASTEFUL_FUEL_SUFFIXES.some((s) => name.endsWith(s));
 }
 
 export interface CraftParams {
@@ -219,12 +246,6 @@ async function resolveCraftingTable(bot: Bot, tablePos?: Coords): Promise<TableR
   };
 }
 
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
-  }
-}
-
 function fmt(v: { x: number; y: number; z: number }): string {
   return `(${Math.round(v.x)}, ${Math.round(v.y)}, ${Math.round(v.z)})`;
 }
@@ -364,6 +385,12 @@ function resolveFuel(bot: Bot, fuelName: string | undefined, smeltCount: number)
     if (!r.ok) return { ok: false, message: `fuel ${r.message}` };
     const fuelData = r.data;
     const normalized = r.normalized;
+    if (isWastefulExplicitFuel(normalized)) {
+      return {
+        ok: false,
+        message: `${normalized} is wasteful fuel (burns <1 item/unit); don't smelt with it. Mine coal_ore (drops coal directly with a wooden pickaxe or better), or as a last resort use logs/planks. Omit \`fuel\` to auto-pick the best one in inventory.`,
+      };
+    }
     const per = FUEL_BURN_PER_UNIT.get(normalized) ?? FUEL_DEFAULT_BURN;
     const units = Math.ceil(smeltCount / per);
     const have = bot.inventory.count(fuelData.id, null);

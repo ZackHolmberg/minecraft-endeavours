@@ -87,7 +87,7 @@ The orchestrator drives Claude through the **Claude Agent SDK** (`@anthropic-ai/
 Lifecycle is split across three pairs of scripts, each with a single job — no script controls anything outside its lane:
 
 - **Server control:** `./scripts/start.sh` / `./scripts/stop.sh` (docker compose).
-- **Bot control:** `./scripts/botInit.sh` is the *only* entry point for starting the orchestrator. It refuses to run if the MC server isn't reachable on `:25565` or if a previous orchestrator is still alive, then detaches `npm run start` into the background with stdout/stderr captured in `.bot-runtime/bot.log`. `./scripts/botStop.sh` sends SIGTERM and waits for graceful shutdown.
+- **Bot control:** `./scripts/botStart.sh` is the *only* entry point for starting the orchestrator. It refuses to run if the MC server isn't reachable on `:25565` or if a previous orchestrator is still alive, then detaches `npm run start` into the background with stdout/stderr captured in `.bot-runtime/bot.log`. `./scripts/botStop.sh` sends SIGTERM and waits for graceful shutdown.
 - **Viewers (read-only):** `./scripts/botLogs.sh` (tails `.bot-runtime/bot.log`) and `./scripts/dashboard.sh` (mounts the TUI). Both refuse to run if the MC server or the bot isn't already up. Quitting either viewer never stops anything.
 
 Runtime state lives under `./.bot-runtime/` (gitignored): `bot.pid` (orchestrator writes its own to avoid npm/tsx wrapper PID issues), `bot.log` (orchestrator stdout/stderr), `snapshot.json` (500ms dump via `src/snapshot-writer.ts`, consumed by the dashboard client).
@@ -331,7 +331,7 @@ config/
   bots.yml                  # versioned
 data/orchestrator/memory/<bot-username>/world.json   # per-bot world knowledge (gitignored via data/)
 scripts/
-  botInit.sh                # only entry point for starting the bot — refuses if MC down or bot already up; detaches orchestrator
+  botStart.sh                # only entry point for starting the bot — refuses if MC down or bot already up; detaches orchestrator
   botStop.sh                # SIGTERM the running orchestrator; waits for clean shutdown
   botLogs.sh                # tail -F .bot-runtime/bot.log (read-only viewer)
   dashboard.sh              # mount TUI dashboard against the running bot (read-only viewer)
@@ -383,8 +383,8 @@ See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearin
 | Interaction routing | Name-mention + `/msg` + `@all` (ambient deferred) | Covers explicit tasking; ambient cut to fit Pro token budget |
 | Claude runtime | Claude Agent SDK + Pro subscription auth | No new billing; built-in agent loop; tradeoff is 5-hour rolling rate limits |
 | Default model | Sonnet 4.6 main / Haiku 4.5 background / Opus 4.7 opt-in | Cost/quality balance; reserved escalation for hard tasks |
-| Orchestrator process | Hybrid: host `botInit.sh` (detached) for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
-| Launcher scripts | Three lanes: server (`start.sh`/`stop.sh`), bot (`botInit.sh`/`botStop.sh`), viewers (`botLogs.sh`/`dashboard.sh`) | Each script does one thing; viewers can't accidentally start the server or the bot |
+| Orchestrator process | Hybrid: host `botStart.sh` (detached) for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
+| Launcher scripts | Three lanes: server (`start.sh`/`stop.sh`), bot (`botStart.sh`/`botStop.sh`), viewers (`botLogs.sh`/`dashboard.sh`) | Each script does one thing; viewers can't accidentally start the server or the bot |
 | Dashboard ↔ orchestrator coupling | Out-of-process via `.bot-runtime/snapshot.json` (500ms dump) | Quitting the dashboard never disturbs the bot; future HTTP/WS API has the same shape |
 | Skill scope | 28 registered skills across perception / chat / movement / world / inventory / interaction / crafting / combat / storage / survival / meta; 4 pending (`findBlock`, `findEntity`, `lookAt`, `wait` — all low-value). See [SKILLS.md](SKILLS.md) status table. | Capable from day one |
 | Architecture principle | "Push work down the stack" — middleware does anything deterministic; Claude only handles judgment | Lower latency, lower token spend, more reliable behavior |

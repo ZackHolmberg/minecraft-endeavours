@@ -1,18 +1,15 @@
 import type { Bot } from "mineflayer";
-import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 
-const { goals, Movements } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 import type { Entity } from "prismarine-entity";
 import { Vec3 } from "vec3";
 import { equipItem } from "./inventory.js";
+import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const BLOCK_REACH = 3;
 const ENTITY_REACH = 3;
-
-interface BotWithPathfinder extends Bot {
-  pathfinder: Pathfinder;
-}
 
 export interface ActivateBlockParams {
   position: Coords;
@@ -210,12 +207,6 @@ function findEntityByName(bot: Bot, name: string): Entity | null {
     if (!best || d < best.dist) best = { entity, dist: d };
   }
   return best?.entity ?? null;
-}
-
-function ensureMovements(bot: BotWithPathfinder): void {
-  if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
-    bot.pathfinder.setMovements(new Movements(bot));
-  }
 }
 
 function fmt(v: { x: number; y: number; z: number }): string {

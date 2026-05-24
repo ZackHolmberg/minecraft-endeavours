@@ -4,7 +4,7 @@
  * in-memory buffer. The snapshot writer (`src/snapshot-writer.ts`) reads the
  * tail of this buffer into `.bot-runtime/snapshot.json` for the out-of-process
  * dashboard. Original console output also keeps flowing to stdout (captured
- * by `scripts/botInit.sh` in `.bot-runtime/bot.log`).
+ * by `scripts/botStart.sh` in `.bot-runtime/bot.log`).
  *
  * Scope (MVP per ROADMAP "stdout capture" risk):
  *  - Captures everything routed through the four console methods, including

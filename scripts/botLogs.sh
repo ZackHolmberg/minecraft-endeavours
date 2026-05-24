@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stream the running bot's log output. Read-only — does not start the MC
-# server or the bot. Use `./scripts/start.sh` and `./scripts/botInit.sh`
+# server or the bot. Use `./scripts/start.sh` and `./scripts/botStart.sh`
 # for that.
 set -e
 cd "$(dirname "$0")/.."
@@ -14,18 +14,18 @@ if ! nc -z localhost 25565 2>/dev/null; then
 fi
 
 if [ ! -f "$PID_FILE" ]; then
-  echo "botLogs: no bot is running — start one with ./scripts/botInit.sh."
+  echo "botLogs: no bot is running — start one with ./scripts/botStart.sh."
   exit 1
 fi
 
 BOT_PID="$(cat "$PID_FILE")"
 if [ -z "$BOT_PID" ] || ! kill -0 "$BOT_PID" 2>/dev/null; then
-  echo "botLogs: stale PID file (process $BOT_PID is gone) — restart with ./scripts/botInit.sh."
+  echo "botLogs: stale PID file (process $BOT_PID is gone) — restart with ./scripts/botStart.sh."
   exit 1
 fi
 
 if [ ! -f "$LOG_FILE" ]; then
-  echo "botLogs: log file $LOG_FILE doesn't exist yet — wait a moment after botInit and retry."
+  echo "botLogs: log file $LOG_FILE doesn't exist yet — wait a moment after botStart and retry."
   exit 1
 fi
 

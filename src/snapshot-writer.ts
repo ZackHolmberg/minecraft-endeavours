@@ -1,7 +1,7 @@
 /**
  * Periodic snapshot dumper for the out-of-process dashboard.
  *
- * The orchestrator runs detached (started by `scripts/botInit.sh`); the
+ * The orchestrator runs detached (started by `scripts/botStart.sh`); the
  * dashboard (`scripts/dashboard.sh`) is a separate blessed process that
  * reads from disk. To bridge the two we serialize every bot's snapshot plus
  * the tail of the log ring buffer into a single JSON file on a 500ms tick.
