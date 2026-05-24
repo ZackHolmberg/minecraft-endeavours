@@ -44,6 +44,15 @@ const MAX_TURNS_PER_EVENT = 100;
 // kills the turn silently.
 const TURN_WARN_FRACTION = 0.8;
 const DEFAULT_COOLDOWN_SECONDS = 5 * 60;
+// Pro plan's rolling 5h window. We never assume the bot starts the window at
+// 0% — other Claude usage on this account counts too. We only show absolute
+// utilization when the SDK reports it via rate_limit_event (which only fires
+// at ~80%+ thresholds). Between events, we display the bot's contribution
+// and, once we have ≥2 anchors, an extrapolated estimate of current util.
+const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
+// Need a non-trivial utilization delta between two anchors before we trust
+// the derived budget — small deltas amplify noise. ~1 percentage point.
+const MIN_UTILIZATION_DELTA_FOR_BUDGET = 0.01;
 
 /**
  * Token usage shape we accumulate from `SDKResultSuccess.usage`. Names match
@@ -78,6 +87,43 @@ export type RateLimitInfo = Record<string, unknown>;
 export interface LastTurnError {
   subtype: string;
   at: number;
+}
+
+/**
+ * One bot-billable sample (input + output tokens per the user's chosen
+ * weighting — cache reads excluded). Buffered in a rolling 5h window so we
+ * can answer "how much has this bot contributed since the SDK's most recent
+ * rate-limit signal".
+ */
+interface WindowSample {
+  at: number;
+  billable: number;
+}
+
+/**
+ * Snapshot of (a) what the SDK told us about Pro-window utilization and
+ * (b) the bot's billable-token cumulative count at the same moment. Two
+ * anchors let us derive a token-per-utilization budget by linear fit.
+ */
+interface CalibrationAnchor {
+  at: number;
+  utilization: number;
+  botBillableInWindow: number;
+}
+
+/**
+ * Window stats surfaced to the dashboard. All bot-only fields are labeled
+ * as such — `botBillableLast5h` is *this bot's* contribution to the shared
+ * 5h window, not the total. `latestAnchor` and `estimatedCurrentUtilization`
+ * are the only fields that speak to the *actual* window state.
+ */
+export interface WindowStats {
+  botBillableLast5h: number;
+  latestAnchor: { at: number; utilization: number } | null;
+  botBillableSinceLastAnchor: number;
+  estimatedBudget: number | null;
+  estimatedCurrentUtilization: number | null;
+  anchorCount: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -157,6 +203,8 @@ export class NpcAgent {
   private lastTurnError: LastTurnError | null = null;
   private turnsThisEvent = 0;
   private warnedThisEvent = false;
+  private windowSamples: WindowSample[] = [];
+  private anchors: CalibrationAnchor[] = [];
 
   constructor(private readonly opts: NpcAgentOptions) {
     this.start();
@@ -246,6 +294,10 @@ export class NpcAgent {
         // (per ROADMAP "Pro window precision" — utilization may only appear
         // under allowed_warning / rejected).
         console.log(`${tag} rate-limit event: ${JSON.stringify(info)}`);
+        const util = info && typeof info.utilization === "number" ? info.utilization : null;
+        if (util !== null) {
+          this.recordAnchor(util);
+        }
         if ((info?.status as string | undefined) === "rejected") {
           const resetsAt = info && typeof info.resetsAt === "number" ? info.resetsAt : null;
           this.startCooldown(resetsAt);
@@ -277,8 +329,12 @@ export class NpcAgent {
           }
           this.sessionUsage.turns += 1;
           this.lastTurnError = null;
+          const billable = turn.input_tokens + turn.output_tokens;
+          this.windowSamples.push({ at: Date.now(), billable });
+          this.pruneWindow();
+          const costStr = turn.total_cost_usd !== null ? ` $${turn.total_cost_usd.toFixed(4)}` : "";
           console.log(
-            `${tag} event complete after ${turnsForEvent} turn(s) (cache_read=${turn.cache_read_input_tokens}, out=${turn.output_tokens})`,
+            `${tag} event complete after ${turnsForEvent} turn(s) — in=${turn.input_tokens} out=${turn.output_tokens} cache_create=${turn.cache_creation_input_tokens} cache_read=${turn.cache_read_input_tokens} billable=${billable}${costStr}`,
           );
         } else {
           this.lastTurnError = { subtype: msg.subtype, at: Date.now() };
@@ -290,6 +346,35 @@ export class NpcAgent {
       default:
         return;
     }
+  }
+
+  private pruneWindow(): void {
+    const cutoff = Date.now() - FIVE_HOURS_MS;
+    while (this.windowSamples.length > 0 && this.windowSamples[0]!.at < cutoff) {
+      this.windowSamples.shift();
+    }
+  }
+
+  private sumWindow(): number {
+    let total = 0;
+    for (const s of this.windowSamples) total += s.billable;
+    return total;
+  }
+
+  /**
+   * Capture an SDK-reported utilization sample. Pairs with the bot's current
+   * 5h-rolling billable count so two anchors can derive a tokens-per-util
+   * budget. We retain the most recent few anchors; only the two latest feed
+   * the budget calc, but keeping a small tail makes future debugging easier.
+   */
+  private recordAnchor(utilization: number): void {
+    this.pruneWindow();
+    this.anchors.push({
+      at: Date.now(),
+      utilization,
+      botBillableInWindow: this.sumWindow(),
+    });
+    while (this.anchors.length > 5) this.anchors.shift();
   }
 
   private startCooldown(resetsAtUnixSeconds: number | null): void {
@@ -347,6 +432,46 @@ export class NpcAgent {
 
   getLastTurnError(): LastTurnError | null {
     return this.lastTurnError ? { ...this.lastTurnError } : null;
+  }
+
+  /**
+   * Snapshot the 5h-window picture for the dashboard. Bot-only totals are
+   * always exact; absolute utilization is only available once the SDK has
+   * emitted at least one `rate_limit_event` with `utilization` populated.
+   * Extrapolated current utilization requires two such anchors with a
+   * non-trivial delta (and assumes no other heavy Claude usage between them).
+   */
+  getWindowStats(): WindowStats {
+    this.pruneWindow();
+    const botBillableLast5h = this.sumWindow();
+    const latest = this.anchors[this.anchors.length - 1] ?? null;
+
+    let botBillableSinceLastAnchor = 0;
+    if (latest) {
+      botBillableSinceLastAnchor = Math.max(0, botBillableLast5h - latest.botBillableInWindow);
+    }
+
+    let estimatedBudget: number | null = null;
+    let estimatedCurrentUtilization: number | null = null;
+    if (this.anchors.length >= 2) {
+      const a = this.anchors[this.anchors.length - 2]!;
+      const b = this.anchors[this.anchors.length - 1]!;
+      const dUtil = b.utilization - a.utilization;
+      const dTokens = b.botBillableInWindow - a.botBillableInWindow;
+      if (dUtil >= MIN_UTILIZATION_DELTA_FOR_BUDGET && dTokens > 0) {
+        estimatedBudget = dTokens / dUtil;
+        estimatedCurrentUtilization = b.utilization + botBillableSinceLastAnchor / estimatedBudget;
+      }
+    }
+
+    return {
+      botBillableLast5h,
+      latestAnchor: latest ? { at: latest.at, utilization: latest.utilization } : null,
+      botBillableSinceLastAnchor,
+      estimatedBudget,
+      estimatedCurrentUtilization,
+      anchorCount: this.anchors.length,
+    };
   }
 
   async stop(): Promise<void> {

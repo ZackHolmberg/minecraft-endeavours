@@ -22,6 +22,7 @@ import {
   type RateLimitInfo,
   type SessionUsage,
   type TurnUsage,
+  type WindowStats,
 } from "../agent/npc-agent.js";
 import {
   getSupervisor,
@@ -81,6 +82,7 @@ export interface AgentFields {
   lastTurnUsage: TurnUsage | null;
   sessionUsage: SessionUsage;
   lastTurnError: LastTurnError | null;
+  windowStats: WindowStats;
 }
 
 /**
@@ -179,6 +181,7 @@ function snapshotAgentFields(username: string): AgentFields | null {
     lastTurnUsage: agent.getLastTurnUsage(),
     sessionUsage: agent.getSessionUsage(),
     lastTurnError: agent.getLastTurnError(),
+    windowStats: agent.getWindowStats(),
   };
 }
 

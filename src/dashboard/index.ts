@@ -320,50 +320,56 @@ function renderTokenPanel(snap: BotSnapshot): string {
 
   const lines: string[] = [];
   const info = a.rateLimitInfo;
+  const w = a.windowStats;
 
-  if (info === null) {
-    lines.push(`{gray-fg}no rate-limit event yet{/}`);
-  } else {
-    const status = (info.status as string | undefined) ?? "unknown";
+  // ── 5h window — SDK is truth; bot contribution is supplement ──────────
+  lines.push(`{bold}5h window{/}`);
+  if (w.latestAnchor) {
+    const age = snap.capturedAt - w.latestAnchor.at;
+    const sdkPct = (w.latestAnchor.utilization * 100).toFixed(0);
+    const status = (info?.status as string | undefined) ?? "—";
     const statusColor = status === "rejected" ? "red" : status === "allowed_warning" ? "yellow" : "green";
-    lines.push(`status:  {${statusColor}-fg}${status}{/}`);
-
-    const util = info.utilization;
-    if (typeof util === "number") {
-      lines.push(`util:    ${(util * 100).toFixed(0)}%`);
+    lines.push(`  SDK {${statusColor}-fg}${sdkPct}%{/} {gray-fg}${formatDuration(age)} ago{/}  ({${statusColor}-fg}${status}{/})`);
+    const resetsAt = info && typeof info.resetsAt === "number" ? info.resetsAt : null;
+    if (resetsAt !== null) {
+      lines.push(`  resets in ${formatDuration(Math.max(0, resetsAt * 1000 - snap.capturedAt))}`);
     }
-
-    const resetsAt = info.resetsAt;
-    if (typeof resetsAt === "number") {
-      const inMs = resetsAt * 1000 - snap.capturedAt;
-      lines.push(`resets:  in ${formatDuration(Math.max(0, inMs))}`);
+    const sincePart = `bot +${formatTokens(w.botBillableSinceLastAnchor)} since`;
+    if (w.estimatedCurrentUtilization !== null) {
+      const pct = (w.estimatedCurrentUtilization * 100).toFixed(0);
+      lines.push(`  ${sincePart} → est {yellow-fg}~${pct}%{/}`);
+    } else {
+      lines.push(`  ${sincePart}  {gray-fg}(need 2 anchors){/}`);
     }
+  } else {
+    lines.push(`  {gray-fg}waiting for SDK (fires ~80%+){/}`);
+    lines.push(`  bot 5h: ${formatTokens(w.botBillableLast5h)} {gray-fg}(bot only){/}`);
   }
-
   if (a.rateLimited) {
-    lines.push(`{red-fg}cooldown ${a.cooldownRemainingMinutes} min{/}`);
+    lines.push(`  {red-fg}cooldown ${a.cooldownRemainingMinutes} min{/}`);
   }
 
+  // ── Per-turn detail (single line per user preference) ─────────────────
   lines.push("");
-  lines.push(`{bold}Last turn{/}`);
   if (a.lastTurnUsage) {
     const t = a.lastTurnUsage;
     const totalIn = t.input_tokens + t.cache_creation_input_tokens + t.cache_read_input_tokens;
     const cacheHitPct = totalIn > 0 ? (t.cache_read_input_tokens / totalIn) * 100 : 0;
-    lines.push(`  in ${formatTokens(totalIn)}  out ${formatTokens(t.output_tokens)}`);
-    lines.push(`  cache ${cacheHitPct.toFixed(0)}%${t.total_cost_usd !== null ? `  $${t.total_cost_usd.toFixed(4)}` : ""}`);
+    const billable = t.input_tokens + t.output_tokens;
+    const cost = t.total_cost_usd !== null ? `  $${t.total_cost_usd.toFixed(4)}` : "";
+    lines.push(`{bold}Last turn{/} billable ${formatTokens(billable)}${cost}`);
+    lines.push(`  in ${formatTokens(t.input_tokens)}  cache_r ${formatTokens(t.cache_read_input_tokens)} (${cacheHitPct.toFixed(0)}%)  out ${formatTokens(t.output_tokens)}`);
   } else {
-    lines.push(`  {gray-fg}no turns yet{/}`);
+    lines.push(`{bold}Last turn{/} {gray-fg}no turns yet{/}`);
   }
 
+  // ── Session totals (bot-only since startup) ───────────────────────────
   lines.push("");
   const s = a.sessionUsage;
-  lines.push(`{bold}Session{/} (${s.turns} turn${s.turns === 1 ? "" : "s"})`);
-  const totalSessionIn = s.input_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
-  lines.push(`  in ${formatTokens(totalSessionIn)}  out ${formatTokens(s.output_tokens)}`);
-  if (s.total_cost_usd !== null) {
-    lines.push(`  cost $${s.total_cost_usd.toFixed(4)}`);
-  }
+  const sessionBillable = s.input_tokens + s.output_tokens;
+  const sessionCost = s.total_cost_usd !== null ? `  $${s.total_cost_usd.toFixed(4)}` : "";
+  lines.push(`{bold}Session{/} (${s.turns}t) billable ${formatTokens(sessionBillable)}${sessionCost}`);
+  lines.push(`  in ${formatTokens(s.input_tokens)}  cache_r ${formatTokens(s.cache_read_input_tokens)}  out ${formatTokens(s.output_tokens)}`);
 
   return lines.join("\n");
 }
