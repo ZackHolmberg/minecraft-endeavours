@@ -1,8 +1,8 @@
 # Architecture
 
-Forward-looking design for the **AI NPC system**: Minecraft players backed by Claude that you can chat with and assign tasks.
+Design + as-shipped reference for the **AI NPC system**: Minecraft players backed by Claude that you can chat with and assign tasks.
 
-Current scope: **v0.2** (first bot, single config, chat interaction only). Deferred features and their technical sketches live in [ROADMAP.md](ROADMAP.md).
+Current scope: **v0.3+** (single bot per username, chat interaction, 28-skill catalogue including the full iron-armor production loop, in-terminal dashboard). Deferred features and their technical sketches live in [ROADMAP.md](ROADMAP.md).
 
 ## Goals
 
@@ -35,7 +35,7 @@ Orchestrator              spawns / supervises NPCs, routes chat
 
 **Middleware handles everything else:** facts, counts, filters, aggregations, lookups, routing decisions by name or regex, deterministic failure handling, pathing checks, capture of observable events, queue management.
 
-Concrete applications baked into v0.2:
+Concrete applications shipped:
 
 | Pre-processing | Saves Claude from |
 |---|---|
@@ -56,7 +56,7 @@ Concrete applications baked into v0.2:
 Single Node.js process that spawns one NPC agent per configured bot account, supervises reconnects, and routes in-game chat events to the right NPC.
 
 ### NPC Agent
-Per-bot Claude Agent SDK loop. Event-driven (not a tight tick loop) — wakes on chat-to-bot, skill completion, or periodic heartbeat. Maintains short-term conversation history; long-term summarization runs when history grows. Conversation memory does not persist across restarts in v0.2 (see [ROADMAP.md](ROADMAP.md)). System prompt + tool definitions are prompt-cached by the SDK.
+Per-bot Claude Agent SDK loop. Event-driven (not a tight tick loop) — wakes on chat-to-bot. One long-lived `query()` per bot in streaming-input mode; an async queue of `SDKUserMessage` is its `prompt`. Conversation lives in SDK process memory and does not persist across restarts (see [ROADMAP.md](ROADMAP.md)). System prompt + tool definitions are prompt-cached by the SDK (~2280 cached tokens per warm turn — see [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md)).
 
 ### Skills
 A library of high-level capabilities exposed to Claude as tools. Each skill is a JS function that orchestrates mineflayer primitives and returns a structured result. Skills are unit-testable independently of Claude.
@@ -69,7 +69,7 @@ The raw bot client plus `mineflayer-pathfinder` for movement. Not exposed to Cla
 ### Claude runtime & auth
 The orchestrator drives Claude through the **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) rather than the raw Anthropic SDK. It authenticates via the **Pro subscription** Claude Code already holds on this Mac — no separate API billing. Tradeoffs:
 
-- **Pro rate limits apply.** 5-hour rolling windows are shared across all NPCs on this account. Heavy multi-hour play could hit them and silence the bots until reset. Acceptable for v0.2 scope (1–2 bots, name-mention only — see *Interaction modes*).
+- **Pro rate limits apply.** 5-hour rolling windows are shared across all NPCs on this account. Heavy multi-hour play could hit them and silence the bots until reset. Acceptable for current scope (1–2 bots, name-mention only — see *Interaction modes*).
 - **Less granular control** than the raw SDK over per-call model selection and prompt caching — these are managed by the Agent SDK runtime. We can still hint (Sonnet for main loop, Haiku for summarization) but not as freely.
 - **Auth is host-bound.** Works seamlessly here because Claude Code is installed and authed. Moving the orchestrator to a remote VPS later would require Claude Code installed and authed there too.
 - **The skill layer doesn't change.** If we ever swap to direct Anthropic API + pay-per-token, only the agent runtime layer changes; skills, orchestrator, and bot wiring are identical.
@@ -92,7 +92,7 @@ A `package.json` at the repo root will define `dev` (nodemon-based hot reload) a
 ## Configuration
 
 ### Bot config — `config/bots.yml`
-Versioned in git. One entry per bot. Minimal v0.2 shape:
+Versioned in git. One entry per bot. Minimal shape:
 
 ```yaml
 bots:
@@ -102,18 +102,18 @@ bots:
 
 Fields:
 - `username` — Minecraft username the bot connects as (must be on the whitelist).
-- `model_hint` — `sonnet` / `haiku` / `opus`. Suggests main-loop model to the Agent SDK; exact mechanism pinned down when coding starts.
+- `model_hint` — `sonnet` / `haiku` / `opus`. Mapped to a full model ID at the agent boundary (`src/agent/behavior.ts`).
 
-`persona`, `owner`, and richer permission fields are deferred to v0.3+ (see [ROADMAP.md](ROADMAP.md)).
+`persona`, `owner`, and richer permission fields are deferred (see [ROADMAP.md](ROADMAP.md)).
 
 ### Environment variables — `.env`
-No new secrets for v0.2 — Agent SDK auth via Pro subscription is handled by Claude Code's existing on-disk credentials. Additions:
+No new secrets — Agent SDK auth via Pro subscription is handled by Claude Code's existing on-disk credentials. Additions over the bare minecraft / duckdns setup:
 
 - `MC_HOST` (optional, default `localhost`) — where the orchestrator connects to the MC server. `localhost` for host-process dev; switches to `minecraft` (the compose service name) when the orchestrator becomes a compose service.
 
 `DUCKDNS_TOKEN` remains the only real secret.
 
-## Skill catalogue (v0.2)
+## Skill catalogue
 
 Each skill is a JS function exposed to Claude as a tool. Skills take **specific, machine-friendly parameters** (block IDs, item IDs, entity types); Claude translates vague player intent into specific calls. All skills block until done or fail and return a structured result:
 
@@ -121,46 +121,48 @@ Each skill is a JS function exposed to Claude as a tool. Skills take **specific,
 { ok: boolean, message: string, state?: object }
 ```
 
+Pending skills are marked ⏳; everything else is shipped. Per-skill reference (signatures, success / failure messages, caveats) lives in [SKILLS.md](SKILLS.md).
+
 | Category | Skill | Params | Notes |
 |---|---|---|---|
-| Perception | `observeSurroundings` | — | Nearby blocks (with counts/distances), entities, players, time, weather, bot health/hunger/position, plus middleware state (recent actions, recently-seen players, current task queue, `knownStorage`, `knownUtilities`). Claude's primary "look around". |
-| Perception | `findBlock` | `type, maxDist?` | Nearest block of a type. |
-| Perception | `findEntity` | `filter, maxDist?` | Nearest entity (mob type or player name). |
-| Perception | `checkInventory` | — | Pre-aggregated inventory: grouped by type with counts, durability, and equipped status (e.g. `"16 logs, 64 cobblestone, iron pickaxe (35%)"`) — not raw slots. |
-| Movement | `goTo` | `target` | Coords / entity / block. Pre-checks reachability via pathfinder; fails fast with nearest accessible point if no path. |
-| Movement | `followPlayer` | `name, dist?` | Sustained follow until stopped. |
-| Movement | `stop` | — | Cancel current movement / action. |
-| Movement | `lookAt` | `target` | Face a target. |
-| World | `mineBlock` | `type, count?` | Composite: find → path → dig → pick up. |
-| World | `placeBlock` | `type, position` | Place from inventory. |
-| World | `activateBlock` | `position` | Doors, chests, levers, buttons. |
-| Inventory | `pickUpNearby` | `maxDist?` | Collect dropped items in range. |
-| Inventory | `equipItem` | `item, slot?` | Hand / armor / off-hand slot. |
-| Inventory | `dropItem` | `item, count?` | Drop on ground. |
-| Inventory | `giveItemTo` | `player, item, count?` | Walk to player and hand off. |
-| Inventory | `checkInventory` | — | Pre-aggregated grouped inventory (main + hotbar + armor + off-hand) with durabilities. |
-| Interaction | `activateBlock` | `position, with?` | Right-click on a block (hoe-till, bucket fill/place, flint-and-steel, plant seeds, doors, levers). |
-| Interaction | `useOnEntity` | `entity, with?` | Right-click on a mob/player (shears sheep, bucket-milk cow, name tag, dye sheep, lead, saddle). |
-| Interaction | `useItem` | `with?, offhand?` | Right-click in mid-air (throw pearl, throw splash potion, charge bow). Not for food — use `eat`. |
-| Crafting | `craft` | `item, count?, tablePos?` | Handles 2×2 inventory vs 3×3 table; falls back to remembered crafting_table from world memory. |
-| Crafting | `smelt` | `input, fuel?, count?, furnacePos?` | Composite: open furnace (auto-found or remembered), put input + fuel, take output. |
-| Survival | `eat` | `item?` | Composite: equip food, consume. Auto-picks best food when `item` omitted. |
-| Survival | `fish` | — | Wraps bot.fish; cancellable; 5-minute timeout. Requires fishing_rod in hand. |
-| Survival | `sleepIn` | `pos?` | Wraps bot.sleep with the same fallback ladder (caller → nearby `*_bed` 32 blocks → remembered bed POI). |
-| Combat | `attack` | `entity` | Basic melee. |
-| Combat | `flee` | `from, dist?` | Path away from threat. |
+| Perception | `observeSurroundings` | `radius?` | Nearby blocks (with counts / distances), entities, players, time, weather, status, plus middleware state (recent actions, recently-seen players, current task queue, `knownStorage`, `knownUtilities`). Claude's primary "look around". |
+| Perception | `checkInventory` | — | Pre-aggregated grouped inventory (main + hotbar + armor + off-hand) with durabilities and equipped-slot annotations. |
+| Perception | `findBlock` ⏳ | `type, maxDist?` | Nearest block of a type. Mostly redundant with `observeSurroundings.nearbyBlocks`. |
+| Perception | `findEntity` ⏳ | `filter, maxDist?` | Nearest entity (mob type or player name). |
 | Chat | `say` | `message` | Public chat. |
 | Chat | `whisper` | `player, message` | Private reply. |
-| Meta | `wait` | `seconds` | "Stand here for a bit". |
-| Meta | `remember` | `type, name?, pos?` | Record a POI to world knowledge. Used when player names a place ("this is the base"). `pos` defaults to bot's current position. |
-| Meta | `setTaskQueue` | `tasks` | Declare a multi-task plan (`["get wood", "get iron", "return"]`). Orchestrator persists the queue across turns. |
-| Meta | `advanceTaskQueue` | — | Mark current task done, move to the next. Returns the new current task or `null` if queue is empty. |
+| Movement | `goTo` | `target, reach?` | Coords / entity / block (discriminated union). Pre-checks reachability; fails fast if no path. |
+| Movement | `followPlayer` | `player, dist?` | Sustained follow until cancelled. |
+| Movement | `stop` | — | Flips the per-bot cancellation flag and cancels active pathfinder goals. |
+| Movement | `lookAt` ⏳ | `target` | Face a target. |
+| World | `mineBlock` | `type, count?` | Composite: find → path → equip → dig → `pickUpNearby` sweep. |
+| World | `placeBlock` | `type, position` | Probes 6 adjacent positions for a solid reference block, derives face vector, equips, places. |
+| Inventory | `pickUpNearby` | `maxDist?` | Collect dropped items in range. Snapshot-at-entry. |
+| Inventory | `equipItem` | `item, slot?` | Hand / off-hand / armor slot. Looks across main + hotbar + already-equipped. |
+| Inventory | `dropItem` | `item, count?` | Drop on ground. |
+| Inventory | `giveItemTo` | `player, item, count?` | Walk to player and hand off (composite: `goTo` → `lookAt` → `dropItem`). |
+| Interaction | `activateBlock` | `position, with?` | Right-click on a block (hoe-till, bucket fill / place, flint-and-steel, plant seeds, bone meal, doors, levers). |
+| Interaction | `useOnEntity` | `entity, with?` | Right-click on a mob / player (shears sheep, bucket-milk cow, name tag, dye sheep, lead, saddle). |
+| Interaction | `useItem` | `with?, offhand?` | Right-click in mid-air (throw pearl, throw splash potion, charge bow). Not for food — use `eat`. |
+| Crafting | `craft` | `item, count?, tablePos?` | 2×2 inventory recipes or 3×3 table; table resolution falls back to `knownUtilities` remembered crafting_table. |
+| Crafting | `smelt` | `input, fuel?, count?, furnacePos?` | Open furnace (caller → nearby → remembered POI), put input + fuel, take output. Closes the iron-armor production loop. |
+| Combat | `attack` | `entity` | Tick-loop melee with weapon auto-equip. Cancellable. |
+| Combat | `flee` | `from, dist?` | Path away from threat until `dist` separation. Cancellable; re-paths every ~1.5s. |
+| Storage | `depositToChest` | `item, count?, pos?` | Walk to chest, deposit. `pos`-less default: nearest known container. Auto-capture hook snapshots contents on close. |
+| Storage | `withdrawFromChest` | `item, count?, pos?` | Walk to chest, withdraw. `pos`-less default: nearest known container whose remembered contents include the item. |
+| Survival | `eat` | `item?` | Equip food, `bot.consume()`. Auto-picks best food when `item` omitted. |
+| Survival | `fish` | — | Wraps `bot.fish()`; cancellable; 5-minute timeout. Requires `fishing_rod` in hand. |
+| Survival | `sleepIn` | `pos?` | Wraps `bot.sleep`; same fallback ladder (caller → nearby `*_bed` 32 blocks → remembered bed POI). |
+| Meta | `remember` | `type, name?, pos?` | Record a POI to world knowledge ("this is the base"). `pos` defaults to bot's current position. Idempotent on (type, position). |
+| Meta | `setTaskQueue` | `tasks` | Declare a multi-task plan. Current + remaining tasks surface in every `observeSurroundings`. |
+| Meta | `advanceTaskQueue` | — | Mark current task done; promote the next. |
+| Meta | `wait` ⏳ | `seconds` | Stand still for a duration. Marginal — model can express "do nothing" by not calling tools. |
 
 ### Skill design principles
 - **Specific params, not vague descriptors.** Skills take concrete IDs. Vagueness is resolved in the model (helped by `observeSurroundings`), not in the skill layer.
 - **Structured result.** Every skill returns `{ ok, message, state? }`. Failure messages must be specific enough for Claude to adapt: `"no oak_log within 64 blocks"`, `"inventory full"`, `"path blocked by water"`.
-- **Sync / blocking.** Skills run to completion or failure; no progress streaming in v0.2.
-- **Composite skills accepted.** `mineBlock(oak_log, 10)` hides 5–6 primitives — saves tokens but Claude can't intervene mid-skill. Acceptable tradeoff for v0.2; revisit if it bites.
+- **Sync / blocking.** Skills run to completion or failure; no progress streaming. Long-running tick-loop skills (`followPlayer`, `attack`, `flee`, `fish`) are cancellable via the per-bot cancellation flag (see *Bot state*).
+- **Composite skills accepted.** `mineBlock(oak_log, 10)` hides 5–6 primitives — saves tokens but Claude can't intervene mid-skill on non-cancellable skills. Acceptable tradeoff; revisit if it bites.
 
 ### `observeSurroundings()` output shape
 The bot's primary "look around". Load-bearing because Claude's defaults for vague requests depend on it.
@@ -196,10 +198,10 @@ Real player chat is conversational and underspecified. Claude is taught (via sys
 - **Propose a plan and wait for confirmation** for large multi-step tasks. *"I'll build a 5×5 wood hut next to that oak — sound good?"*
 
 ### Interruption while a skill runs
-Chat arriving during a skill is **queued** until the skill finishes; Claude then handles it. To preempt, the player says "stop" → Claude calls `stop()` → handles the new request. Simpler than mid-skill preemption; revisit if it feels laggy.
+Chat arriving during a skill is **queued** until the skill finishes; Claude then handles it on the next turn. For the cancellable tick-loop skills (`followPlayer`, `attack`, `flee`, `fish`), a **side-channel preempt** in `mineflayer-glue/event-hooks.ts` flips the cancellation flag immediately when the current conversation partner says "stop" / "halt" / "wait" — the skill exits within its next tick (~100–250ms) without waiting for the chat to drain through the agent queue. Non-cancellable skills (`mineBlock`, `craft`, `smelt`, etc.) finish to completion; the player's chat is processed when they end.
 
 ### Conversation continuity
-When Claude's last message to a player was a question, the orchestrator treats that player's next chat as a likely continuation. Heuristic: if a bot recently (~30s) asked a question and the same player chats again, route to that bot regardless of name-mention. Avoids the awkward *"Steve, small"* requirement.
+When Claude's last message to a player contained `?`, the orchestrator flags the (bot, player) pair for 30s; the player's next chat without a name-mention routes to that bot as `reason=continuation`. Detection is `sent.includes("?")` (`runSkill` → `noteBotQuestionedPlayer`) — relaxed from the original strict `endsWith` in commit `026836e` because the model often appends an acknowledgment after the question. Avoids the awkward *"Steve, small"* requirement.
 
 ## Memory model
 
@@ -223,14 +225,14 @@ Per-bot JSON file at `data/orchestrator/memory/<bot-username>/world.json` storin
 - Anything requiring judgment about what's worth recording.
 
 ### Conversation memory — free-form, Claude-managed
-Per-bot running dialog state held by the Claude Agent SDK. Short-term: verbatim turns. Long-term: periodic summarization (Haiku 4.5) when history grows. Persistence across orchestrator restart is a post-v0.2 question (see [ROADMAP.md](ROADMAP.md)).
+Per-bot running dialog state held by the Claude Agent SDK. Short-term: verbatim turns. Long-term: periodic summarization (Haiku 4.5) when history grows. Persistence across orchestrator restart is still deferred (see [ROADMAP.md](ROADMAP.md)).
 
 ## Bot state
 
 Per-bot in-memory state that middleware maintains so Claude doesn't have to track it from conversation history. Distinct from memory: these are short-lived or always-current, not durable facts about the world. Most fields are surfaced to Claude through `observeSurroundings`; the in-flight tool name is observability-only (consumed by the dashboard).
 
 ### Recent actions log
-Rolling 5-minute log of bot activity, summarized to short phrases (`"mined 7 oak_log"`, `"walked 200 blocks"`, `"killed 2 zombies"`). `runSkill` appends successful (non-noisy) skill messages; oldest entries drop off. When a player asks *"what have you been doing?"*, Claude reads the log rather than reconstructing from chat history. Not persisted across restarts in v0.2.
+Rolling 5-minute log of bot activity, summarized to short phrases (`"mined 7 oak_log"`, `"walked 200 blocks"`, `"killed 2 zombies"`). `runSkill` appends successful (non-noisy) skill messages; oldest entries drop off. When a player asks *"what have you been doing?"*, Claude reads the log rather than reconstructing from chat history. Not persisted across restarts.
 
 ### Player presence
 Per-player table: online/offline, last-seen position, last-seen timestamp. Captured from mineflayer `playerJoin` / `playerLeave` / movement events. Currently-online nearby players appear in `nearbyEntities`; offline-but-recently-seen players appear in `recentlySeenPlayers`. Useful for answering "has Zack been on today?" without Claude guessing.
@@ -239,7 +241,14 @@ Per-player table: online/offline, last-seen position, last-seen timestamp. Captu
 When a player chains requests (*"get wood, then iron, then come back"*), Claude calls `setTaskQueue(["get wood", "get iron", "return"])` to declare the plan, then `advanceTaskQueue()` between items. The orchestrator persists the queue across turns and surfaces `currentTask` + `remainingTasks` in every `observeSurroundings` call. Claude doesn't have to remember the chain from conversation memory — the queue is always in the bot's view of the world.
 
 ### Current tool (observability-only)
-Name + start timestamp of the skill currently executing for this bot. Set/cleared by `runSkill` (`src/skills/harness.ts`) inside a `try/finally` so it's always reset even on exception. Read by the v0.3 dashboard via `getBotSnapshot` to render the live `DOING` field; **not surfaced through `observeSurroundings`** — Claude doesn't need to see its own in-flight tool (it called it).
+Name + start timestamp of the skill currently executing for this bot. Set/cleared by `runSkill` (`src/skills/harness.ts`) inside a `try/finally` so it's always reset even on exception. Read by the dashboard via `getBotSnapshot` to render the live `DOING` field; **not surfaced through `observeSurroundings`** — Claude doesn't need to see its own in-flight tool (it called it).
+
+### Cancellation flag
+Per-bot cooperative cancellation flag (`src/state/cancellation.ts`) checked by the long-running tick-loop skills (`followPlayer`, `attack`, `flee`, `fish`). Flipped two ways:
+1. Claude calls the `stop` skill explicitly.
+2. **Side-channel preempt** in `mineflayer-glue/event-hooks.ts` — when a cancellable skill is in flight and the current conversation partner sends a message matching `/\b(stop|halt|wait)\b/i`, the flag flips immediately, before the chat queues through the agent loop. This is what makes player-side "stop" actually preempt despite chat being queued.
+
+Each cancellable skill calls `cancellation.begin()` on entry to clear any stale request from the previous run.
 
 ### Why the split
 - **World knowledge is exact** — programmatic capture beats Claude summarization for facts (*"7 oak_log in the chest"* vs. *"a few logs I think"*).
@@ -261,7 +270,7 @@ Name + start timestamp of the skill currently executing for this bot. Set/cleare
 
 ## Project layout
 
-TypeScript project at the repo root. The actual tree is below; some files in the design (e.g. additional per-skill modules under `skills/`, `memory/conversation.ts`) are deferred — see SKILLS.md status table and ROADMAP.md.
+TypeScript project at the repo root. The actual tree is below. The only design-level file still deferred is `memory/conversation.ts` for cross-restart conversation persistence — see ROADMAP.md.
 
 ```
 package.json
@@ -341,15 +350,16 @@ Switch is safe to make now because no one has played on the world yet — once p
 ### Alternative considered: server-side NPCs via Paper plugin (e.g. Citizens)
 Rejected. NPCs would be fake entities spawned by a Java plugin rather than real mineflayer clients — they wouldn't need accounts or whitelist slots, and wouldn't appear in the player list. The cost: drops the entire mineflayer ecosystem (pathfinder, inventory handling, world parsing, mature event surface), requires writing a Paper plugin in Java (build cycle, server restart to deploy), and the orchestrator-to-plugin bridge becomes its own IPC surface. Much bigger lift than offline-mode + whitelist, and many interactions (PvP, scoreboards, vanilla mechanics) behave differently for "fake" NPCs. Revisit only if (a) accountless NPCs become a hard requirement (e.g., opening to a wider server where impersonation matters more) or (b) bot count gets large enough that managing usernames is awkward.
 
-### Interaction modes (v0.2)
+### Interaction modes
 - **Name mention in public chat** (primary). Orchestrator regex-filters every chat event for each bot's name and wakes only the addressed bot. Reply in public chat.
 - **`/msg <bot>` whispers**. Private 1:1 tasking. Bot whispers back. Surfaced as a separate event by mineflayer.
 - **`@all` group address**. Trivial extension of the filter layer; wakes every bot at once.
+- **Conversation continuation** (no name mention). 30s window after a `?`-message; routes the same player's next chat to the bot that asked. Includes a side-channel "stop" preempt for cancellable skills (see *Cancellation flag* under *Bot state*).
 
 ### Response channel
 Bots reply on the channel they were addressed on: public ↔ public, whisper ↔ whisper.
 
-### Deferred to post-v0.2
+### Deferred
 See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearing (cut for token budget), right-click / trade GUI / sign interactions (needs Paper plugin), multi-NPC coordination, personas, owner-based safety limits.
 
 ## Key design decisions
@@ -366,25 +376,26 @@ See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearin
 | Default model | Sonnet 4.6 main / Haiku 4.5 background / Opus 4.7 opt-in | Cost/quality balance; reserved escalation for hard tasks |
 | Orchestrator process | Hybrid: host `npm run dev` for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
 | Launcher scripts | `dev.sh` (host, foreground) + existing `start.sh` (compose, unchanged) | One command per mode; no double-edit of `start.sh` |
-| Skill scope (v0.2) | 24 skills across perception / movement / world / inventory / crafting / combat / chat / meta | Capable from day one |
+| Skill scope | 28 registered skills across perception / chat / movement / world / inventory / interaction / crafting / combat / storage / survival / meta; 4 pending (`findBlock`, `findEntity`, `lookAt`, `wait` — all low-value). See [SKILLS.md](SKILLS.md) status table. | Capable from day one |
 | Architecture principle | "Push work down the stack" — middleware does anything deterministic; Claude only handles judgment | Lower latency, lower token spend, more reliable behavior |
 | Bot state | Recent-actions log (rolling 5-min), player-presence tracking, task queue — all surfaced in `observeSurroundings` | Claude reads pre-computed state instead of reconstructing from chat history |
 | Memory architecture | Two-tier: structured world knowledge (per-bot JSON, mostly auto-captured) + conversation memory (Claude-managed) | Cheap, exact, composable facts; Claude does only what Claude is good at |
 | Resilience | Indefinite reconnect; auto-respawn on death; SDK retries + chat-surfaced rate-limit handling; skill exceptions become `{ok: false}` results | Bots survive transient failures; players see meaningful feedback when something durable breaks |
-| Bot config | `config/bots.yml` (versioned), minimal v0.2 fields (`username`, `model_hint`) | No new secrets; persona/owner deferred to v0.3+ |
+| Bot config | `config/bots.yml` (versioned), minimal fields (`username`, `model_hint`) | No new secrets; persona/owner still deferred |
 | MC connection | `MC_HOST` env var, defaults to `localhost`; switches to `minecraft` when orchestrator becomes a compose service | Same code for dev and steady-state |
 | Language | TypeScript | Type-checked skill params, `observeSurroundings` output, world.json schema |
 | Project layout | Layer-named directories (`orchestrator/`, `agent/`, `skills/`, `memory/`, `mineflayer-glue/`) | Matches architecture stack; isolation point for bot-client swap |
 | Skill params | Specific machine-friendly IDs | Predictable and testable; vagueness resolved in the model |
 | Tool result shape | `{ ok, message, state? }` | Consistent format; specific failure messages let Claude adapt |
-| Execution model | Sync / blocking; no progress streaming | Simpler v0.2 |
+| Execution model | Sync / blocking; cancellable tick-loop skills check a per-bot cancellation flag; non-cancellable skills run to completion | Simpler than full mid-skill preemption; matches the "queue chat during skills" interruption policy |
 | Vagueness handling | Default / clarify / propose-and-confirm, taught via system prompt | Right tradeoff per request cost |
 | Interruption | Queue chat during skills; player says "stop" to preempt | Avoids mid-skill races |
 
 ## Open questions
 
-- Conversation memory specifics: summarization threshold, where (if anywhere) to persist conversation state across restarts. (World knowledge already persists by design.)
-- Multi-NPC coordination: do NPCs share `world.json` (or a merged view), or is each one fully independent?
-- Safety / griefing limits: which actions need allowlists or owner confirmation (e.g. breaking player-placed blocks).
-- Heuristic tuning: conversation-continuity window (~30s), "stop" detection robustness, recent-actions log granularity.
-- Agent SDK specifics: exact mechanism for per-call model hinting, tool definition shape, and how the SDK's built-in caching interacts with our event-driven loop. Pin down when we start coding.
+- Conversation memory specifics: summarization threshold, where (if anywhere) to persist conversation state across restarts. (World knowledge already persists by design.) Sketched in [ROADMAP.md](ROADMAP.md).
+- Multi-NPC coordination: do NPCs share `world.json` (or a merged view), or is each one fully independent? Currently independent — `world.json` is per-bot.
+- Safety / griefing limits: which actions need allowlists or owner confirmation (e.g. breaking player-placed blocks, `attack({ entity: "<player_name>" })`). Closer to relevant than originally scoped — `attack` will hit a player username today. Sketched in [ROADMAP.md](ROADMAP.md) under "Owner-based safety / griefing limits".
+- Heuristic tuning: conversation-continuity window (~30s; `?`-detection relaxed from `endsWith` to `includes` in `026836e`), "stop" regex (`/\b(stop|halt|wait)\b/i`), recent-actions log window (5 min). All judgment calls; tune when something feels wrong in live play.
+
+Agent SDK specifics are now pinned in [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md) — no longer open.
