@@ -6,6 +6,7 @@ import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 import { noteContainerOpening } from "../mineflayer-glue/event-hooks.js";
 import { readWorldKnowledge, type Container } from "../memory/world-knowledge.js";
+import { resolveItem } from "./item-naming.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const CONTAINER_BLOCK_TYPES = new Set([
@@ -39,23 +40,23 @@ export async function depositToChest(
   bot: Bot,
   { item, count, pos }: DepositToChestParams,
 ): Promise<SkillResult> {
-  if (!item) return { ok: false, message: "item is required" };
   if (count !== undefined && count < 1) {
     return { ok: false, message: `count must be >= 1, got ${count}` };
   }
-
-  const itemData = bot.registry.itemsByName[item];
-  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
+  const r = resolveItem(bot, item);
+  if (!r.ok) return { ok: false, message: `item ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
 
   const available = bot.inventory.count(itemData.id, null);
   if (available === 0) {
-    return { ok: false, message: `no ${item} in inventory to deposit` };
+    return { ok: false, message: `no ${name} in inventory to deposit` };
   }
   const want = count ?? available;
   if (want > available) {
     return {
       ok: false,
-      message: `cannot deposit ${want} ${item}: only ${available} in inventory`,
+      message: `cannot deposit ${want} ${name}: only ${available} in inventory`,
     };
   }
 
@@ -81,7 +82,7 @@ export async function depositToChest(
     const message = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
-      message: `deposit of ${want} ${item} into ${block.name} at ${fmt(block.position)} failed: ${message}`,
+      message: `deposit of ${want} ${name} into ${block.name} at ${fmt(block.position)} failed: ${message}`,
     };
   } finally {
     chest.close();
@@ -89,7 +90,7 @@ export async function depositToChest(
 
   return {
     ok: true,
-    message: `deposited ${want} ${item} into ${block.name} at ${fmt(block.position)} (${source})`,
+    message: `deposited ${want} ${name} into ${block.name} at ${fmt(block.position)} (${source})`,
     state: { deposited: want, container: block.name, pos: { x: block.position.x, y: block.position.y, z: block.position.z } },
   };
 }
@@ -111,13 +112,13 @@ export async function withdrawFromChest(
   bot: Bot,
   { item, count = 1, pos }: WithdrawFromChestParams,
 ): Promise<SkillResult> {
-  if (!item) return { ok: false, message: "item is required" };
   if (count < 1) return { ok: false, message: `count must be >= 1, got ${count}` };
+  const r = resolveItem(bot, item);
+  if (!r.ok) return { ok: false, message: `item ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
 
-  const itemData = bot.registry.itemsByName[item];
-  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
-
-  const resolved = await resolveChestBlock(bot, pos, "withdraw", item);
+  const resolved = await resolveChestBlock(bot, pos, "withdraw", name);
   if (!resolved.ok) return resolved;
   const { block, source } = resolved;
 
@@ -140,7 +141,7 @@ export async function withdrawFromChest(
     chest.close();
     return {
       ok: false,
-      message: `${block.name} at ${fmt(block.position)} has no ${item} (stored memory was stale)`,
+      message: `${block.name} at ${fmt(block.position)} has no ${name} (stored memory was stale)`,
     };
   }
   const take = Math.min(count, insideCount);
@@ -151,7 +152,7 @@ export async function withdrawFromChest(
     const message = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
-      message: `withdraw of ${take} ${item} from ${block.name} at ${fmt(block.position)} failed: ${message}`,
+      message: `withdraw of ${take} ${name} from ${block.name} at ${fmt(block.position)} failed: ${message}`,
     };
   } finally {
     chest.close();
@@ -160,8 +161,8 @@ export async function withdrawFromChest(
   return {
     ok: true,
     message: take < count
-      ? `withdrew ${take} ${item} from ${block.name} at ${fmt(block.position)} (${source}); chest only had ${insideCount}`
-      : `withdrew ${take} ${item} from ${block.name} at ${fmt(block.position)} (${source})`,
+      ? `withdrew ${take} ${name} from ${block.name} at ${fmt(block.position)} (${source}); chest only had ${insideCount}`
+      : `withdrew ${take} ${name} from ${block.name} at ${fmt(block.position)} (${source})`,
     state: { withdrawn: take, container: block.name, pos: { x: block.position.x, y: block.position.y, z: block.position.z } },
   };
 }

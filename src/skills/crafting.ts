@@ -6,6 +6,7 @@ import type { Block } from "prismarine-block";
 import type { Recipe } from "prismarine-recipe";
 import { Vec3 } from "vec3";
 import { readWorldKnowledge } from "../memory/world-knowledge.js";
+import { resolveItem } from "./item-naming.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const TABLE_SEARCH_RADIUS = 32;
@@ -64,17 +65,17 @@ export async function craft(
   bot: Bot,
   { item, count = 1, tablePos }: CraftParams,
 ): Promise<SkillResult> {
-  if (!item) return { ok: false, message: "item is required" };
   if (count < 1) return { ok: false, message: `count must be >= 1, got ${count}` };
-
-  const itemData = bot.registry.itemsByName[item];
-  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
+  const r = resolveItem(bot, item);
+  if (!r.ok) return { ok: false, message: `item ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
 
   // Try inventory-only first (2×2 grid). Cheap shortcut for planks, sticks,
   // torches, etc. and avoids any walking.
   const inventoryRecipes = bot.recipesFor(itemData.id, null, count, null);
   if (inventoryRecipes.length > 0) {
-    return await runCraft(bot, item, count, inventoryRecipes[0]!, null);
+    return await runCraft(bot, name, count, inventoryRecipes[0]!, null);
   }
 
   // Inventory crafting failed — either the recipe needs a table or we don't
@@ -82,7 +83,7 @@ export async function craft(
   const inventoryAllRecipes = bot.recipesAll(itemData.id, null, false);
   if (inventoryAllRecipes.length > 0) {
     // Recipe exists for 2×2; we're short on ingredients.
-    return shortfallResult(bot, item, count, inventoryAllRecipes[0]!);
+    return shortfallResult(bot, name, count, inventoryAllRecipes[0]!);
   }
 
   // 3×3 recipe — needs a crafting table.
@@ -110,12 +111,12 @@ export async function craft(
   if (tableRecipes.length === 0) {
     const all = bot.recipesAll(itemData.id, null, table);
     if (all.length === 0) {
-      return { ok: false, message: `no known recipe for "${item}"` };
+      return { ok: false, message: `no known recipe for "${name}"` };
     }
-    return shortfallResult(bot, item, count, all[0]!);
+    return shortfallResult(bot, name, count, all[0]!);
   }
 
-  return await runCraft(bot, item, count, tableRecipes[0]!, table);
+  return await runCraft(bot, name, count, tableRecipes[0]!, table);
 }
 
 async function runCraft(
@@ -256,16 +257,16 @@ export async function smelt(
   bot: Bot,
   { input, fuel, count = 1, furnacePos }: SmeltParams,
 ): Promise<SkillResult> {
-  if (!input) return { ok: false, message: "input is required" };
   if (count < 1) return { ok: false, message: `count must be >= 1, got ${count}` };
-
-  const inputData = bot.registry.itemsByName[input];
-  if (!inputData) return { ok: false, message: `unknown input item "${input}"` };
+  const r = resolveItem(bot, input);
+  if (!r.ok) return { ok: false, message: `input ${r.message}` };
+  const inputData = r.data;
+  const inputName = r.normalized;
   const haveInput = bot.inventory.count(inputData.id, null);
   if (haveInput < count) {
     return {
       ok: false,
-      message: `cannot smelt ${count} ${input}: only ${haveInput} in inventory`,
+      message: `cannot smelt ${count} ${inputName}: only ${haveInput} in inventory`,
     };
   }
 
@@ -307,7 +308,7 @@ export async function smelt(
       await furnace.putInput(inputData.id, null, count);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, message: `putInput ${count} ${input} failed: ${message}` };
+      return { ok: false, message: `putInput ${count} ${inputName} failed: ${message}` };
     }
     try {
       await furnace.putFuel(fuelItem.type, null, fuelUnits);
@@ -322,7 +323,7 @@ export async function smelt(
       if (Date.now() > deadline) {
         return {
           ok: false,
-          message: `smelt timeout: collected ${collected} of ${count} ${input} from furnace at ${fmt(furnaceBlock.position)}`,
+          message: `smelt timeout: collected ${collected} of ${count} ${inputName} from furnace at ${fmt(furnaceBlock.position)}`,
           state: { collected },
         };
       }
@@ -348,7 +349,7 @@ export async function smelt(
 
   return {
     ok: true,
-    message: `smelted ${collected} ${input} at furnace ${fmt(furnaceBlock.position)} (${source})`,
+    message: `smelted ${collected} ${inputName} at furnace ${fmt(furnaceBlock.position)} (${source})`,
     state: { collected, furnace: furnaceBlock.name, pos: { x: furnaceBlock.position.x, y: furnaceBlock.position.y, z: furnaceBlock.position.z } },
   };
 }
@@ -359,18 +360,20 @@ type FuelResolution =
 
 function resolveFuel(bot: Bot, fuelName: string | undefined, smeltCount: number): FuelResolution {
   if (fuelName) {
-    const fuelData = bot.registry.itemsByName[fuelName];
-    if (!fuelData) return { ok: false, message: `unknown fuel "${fuelName}"` };
-    const per = FUEL_BURN_PER_UNIT.get(fuelName) ?? FUEL_DEFAULT_BURN;
+    const r = resolveItem(bot, fuelName);
+    if (!r.ok) return { ok: false, message: `fuel ${r.message}` };
+    const fuelData = r.data;
+    const normalized = r.normalized;
+    const per = FUEL_BURN_PER_UNIT.get(normalized) ?? FUEL_DEFAULT_BURN;
     const units = Math.ceil(smeltCount / per);
     const have = bot.inventory.count(fuelData.id, null);
     if (have < units) {
       return {
         ok: false,
-        message: `not enough fuel: need ${units} ${fuelName} (smelts ${per}/unit), have ${have}`,
+        message: `not enough fuel: need ${units} ${normalized} (smelts ${per}/unit), have ${have}`,
       };
     }
-    return { ok: true, item: { type: fuelData.id, name: fuelName }, units };
+    return { ok: true, item: { type: fuelData.id, name: normalized }, units };
   }
 
   // Auto-pick. Walk the preference order; first one with enough wins.

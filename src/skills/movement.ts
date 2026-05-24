@@ -4,6 +4,7 @@ import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 const { goals, Movements } = pathfinderPkg;
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
+import { resolveBlock } from "./item-naming.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 const DEFAULT_REACH = 1;
@@ -135,17 +136,17 @@ function resolveTarget(bot: Bot, target: GoToTarget): Resolved {
       return { ok: true, destination: entity.position.clone(), label: target.entity };
     }
     case "block": {
-      const id = bot.registry.blocksByName[target.block]?.id;
-      if (id === undefined) return { ok: false, message: `unknown block type "${target.block}"` };
+      const r = resolveBlock(bot, target.block);
+      if (!r.ok) return { ok: false, message: `block ${r.message}` };
       const found = bot.findBlock({
         point: bot.entity.position,
-        matching: id,
+        matching: r.data.id,
         maxDistance: SEARCH_RADIUS_FOR_BLOCK,
       });
       if (!found) {
-        return { ok: false, message: `no ${target.block} within ${SEARCH_RADIUS_FOR_BLOCK} blocks` };
+        return { ok: false, message: `no ${r.normalized} within ${SEARCH_RADIUS_FOR_BLOCK} blocks` };
       }
-      return { ok: true, destination: found.position.clone(), label: target.block };
+      return { ok: true, destination: found.position.clone(), label: r.normalized };
     }
   }
 }

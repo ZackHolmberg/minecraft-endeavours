@@ -6,6 +6,7 @@ import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { pickUpNearby } from "./inventory.js";
+import { resolveBlock, resolveItem } from "./item-naming.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const SEARCH_RADIUS = 64;
@@ -39,9 +40,10 @@ export async function mineBlock(
   const pBot = bot as BotWithPathfinder;
   ensureMovements(pBot);
 
-  const blockData = bot.registry.blocksByName[type];
-  if (!blockData) return { ok: false, message: `unknown block type "${type}"` };
-  const blockId = blockData.id;
+  const r = resolveBlock(bot, type);
+  if (!r.ok) return { ok: false, message: `type ${r.message}` };
+  const blockId = r.data.id;
+  const name = r.normalized;
 
   // Probe a sample block to check tool feasibility before any movement.
   const sample = bot.findBlock({
@@ -49,7 +51,7 @@ export async function mineBlock(
     matching: blockId,
     maxDistance: SEARCH_RADIUS,
   });
-  if (!sample) return { ok: false, message: `no ${type} within ${SEARCH_RADIUS} blocks` };
+  if (!sample) return { ok: false, message: `no ${name} within ${SEARCH_RADIUS} blocks` };
 
   const toolCheck = checkHarvestability(bot, sample);
   if (!toolCheck.ok) return toolCheck;
@@ -64,7 +66,7 @@ export async function mineBlock(
     if (!block) {
       return {
         ok: false,
-        message: `mined ${mined} of ${count} ${type}; no more within ${SEARCH_RADIUS} blocks`,
+        message: `mined ${mined} of ${count} ${name}; no more within ${SEARCH_RADIUS} blocks`,
         state: { mined },
       };
     }
@@ -94,7 +96,7 @@ export async function mineBlock(
 
   return {
     ok: true,
-    message: `mined ${mined} ${type}`,
+    message: `mined ${mined} ${name}`,
     state: { mined },
   };
 }
@@ -116,15 +118,15 @@ export async function placeBlock(
   bot: Bot,
   { type, position }: PlaceBlockParams,
 ): Promise<SkillResult> {
-  if (!type) return { ok: false, message: "type is required" };
   if (!position) return { ok: false, message: "position is required" };
-
-  const itemData = bot.registry.itemsByName[type];
-  if (!itemData) return { ok: false, message: `unknown block item "${type}"` };
+  const r = resolveItem(bot, type);
+  if (!r.ok) return { ok: false, message: `type ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
 
   const stack = bot.inventory.items().find((i) => i.type === itemData.id);
   if (!stack) {
-    return { ok: false, message: `no ${type} in inventory to place` };
+    return { ok: false, message: `no ${name} in inventory to place` };
   }
 
   const target = new Vec3(position.x, position.y, position.z);
@@ -155,7 +157,7 @@ export async function placeBlock(
   if (!reference) {
     return {
       ok: false,
-      message: `no solid neighbor at ${fmt(target.x, target.y, target.z)} to place ${type} against`,
+      message: `no solid neighbor at ${fmt(target.x, target.y, target.z)} to place ${name} against`,
     };
   }
 
@@ -169,7 +171,7 @@ export async function placeBlock(
     const message = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
-      message: `couldn't reach a placing position for ${type} at ${fmt(target.x, target.y, target.z)}: ${message}`,
+      message: `couldn't reach a placing position for ${name} at ${fmt(target.x, target.y, target.z)}: ${message}`,
     };
   }
 
@@ -178,7 +180,7 @@ export async function placeBlock(
       await bot.equip(stack, "hand");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, message: `failed to equip ${type}: ${message}` };
+      return { ok: false, message: `failed to equip ${name}: ${message}` };
     }
   }
 
@@ -194,7 +196,7 @@ export async function placeBlock(
 
   return {
     ok: true,
-    message: `placed ${type} at ${fmt(target.x, target.y, target.z)}`,
+    message: `placed ${name} at ${fmt(target.x, target.y, target.z)}`,
     state: { position: { x: target.x, y: target.y, z: target.z }, against: reference.block.name },
   };
 }

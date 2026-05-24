@@ -4,6 +4,7 @@ import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 const { goals, Movements } = pathfinderPkg;
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
+import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
 import type { SkillResult } from "./types.js";
 
@@ -133,17 +134,17 @@ export async function dropItem(
   bot: Bot,
   { item, count }: DropItemParams,
 ): Promise<SkillResult> {
-  if (!item) return { ok: false, message: "item is required" };
+  const r = resolveItem(bot, item);
+  if (!r.ok) return { ok: false, message: `item ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
   if (count !== undefined && count < 1) {
     return { ok: false, message: `count must be >= 1, got ${count}` };
   }
 
-  const itemData = bot.registry.itemsByName[item];
-  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
-
   const available = bot.inventory.items().filter((i) => i.type === itemData.id);
   if (available.length === 0) {
-    return { ok: false, message: `no ${item} in inventory to drop` };
+    return { ok: false, message: `no ${name} in inventory to drop` };
   }
   const totalAvailable = available.reduce((sum, s) => sum + s.count, 0);
   const want = count ?? totalAvailable;
@@ -161,7 +162,7 @@ export async function dropItem(
       const message = err instanceof Error ? err.message : String(err);
       return {
         ok: false,
-        message: `dropped ${dropped} of ${want} ${item}; toss failed: ${message}`,
+        message: `dropped ${dropped} of ${want} ${name}; toss failed: ${message}`,
         state: { dropped },
       };
     }
@@ -170,11 +171,11 @@ export async function dropItem(
   if (dropped < want) {
     return {
       ok: false,
-      message: `dropped ${dropped} of ${want} ${item}; only ${totalAvailable} were available`,
+      message: `dropped ${dropped} of ${want} ${name}; only ${totalAvailable} were available`,
       state: { dropped },
     };
   }
-  return { ok: true, message: `dropped ${dropped} ${item}`, state: { dropped } };
+  return { ok: true, message: `dropped ${dropped} ${name}`, state: { dropped } };
 }
 
 export interface GiveItemToParams {
@@ -194,18 +195,19 @@ export async function giveItemTo(
   { player, item, count }: GiveItemToParams,
 ): Promise<SkillResult> {
   if (!player) return { ok: false, message: "player name required" };
-  if (!item) return { ok: false, message: "item is required" };
+  const r = resolveItem(bot, item);
+  if (!r.ok) return { ok: false, message: `item ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
 
   const playerInfo = bot.players[player];
   if (!playerInfo?.entity) {
     return { ok: false, message: `player "${player}" is not visible to the bot` };
   }
 
-  const itemData = bot.registry.itemsByName[item];
-  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
   const have = bot.inventory.items().filter((i) => i.type === itemData.id);
   if (have.length === 0) {
-    return { ok: false, message: `no ${item} in inventory to give to ${player}` };
+    return { ok: false, message: `no ${name} in inventory to give to ${player}` };
   }
 
   const pBot = bot as BotWithPathfinder;
@@ -230,14 +232,14 @@ export async function giveItemTo(
     }
   }
 
-  const drop = await dropItem(bot, count !== undefined ? { item, count } : { item });
+  const drop = await dropItem(bot, count !== undefined ? { item: name, count } : { item: name });
   if (!drop.ok) {
     return { ok: false, message: `reached ${player} but: ${drop.message}`, state: drop.state };
   }
   const droppedCount = (drop.state as { dropped: number }).dropped;
   return {
     ok: true,
-    message: `gave ${droppedCount} ${item} to ${player}`,
+    message: `gave ${droppedCount} ${name} to ${player}`,
     state: drop.state,
   };
 }
@@ -376,20 +378,20 @@ export async function equipItem(
   bot: Bot,
   { item, slot = "hand" }: EquipItemParams,
 ): Promise<SkillResult> {
-  if (!item) return { ok: false, message: "item is required" };
   if (!EQUIPMENT_DESTINATIONS.has(slot)) {
     return {
       ok: false,
       message: `slot must be one of hand / off-hand / head / torso / legs / feet; got "${slot}"`,
     };
   }
-
-  const itemData = bot.registry.itemsByName[item];
-  if (!itemData) return { ok: false, message: `unknown item "${item}"` };
+  const r = resolveItem(bot, item);
+  if (!r.ok) return { ok: false, message: `item ${r.message}` };
+  const itemData = r.data;
+  const name = r.normalized;
 
   // Already in the requested slot? Skip the API call.
   if (slot === "hand" && bot.heldItem?.type === itemData.id) {
-    return { ok: true, message: `already holding ${item}`, state: { equipped: item, slot } };
+    return { ok: true, message: `already holding ${name}`, state: { equipped: name, slot } };
   }
 
   const stack = bot.inventory.items().find((i) => i.type === itemData.id);
@@ -404,14 +406,14 @@ export async function equipItem(
     : null;
   const found = stack ?? armorStack ?? offhandStack;
   if (!found) {
-    return { ok: false, message: `no ${item} in inventory to equip` };
+    return { ok: false, message: `no ${name} in inventory to equip` };
   }
 
   try {
     await bot.equip(found, slot);
-    return { ok: true, message: `equipped ${item} (${slot})`, state: { equipped: item, slot } };
+    return { ok: true, message: `equipped ${name} (${slot})`, state: { equipped: name, slot } };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `equip ${item} → ${slot} failed: ${message}` };
+    return { ok: false, message: `equip ${name} → ${slot} failed: ${message}` };
   }
 }

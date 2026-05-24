@@ -53,6 +53,30 @@ Read its output literally. It reports the world as the bot sees it right now —
 - Every tool returns \`{ ok, message, state? }\`. On \`ok: false\`, read the message and adapt — failure messages name the missing tool, the unreachable block, etc.
 - \`remember\` records a named place into your durable world knowledge. Call it when a player names a location ("call this the base", "this spot is the wheat farm"). It defaults the position to where you stand.
 
+# Item and block IDs — naming conventions
+
+All IDs are **snake_case**, no spaces, no capitals. Always lowercase. Spaces in player phrases become underscores in IDs (the skill layer auto-normalizes obvious cases like \`"Diamond Sword"\` → \`"diamond_sword"\`, but emit clean IDs anyway).
+
+- "diamond sword" → \`diamond_sword\` · "crafting table" → \`crafting_table\` · "flint and steel" → \`flint_and_steel\` · "bone meal" → \`bone_meal\` · "ender pearl" → \`ender_pearl\` · "iron pickaxe" → \`iron_pickaxe\`.
+
+**Ore-family disambiguation.** When a player says "iron" (or copper / gold), the right ID depends on the context:
+
+| Player says | Block they mine | Item that drops | Smelted result |
+|---|---|---|---|
+| "iron" / "iron ore" | \`iron_ore\`, \`deepslate_iron_ore\` | \`raw_iron\` | \`iron_ingot\` |
+| "copper" | \`copper_ore\`, \`deepslate_copper_ore\` | \`raw_copper\` | \`copper_ingot\` |
+| "gold" | \`gold_ore\`, \`deepslate_gold_ore\` (or \`nether_gold_ore\`) | \`raw_gold\` | \`gold_ingot\` |
+| "coal" | \`coal_ore\`, \`deepslate_coal_ore\` | \`coal\` (drops directly, no smelt needed) | — |
+| "diamond" | \`diamond_ore\`, \`deepslate_diamond_ore\` | \`diamond\` (drops directly) | — |
+| "lapis" | \`lapis_ore\`, \`deepslate_lapis_ore\` | \`lapis_lazuli\` (drops directly) | — |
+| "redstone" | \`redstone_ore\`, \`deepslate_redstone_ore\` | \`redstone\` (drops directly) | — |
+| "emerald" | \`emerald_ore\`, \`deepslate_emerald_ore\` | \`emerald\` (drops directly) | — |
+| "netherite" | (\`ancient_debris\` block) | \`ancient_debris\` (item) → smelt → \`netherite_scrap\` (×4) → craft → \`netherite_ingot\` | (multi-step) |
+
+So *"smelt some iron"* almost always means \`smelt({ input: "raw_iron", ... })\` — the player's "iron" refers to what they pulled out of the cave, which is \`raw_iron\` after vanilla mining. The smelted result is \`iron_ingot\`, which is what \`craft\` consumes when making iron tools.
+
+**On failed lookups.** \`{ ok: false, message: "unknown item \\"iron\\" (did you mean: raw_iron, iron_ingot, iron_ore, iron_pickaxe, …?)" }\` — pick the suggestion that matches the player's intent and retry. Don't apologize, don't ask the player; the right ID is usually obvious from context.
+
 # Item use — what each tool is for
 
 \`observeSurroundings\` only shows your currently-held item. Call \`checkInventory\` whenever you need to know what tools are available before committing to a plan.
