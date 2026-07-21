@@ -1,0 +1,124 @@
+/**
+ * Deterministic planning-context pre-loader for the hybrid backend.
+ *
+ * The planner (Claude) shouldn't spend turns gathering world state, so the
+ * orchestrator assembles it for free and injects it into each planner message.
+ * This reuses `observeSurroundings` (position / status / nearby / known
+ * storage+utilities+waypoints / recent actions / task queue) and adds a full
+ * inventory summary — all straight from the bot + world memory, no LLM
+ * (per the "push deterministic work to middleware" rule).
+ */
+
+import type { Bot } from "mineflayer";
+import { observeSurroundings, type ObserveSurroundingsState } from "../skills/perception.js";
+
+const MAX_BLOCKS = 8;
+const MAX_ENTITIES = 6;
+const MAX_STORAGE = 5;
+const MAX_UTILITIES = 5;
+const MAX_WAYPOINTS = 5;
+const MAX_ACTIONS = 5;
+
+/** Build a compact, literal world-context block for the planner prompt. */
+export async function buildPlanningContext(bot: Bot): Promise<string> {
+  const { state: s } = await observeSurroundings(bot);
+  const L: string[] = [];
+
+  L.push("# World context (auto-generated — read literally, do not embellish)");
+  L.push(
+    `position: ${s.position.x} ${s.position.y} ${s.position.z} (${s.dimension}), facing ${s.facing}`,
+  );
+  L.push(
+    `status: health ${s.status.health}/20, food ${s.status.food}/20, ${s.time.phase}, ${s.weather}` +
+      `${s.status.isInWater ? ", in water" : ""}${s.status.isOnFire ? ", ON FIRE" : ""}`,
+  );
+  L.push(`held: ${s.heldItem ? `${s.heldItem.name} x${s.heldItem.count}` : "nothing"}`);
+  L.push(`inventory: ${inventorySummary(bot)}`);
+
+  if (s.nearbyBlocks.length > 0) {
+    L.push(
+      `nearby blocks: ${s.nearbyBlocks
+        .slice(0, MAX_BLOCKS)
+        .map((b) => `${b.type} x${b.count} @${fmt(b.nearest)} (${b.nearest.dist}m)`)
+        .join(", ")}`,
+    );
+  }
+
+  const notableEntities = s.nearbyEntities.filter(
+    (e) => e.type === "player" || e.type === "hostile" || e.type === "passive",
+  );
+  if (notableEntities.length > 0) {
+    L.push(
+      `nearby entities: ${notableEntities
+        .slice(0, MAX_ENTITIES)
+        .map((e) => `${e.name} (${e.type}, ${e.dist}m)`)
+        .join(", ")}`,
+    );
+  }
+  if (s.nearbyDroppedItems.length > 0) {
+    L.push(
+      `dropped items: ${s.nearbyDroppedItems.map((d) => `${d.item} x${d.count} (${d.dist}m)`).join(", ")}`,
+    );
+  }
+
+  if (s.knownStorage.length > 0) {
+    L.push(
+      `known storage: ${s.knownStorage
+        .slice(0, MAX_STORAGE)
+        .map((c) => `${c.type} @${fmt(c.pos)}${storageContents(c)}`)
+        .join(", ")}`,
+    );
+  }
+  if (s.knownUtilities.length > 0) {
+    L.push(
+      `known utilities: ${s.knownUtilities
+        .slice(0, MAX_UTILITIES)
+        .map((u) => `${u.name ? `${u.name} ` : ""}${u.type} @${fmt(u.pos)}`)
+        .join(", ")}`,
+    );
+  }
+  if (s.knownWaypoints.length > 0) {
+    L.push(
+      `known waypoints: ${s.knownWaypoints
+        .slice(0, MAX_WAYPOINTS)
+        .map((w) => `${w.name ? `${w.name} ` : ""}${w.type} @${fmt(w.pos)}`)
+        .join(", ")}`,
+    );
+  }
+
+  if (s.recentActions.length > 0) {
+    L.push(`recent actions: ${s.recentActions.slice(-MAX_ACTIONS).join(" | ")}`);
+  }
+
+  L.push(`current task: ${s.currentTask ?? "(none)"}`);
+  if (s.remainingTasks.length > 0) {
+    L.push(`remaining tasks: ${s.remainingTasks.join(" | ")}`);
+  }
+
+  return L.join("\n");
+}
+
+function inventorySummary(bot: Bot): string {
+  const counts = new Map<string, number>();
+  for (const item of bot.inventory.items()) {
+    counts.set(item.name, (counts.get(item.name) ?? 0) + item.count);
+  }
+  if (counts.size === 0) return "empty";
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => `${name} x${count}`)
+    .join(", ");
+}
+
+function storageContents(c: ObserveSurroundingsState["knownStorage"][number]): string {
+  if (!c.contents || c.contents.length === 0) return "";
+  const top = c.contents
+    .slice(0, 4)
+    .map((i) => `${i.item} x${i.count}`)
+    .join(", ");
+  return ` [${top}${c.contents.length > 4 ? ", …" : ""}]`;
+}
+
+function fmt(p: { x: number; y: number; z: number }): string {
+  return `${p.x} ${p.y} ${p.z}`;
+}

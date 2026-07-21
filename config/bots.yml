@@ -13,3 +13,13 @@ bots:
 #     local:
 #       baseUrl: http://127.0.0.1:8080/v1
 #       model: mlx-community/Qwen3-14B-4bit
+#
+# Hybrid (Claude plans / Qwen executes) — also needs ./scripts/llmStart.sh:
+#
+#   - username: Duo_AI
+#     backend: hybrid
+#     planner:
+#       model_hint: sonnet     # Claude tier that plans (default sonnet; opus for heavier planning)
+#     executor:
+#       baseUrl: http://127.0.0.1:8080/v1
+#       model: mlx-community/Qwen3-14B-4bit

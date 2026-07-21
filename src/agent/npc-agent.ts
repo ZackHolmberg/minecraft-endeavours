@@ -9,15 +9,17 @@
  *    `BackendObservability` surface.
  *
  * Which backend is constructed is decided here from `botConfig.backend`:
- * `"claude"` (default) → `ClaudeBackend`; `"local"` → `LocalBackend`. Phase C
- * adds `"hybrid"`. The per-bot registry (`registerAgent` / `getAgent`) and the
- * `pushChat` entry point are unchanged from the previous SDK-only design.
+ * `"claude"` (default) → `ClaudeBackend`; `"local"` → `LocalBackend`;
+ * `"hybrid"` → `HybridBackend` (Claude plans / Qwen executes). The per-bot
+ * registry (`registerAgent` / `getAgent`) and the `pushChat` entry point are
+ * unchanged from the previous SDK-only design.
  */
 
 import type { Bot } from "mineflayer";
 import type { ChatEvent, RouteMatch } from "../orchestrator/chat-router.js";
 import type { BotConfig } from "../types.js";
 import { ClaudeBackend } from "./backend/claude-backend.js";
+import { HybridBackend } from "./backend/hybrid-backend.js";
 import { LocalBackend } from "./backend/local-backend.js";
 import type {
   AgentBackend,
@@ -47,10 +49,17 @@ export class NpcAgent {
   private readonly backend: AgentBackend;
 
   constructor(private readonly opts: NpcAgentOptions) {
-    this.backend =
-      opts.botConfig.backend === "local"
-        ? new LocalBackend({ bot: opts.bot, botConfig: opts.botConfig })
-        : new ClaudeBackend({ bot: opts.bot, botConfig: opts.botConfig });
+    const { bot, botConfig } = opts;
+    switch (botConfig.backend) {
+      case "local":
+        this.backend = new LocalBackend({ bot, botConfig });
+        break;
+      case "hybrid":
+        this.backend = new HybridBackend({ bot, botConfig });
+        break;
+      default:
+        this.backend = new ClaudeBackend({ bot, botConfig });
+    }
   }
 
   pushChat(event: ChatEvent, decision: RouteMatch): void {

@@ -13,17 +13,29 @@
 
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Bot } from "mineflayer";
-import { SKILL_SPECS } from "../skills/registry.js";
+import { SKILL_SPECS, type SkillSpec } from "../skills/registry.js";
 import { toClaudeMcpServer } from "./backend/adapters.js";
 
 export const MCP_SERVER_NAME = "minecraft-skills";
 
 const CLAUDE_SPECS = SKILL_SPECS.filter((s) => s.surfaces.claude);
 
-export const ALLOWED_TOOL_NAMES: readonly string[] = CLAUDE_SPECS.map(
-  (s) => `mcp__${MCP_SERVER_NAME}__${s.name}`,
-);
+/** Fully-qualified allowed-tool names for an arbitrary spec subset. */
+export function allowedToolNamesFor(specs: SkillSpec[]): string[] {
+  return specs.map((s) => `mcp__${MCP_SERVER_NAME}__${s.name}`);
+}
+
+/** Build the per-bot MCP server exposing an arbitrary spec subset. */
+export function buildSkillsServerFor(
+  bot: Bot,
+  specs: SkillSpec[],
+): McpSdkServerConfigWithInstance {
+  return toClaudeMcpServer(MCP_SERVER_NAME, bot, specs);
+}
+
+// Defaults: the full Claude surface (all 35), preserving today's behavior.
+export const ALLOWED_TOOL_NAMES: readonly string[] = allowedToolNamesFor(CLAUDE_SPECS);
 
 export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
-  return toClaudeMcpServer(MCP_SERVER_NAME, bot, CLAUDE_SPECS);
+  return buildSkillsServerFor(bot, CLAUDE_SPECS);
 }

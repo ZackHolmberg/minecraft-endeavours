@@ -12,6 +12,7 @@
 export class TaskQueue {
   private currentTask: string | null = null;
   private queued: string[] = [];
+  private rev = 0;
 
   set(tasks: string[]): void {
     const normalized = tasks.map((t) => t.trim()).filter((t) => t.length > 0);
@@ -21,10 +22,12 @@ export class TaskQueue {
     }
     this.currentTask = normalized[0]!;
     this.queued = normalized.slice(1);
+    this.rev += 1;
   }
 
   /** Marks the current task done. Returns the new current task or null if the queue emptied. */
   advance(): string | null {
+    this.rev += 1;
     if (this.queued.length === 0) {
       this.currentTask = null;
       return null;
@@ -41,8 +44,23 @@ export class TaskQueue {
     return [...this.queued];
   }
 
+  isEmpty(): boolean {
+    return this.currentTask === null;
+  }
+
+  /**
+   * Monotonic mutation counter, bumped on every `set` / `advance` / `clear`.
+   * The hybrid coordinator uses it as a deterministic signal: a bump after a
+   * planner turn means a plan was (re)declared (handoff); a bump during an
+   * executor turn means a task was advanced (progress).
+   */
+  revision(): number {
+    return this.rev;
+  }
+
   clear(): void {
     this.currentTask = null;
     this.queued = [];
+    this.rev += 1;
   }
 }

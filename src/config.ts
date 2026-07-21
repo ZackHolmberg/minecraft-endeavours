@@ -1,10 +1,17 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import yaml from "js-yaml";
-import type { AppConfig, BackendKind, BotConfig, LocalModelConfig, ModelHint } from "./types.js";
+import type {
+  AppConfig,
+  BackendKind,
+  BotConfig,
+  HybridConfig,
+  LocalModelConfig,
+  ModelHint,
+} from "./types.js";
 
 const VALID_MODEL_HINTS: readonly ModelHint[] = ["sonnet", "haiku", "opus"];
-const VALID_BACKENDS: readonly BackendKind[] = ["claude", "local"];
+const VALID_BACKENDS: readonly BackendKind[] = ["claude", "local", "hybrid"];
 const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 
 const DEFAULT_MODEL_HINT: ModelHint = "sonnet";
@@ -97,7 +104,33 @@ function parseBot(entry: unknown, index: number, path: string): BotConfig {
   if (backend === "local") {
     bot.local = parseLocal(obj.local, index, path);
   }
+  if (backend === "hybrid") {
+    bot.hybrid = parseHybrid(obj, index, path);
+  }
   return bot;
+}
+
+function parseHybrid(obj: Record<string, unknown>, index: number, path: string): HybridConfig {
+  // planner.model_hint — the Claude tier that plans. Defaults to sonnet
+  // (cheaper on the Pro 5h window; bump to opus per-bot for heavier planning).
+  let plannerModelHint: ModelHint = DEFAULT_MODEL_HINT;
+  const planner = obj.planner;
+  if (planner !== undefined) {
+    if (typeof planner !== "object" || planner === null) {
+      throw new Error(`${path}: bots[${index}].planner must be an object`);
+    }
+    const hint = (planner as Record<string, unknown>).model_hint;
+    if (hint !== undefined) {
+      if (typeof hint !== "string" || !VALID_MODEL_HINTS.includes(hint as ModelHint)) {
+        throw new Error(
+          `${path}: bots[${index}].planner.model_hint must be one of ${VALID_MODEL_HINTS.join(", ")}`,
+        );
+      }
+      plannerModelHint = hint as ModelHint;
+    }
+  }
+
+  return { plannerModelHint, executor: parseLocal(obj.executor, index, path) };
 }
 
 function parseLocal(raw: unknown, index: number, path: string): LocalModelConfig {

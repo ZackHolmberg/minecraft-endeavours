@@ -26,9 +26,16 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Bot } from "mineflayer";
 import { getCurrentConversationPartner } from "../../orchestrator/chat-router.js";
-import type { BotConfig } from "../../types.js";
+import type { SkillSpec } from "../../skills/registry.js";
+import type { BotConfig, ModelHint } from "../../types.js";
 import { modelIdFor, RateLimitCooldown } from "../behavior.js";
-import { ALLOWED_TOOL_NAMES, MCP_SERVER_NAME, buildSkillsServer } from "../skill-tools.js";
+import {
+  ALLOWED_TOOL_NAMES,
+  MCP_SERVER_NAME,
+  allowedToolNamesFor,
+  buildSkillsServer,
+  buildSkillsServerFor,
+} from "../skill-tools.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import type {
   AgentBackend,
@@ -137,6 +144,14 @@ class UserMessageQueue implements AsyncIterable<SDKUserMessage> {
 export interface ClaudeBackendOptions {
   bot: Bot;
   botConfig: BotConfig;
+  /**
+   * Overrides for composed use (the hybrid planner). When omitted, the backend
+   * reproduces the standalone Claude bot exactly: full system prompt, all 35
+   * tools, and the bot's configured model tier.
+   */
+  systemPrompt?: string;
+  specs?: SkillSpec[];
+  modelHint?: ModelHint;
 }
 
 export class ClaudeBackend implements AgentBackend {
@@ -160,24 +175,29 @@ export class ClaudeBackend implements AgentBackend {
   private warnedThisEvent = false;
   private windowSamples: WindowSample[] = [];
   private anchors: CalibrationAnchor[] = [];
+  // Resolver for the in-flight `runTurn` (hybrid coordinator use). The
+  // coordinator drives one turn at a time and awaits it, so at most one is
+  // outstanding. Resolved when the event's `result` arrives, or on cooldown.
+  private pendingTurn: (() => void) | null = null;
 
   constructor(private readonly opts: ClaudeBackendOptions) {
     this.start();
   }
 
   private start(): void {
-    const { bot, botConfig } = this.opts;
-    const skillsServer = buildSkillsServer(bot);
+    const { bot, botConfig, systemPrompt, specs, modelHint } = this.opts;
+    const skillsServer = specs ? buildSkillsServerFor(bot, specs) : buildSkillsServer(bot);
+    const allowedTools = specs ? allowedToolNamesFor(specs) : [...ALLOWED_TOOL_NAMES];
 
     this.session = query({
       prompt: this.queue,
       options: {
-        model: modelIdFor(botConfig.model_hint),
-        systemPrompt: buildSystemPrompt(bot.username),
+        model: modelIdFor(modelHint ?? botConfig.model_hint),
+        systemPrompt: systemPrompt ?? buildSystemPrompt(bot.username),
         mcpServers: { [MCP_SERVER_NAME]: skillsServer },
         // Disable Claude Code's built-in tools — the NPC's surface is the skill layer only.
         tools: [],
-        allowedTools: [...ALLOWED_TOOL_NAMES],
+        allowedTools,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         persistSession: false,
@@ -189,6 +209,8 @@ export class ClaudeBackend implements AgentBackend {
       if (!this.stopped) {
         console.error(`[${bot.username}] agent loop crashed:`, err);
       }
+      // Never leave the hybrid coordinator awaiting a turn on a dead session.
+      this.resolvePendingTurn();
     });
   }
 
@@ -295,12 +317,35 @@ export class ClaudeBackend implements AgentBackend {
           this.lastTurnError = { subtype: msg.subtype, at: Date.now() };
           console.warn(`${tag} event ended after ${turnsForEvent} turn(s): ${msg.subtype}`);
         }
+        this.resolvePendingTurn();
         return;
       }
 
       default:
         return;
     }
+  }
+
+  private resolvePendingTurn(): void {
+    if (this.pendingTurn) {
+      const resolve = this.pendingTurn;
+      this.pendingTurn = null;
+      resolve();
+    }
+  }
+
+  /**
+   * Push one message and resolve when its event completes (a `result` message,
+   * or a rate-limit cooldown). For the hybrid coordinator, which needs to await
+   * a planning turn before inspecting the task queue. Not part of `AgentBackend`
+   * — standalone use stays fire-and-forget via `pushUserMessage`.
+   */
+  runTurn(content: string): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.pendingTurn = resolve;
+      this.pushUserMessage(content);
+    });
   }
 
   private pruneWindow(): void {
@@ -348,6 +393,8 @@ export class ClaudeBackend implements AgentBackend {
         console.warn(`[${this.opts.bot.username}] rate-limit whisper failed:`, err);
       }
     }
+    // Don't leave the hybrid coordinator awaiting a turn that won't complete.
+    this.resolvePendingTurn();
   }
 
   pushUserMessage(content: string): void {
@@ -426,6 +473,7 @@ export class ClaudeBackend implements AgentBackend {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    this.resolvePendingTurn();
     this.queue.close();
     // Let the SDK session drain naturally. Any in-flight tool call finishes.
   }

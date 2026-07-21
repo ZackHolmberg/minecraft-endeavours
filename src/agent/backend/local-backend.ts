@@ -95,6 +95,22 @@ const EXECUTOR_BY_NAME: ReadonlyMap<string, { spec: SkillSpec; validator: z.ZodT
 export interface LocalBackendOptions {
   bot: Bot;
   botConfig: BotConfig;
+  /**
+   * Connection to use instead of `botConfig.local`. The hybrid backend passes
+   * its executor sub-config here (its own `botConfig.backend` is "hybrid", not
+   * "local", so `botConfig.local` is unset).
+   */
+  local?: LocalModelConfig;
+  /** System prompt override (the hybrid executor prompt). Defaults to the standalone agent prompt. */
+  systemPrompt?: string;
+}
+
+/** Outcome of one executor turn, for the hybrid coordinator. */
+export interface ExecutorOutcome {
+  /** The model server couldn't be reached (ECONNREFUSED / Metal-OOM abort). */
+  serverUnreachable: boolean;
+  /** Tool-calling steps taken this turn. */
+  steps: number;
 }
 
 export class LocalBackend implements AgentBackend {
@@ -117,14 +133,15 @@ export class LocalBackend implements AgentBackend {
   private lastTurnError: LastTurnError | null = null;
 
   constructor(private readonly opts: LocalBackendOptions) {
-    const local = opts.botConfig.local;
+    const local = opts.local ?? opts.botConfig.local;
     if (!local) {
       throw new Error(
-        `[${opts.bot.username}] LocalBackend requires botConfig.local — check config parsing`,
+        `[${opts.bot.username}] LocalBackend requires a local model config — check config parsing`,
       );
     }
     this.local = local;
-    this.transcript = [{ role: "system", content: buildLocalSystemPrompt(opts.bot.username) }];
+    const systemPrompt = opts.systemPrompt ?? buildLocalSystemPrompt(opts.bot.username);
+    this.transcript = [{ role: "system", content: systemPrompt }];
     console.log(
       `[${opts.bot.username}] local backend → ${this.local.baseUrl} (${this.local.model}), ${EXECUTOR_TOOLS.length} tools`,
     );
@@ -155,7 +172,18 @@ export class LocalBackend implements AgentBackend {
     }
   }
 
-  private async handleUserMessage(content: string): Promise<void> {
+  /**
+   * Run one executor turn to completion (drive the tool loop for `content`).
+   * The hybrid coordinator awaits this and inspects task-queue/world deltas to
+   * decide whether to continue, replan, or finish. Standalone use goes through
+   * `pushUserMessage` → `drain`, which ignores the outcome.
+   */
+  async runTurn(content: string): Promise<ExecutorOutcome> {
+    if (this.stopped) return { serverUnreachable: false, steps: 0 };
+    return this.handleUserMessage(content);
+  }
+
+  private async handleUserMessage(content: string): Promise<ExecutorOutcome> {
     const { bot } = this.opts;
     const tag = `[${bot.username}]`;
     // A fresh user message is a fresh intent. Clear any stale stop request left
@@ -183,7 +211,7 @@ export class LocalBackend implements AgentBackend {
         resp = await this.chat();
       } catch (err) {
         this.onBackendUnavailable(err);
-        return;
+        return { serverUnreachable: true, steps };
       }
 
       const usage = resp.usage;
@@ -249,6 +277,7 @@ export class LocalBackend implements AgentBackend {
       `${tag} [local] event complete after ${steps} step(s) — in=${turn.input_tokens} out=${turn.output_tokens}`,
     );
     this.pruneTranscript();
+    return { serverUnreachable: false, steps };
   }
 
   /** Validate args against the spec's zod shape, then run through `runSkill`. */
