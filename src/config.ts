@@ -1,10 +1,18 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import yaml from "js-yaml";
-import type { AppConfig, BotConfig, ModelHint } from "./types.js";
+import type { AppConfig, BackendKind, BotConfig, LocalModelConfig, ModelHint } from "./types.js";
 
 const VALID_MODEL_HINTS: readonly ModelHint[] = ["sonnet", "haiku", "opus"];
+const VALID_BACKENDS: readonly BackendKind[] = ["claude", "local"];
 const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
+
+const DEFAULT_MODEL_HINT: ModelHint = "sonnet";
+const DEFAULT_BACKEND: BackendKind = "claude";
+// Spike-validated local defaults (spikes/MLX_NOTES.md): mlx_lm.server on
+// 127.0.0.1:8080 serving Qwen3-14B-4bit. Override per-bot in config/bots.yml.
+const DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1";
+const DEFAULT_LOCAL_MODEL = "mlx-community/Qwen3-14B-4bit";
 
 export function loadConfig(botsYmlPath = "config/bots.yml"): AppConfig {
   const absPath = resolve(process.cwd(), botsYmlPath);
@@ -60,12 +68,58 @@ function parseBot(entry: unknown, index: number, path: string): BotConfig {
     );
   }
 
-  const modelHint = obj.model_hint;
-  if (typeof modelHint !== "string" || !VALID_MODEL_HINTS.includes(modelHint as ModelHint)) {
-    throw new Error(
-      `${path}: bots[${index}].model_hint must be one of ${VALID_MODEL_HINTS.join(", ")}`,
-    );
+  // model_hint is optional — defaults to sonnet. It's only meaningful for the
+  // claude backend (and, later, the hybrid planner); a local bot can omit it.
+  const modelHintRaw = obj.model_hint;
+  let model_hint: ModelHint = DEFAULT_MODEL_HINT;
+  if (modelHintRaw !== undefined) {
+    if (typeof modelHintRaw !== "string" || !VALID_MODEL_HINTS.includes(modelHintRaw as ModelHint)) {
+      throw new Error(
+        `${path}: bots[${index}].model_hint must be one of ${VALID_MODEL_HINTS.join(", ")}`,
+      );
+    }
+    model_hint = modelHintRaw as ModelHint;
   }
 
-  return { username, model_hint: modelHint as ModelHint };
+  // backend is optional — defaults to claude so existing configs are unchanged.
+  const backendRaw = obj.backend;
+  let backend: BackendKind = DEFAULT_BACKEND;
+  if (backendRaw !== undefined) {
+    if (typeof backendRaw !== "string" || !VALID_BACKENDS.includes(backendRaw as BackendKind)) {
+      throw new Error(
+        `${path}: bots[${index}].backend must be one of ${VALID_BACKENDS.join(", ")}`,
+      );
+    }
+    backend = backendRaw as BackendKind;
+  }
+
+  const bot: BotConfig = { username, model_hint, backend };
+  if (backend === "local") {
+    bot.local = parseLocal(obj.local, index, path);
+  }
+  return bot;
+}
+
+function parseLocal(raw: unknown, index: number, path: string): LocalModelConfig {
+  if (raw === undefined) {
+    return { baseUrl: DEFAULT_LOCAL_BASE_URL, model: DEFAULT_LOCAL_MODEL };
+  }
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(`${path}: bots[${index}].local must be an object`);
+  }
+  const obj = raw as Record<string, unknown>;
+
+  const baseUrl = obj.baseUrl ?? obj.base_url;
+  if (baseUrl !== undefined && typeof baseUrl !== "string") {
+    throw new Error(`${path}: bots[${index}].local.baseUrl must be a string`);
+  }
+  const model = obj.model;
+  if (model !== undefined && typeof model !== "string") {
+    throw new Error(`${path}: bots[${index}].local.model must be a string`);
+  }
+
+  return {
+    baseUrl: (baseUrl as string | undefined) ?? DEFAULT_LOCAL_BASE_URL,
+    model: (model as string | undefined) ?? DEFAULT_LOCAL_MODEL,
+  };
 }

@@ -1,3 +1,15 @@
 bots:
   - username: Steve_AI
     model_hint: sonnet
+    backend: claude
+
+# To run a bot on the local model instead of Claude:
+#   1. Start the model server:  ./scripts/llmStart.sh
+#   2. Set backend: local (model_hint is then optional/ignored). Defaults:
+#      baseUrl http://127.0.0.1:8080/v1, model mlx-community/Qwen3-14B-4bit.
+#
+#   - username: Qwen_AI
+#     backend: local
+#     local:
+#       baseUrl: http://127.0.0.1:8080/v1
+#       model: mlx-community/Qwen3-14B-4bit

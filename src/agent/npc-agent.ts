@@ -8,16 +8,17 @@
  *  - The 7 dashboard getters delegate straight to the backend's
  *    `BackendObservability` surface.
  *
- * Which backend is constructed is decided here. Phase A wires only
- * `ClaudeBackend`; Phase B/C add local + hybrid behind a config discriminant.
- * The per-bot registry (`registerAgent` / `getAgent`) and the `pushChat` entry
- * point are unchanged from the previous SDK-only design.
+ * Which backend is constructed is decided here from `botConfig.backend`:
+ * `"claude"` (default) → `ClaudeBackend`; `"local"` → `LocalBackend`. Phase C
+ * adds `"hybrid"`. The per-bot registry (`registerAgent` / `getAgent`) and the
+ * `pushChat` entry point are unchanged from the previous SDK-only design.
  */
 
 import type { Bot } from "mineflayer";
 import type { ChatEvent, RouteMatch } from "../orchestrator/chat-router.js";
 import type { BotConfig } from "../types.js";
 import { ClaudeBackend } from "./backend/claude-backend.js";
+import { LocalBackend } from "./backend/local-backend.js";
 import type {
   AgentBackend,
   LastTurnError,
@@ -46,8 +47,10 @@ export class NpcAgent {
   private readonly backend: AgentBackend;
 
   constructor(private readonly opts: NpcAgentOptions) {
-    // Phase A: always the Claude backend. The backend discriminant lands in Phase B.
-    this.backend = new ClaudeBackend({ bot: opts.bot, botConfig: opts.botConfig });
+    this.backend =
+      opts.botConfig.backend === "local"
+        ? new LocalBackend({ bot: opts.bot, botConfig: opts.botConfig })
+        : new ClaudeBackend({ bot: opts.bot, botConfig: opts.botConfig });
   }
 
   pushChat(event: ChatEvent, decision: RouteMatch): void {
