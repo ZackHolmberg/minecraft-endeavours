@@ -19,7 +19,7 @@ import { startModelServerSupervisor } from "./server-supervisor.js";
 const serverBin = process.env.MLX_SERVER_BIN
   ? resolve(process.cwd(), process.env.MLX_SERVER_BIN)
   : resolve(process.cwd(), ".venv/bin/mlx_lm.server");
-const model = process.env.MLX_MODEL ?? "mlx-community/Qwen3-14B-4bit";
+const model = process.env.MLX_MODEL ?? "mlx-community/Qwen3-8B-4bit";
 const host = process.env.MLX_HOST ?? "127.0.0.1";
 const port = Number(process.env.MLX_PORT ?? 8080);
 

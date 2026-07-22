@@ -56,6 +56,11 @@ const REQUEST_TIMEOUT_MS = 120_000;
 const BACKEND_UNAVAILABLE_COOLDOWN_SECONDS = 30;
 const DEFAULT_TEMPERATURE = 0.3;
 const MAX_TOKENS_PER_STEP = 1024;
+// Cap any single tool result fed into the transcript. observeSurroundings can
+// return ~4k tokens of JSON, which balloons cold prompt-processing time and GPU
+// memory; the (hybrid) executor gets a compact context up front, so a truncated
+// observe is an acceptable fallback.
+const MAX_TOOL_RESULT_CHARS = 2000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenAI chat wire shapes (only the fields we touch).
@@ -260,7 +265,7 @@ export class LocalBackend implements AgentBackend {
           role: "tool",
           tool_call_id: tc.id ?? `c${step}_0`,
           name,
-          content: JSON.stringify(result),
+          content: capResult(JSON.stringify(result)),
         });
       }
       console.log(`${tag} [local] [turn ${step}] → ${logParts.join(" | ")}`);
@@ -406,6 +411,11 @@ export class LocalBackend implements AgentBackend {
     this.stopped = true;
     this.pending.length = 0;
   }
+}
+
+/** Truncate an oversized tool-result string before it enters the transcript. */
+function capResult(s: string): string {
+  return s.length > MAX_TOOL_RESULT_CHARS ? `${s.slice(0, MAX_TOOL_RESULT_CHARS)}…(truncated)` : s;
 }
 
 /** Strip Qwen thinking blocks and chat-template special tokens from text. */

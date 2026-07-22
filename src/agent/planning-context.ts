@@ -98,6 +98,35 @@ export async function buildPlanningContext(bot: Bot): Promise<string> {
   return L.join("\n");
 }
 
+/**
+ * Compact execution context for the EXECUTOR kickoff — a small fraction of the
+ * planner context. The planner already precomputed coords into the task text,
+ * so the executor mainly needs its inventory, the current/remaining tasks, and a
+ * short list of nearby blocks. Injecting this up front means the executor rarely
+ * needs to call the full `observeSurroundings` (whose ~4k-token result is the
+ * main driver of local prompt-processing latency and GPU OOM).
+ */
+export async function buildExecutorContext(bot: Bot): Promise<string> {
+  const { state: s } = await observeSurroundings(bot);
+  const L: string[] = [];
+  L.push("# Current situation (you already have this — only observe if you need fresh info after moving)");
+  L.push(`position: ${s.position.x} ${s.position.y} ${s.position.z}`);
+  L.push(`inventory: ${inventorySummary(bot)}`);
+  L.push(`current task: ${s.currentTask ?? "(none)"}`);
+  if (s.remainingTasks.length > 0) {
+    L.push(`remaining tasks: ${s.remainingTasks.join(" | ")}`);
+  }
+  if (s.nearbyBlocks.length > 0) {
+    L.push(
+      `nearby: ${s.nearbyBlocks
+        .slice(0, MAX_BLOCKS)
+        .map((b) => `${b.type} x${b.count} @${fmt(b.nearest)} (${b.nearest.dist}m)`)
+        .join(", ")}`,
+    );
+  }
+  return L.join("\n");
+}
+
 function inventorySummary(bot: Bot): string {
   const counts = new Map<string, number>();
   for (const item of bot.inventory.items()) {

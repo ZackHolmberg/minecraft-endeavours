@@ -29,7 +29,7 @@ import type { Bot } from "mineflayer";
 import { getBotState } from "../../state/index.js";
 import { SKILL_SPECS, type SkillSpec } from "../../skills/registry.js";
 import type { BotConfig } from "../../types.js";
-import { buildPlanningContext } from "../planning-context.js";
+import { buildExecutorContext, buildPlanningContext } from "../planning-context.js";
 import { buildExecutorSystemPrompt, buildPlannerSystemPrompt } from "../system-prompt.js";
 import { ClaudeBackend } from "./claude-backend.js";
 import { LocalBackend } from "./local-backend.js";
@@ -178,7 +178,13 @@ export class HybridBackend implements AgentBackend {
 
       const revBefore = this.taskRevision();
       const before = this.snapshot();
-      const outcome = await this.executor.runTurn(totalTurns === 0 ? EXEC_KICKOFF : EXEC_CONTINUE);
+      // Inject the compact execution context on the first burst so the executor
+      // has task/inventory/nearby up front and needn't call the heavy
+      // observeSurroundings itself. Continue bursts already carry the context in
+      // their transcript.
+      const kickoff =
+        totalTurns === 0 ? `${await buildExecutorContext(bot)}\n\n${EXEC_KICKOFF}` : EXEC_CONTINUE;
+      const outcome = await this.executor.runTurn(kickoff);
       totalTurns += 1;
       if (this.stopped) return;
 

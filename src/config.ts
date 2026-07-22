@@ -16,10 +16,12 @@ const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 
 const DEFAULT_MODEL_HINT: ModelHint = "sonnet";
 const DEFAULT_BACKEND: BackendKind = "claude";
-// Spike-validated local defaults (spikes/MLX_NOTES.md): mlx_lm.server on
-// 127.0.0.1:8080 serving Qwen3-14B-4bit. Override per-bot in config/bots.yml.
+// Local defaults: mlx_lm.server on 127.0.0.1:8080. Qwen3-8B-4bit (~4.3GB) is the
+// default over 14B (~8GB) — faster prompt-processing and enough GPU headroom on
+// the 24GB box to avoid the recurring Metal-OOM aborts we hit under load with
+// 14B. Override per-bot in config/bots.yml.
 const DEFAULT_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1";
-const DEFAULT_LOCAL_MODEL = "mlx-community/Qwen3-14B-4bit";
+const DEFAULT_LOCAL_MODEL = "mlx-community/Qwen3-8B-4bit";
 
 export function loadConfig(botsYmlPath = "config/bots.yml"): AppConfig {
   const absPath = resolve(process.cwd(), botsYmlPath);
