@@ -1,25 +1,21 @@
 bots:
+  # TEMPORARY: Steve_AI flipped to hybrid for the Phase C live test.
+  # Requires the model server up first: ./scripts/llmStart.sh
+  # To revert to the plain Claude bot, restore:
+  #   - username: Steve_AI
+  #     model_hint: sonnet
+  #     backend: claude
   - username: Steve_AI
-    model_hint: sonnet
-    backend: claude
+    backend: hybrid
+    planner:
+      model_hint: sonnet     # Claude tier that plans (default sonnet; opus for heavier planning)
+    executor:
+      baseUrl: http://127.0.0.1:8080/v1
+      model: mlx-community/Qwen3-8B-4bit
 
-# To run a bot on the local model instead of Claude:
-#   1. Start the model server:  ./scripts/llmStart.sh
-#   2. Set backend: local (model_hint is then optional/ignored). Defaults:
-#      baseUrl http://127.0.0.1:8080/v1, model mlx-community/Qwen3-14B-4bit.
-#
+# To run a bot on the local model directly (executor only, no planner):
 #   - username: Qwen_AI
 #     backend: local
 #     local:
 #       baseUrl: http://127.0.0.1:8080/v1
-#       model: mlx-community/Qwen3-14B-4bit
-#
-# Hybrid (Claude plans / Qwen executes) — also needs ./scripts/llmStart.sh:
-#
-#   - username: Duo_AI
-#     backend: hybrid
-#     planner:
-#       model_hint: sonnet     # Claude tier that plans (default sonnet; opus for heavier planning)
-#     executor:
-#       baseUrl: http://127.0.0.1:8080/v1
-#       model: mlx-community/Qwen3-14B-4bit
+#       model: mlx-community/Qwen3-8B-4bit
