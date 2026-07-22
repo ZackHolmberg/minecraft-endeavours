@@ -47,10 +47,19 @@ const PLANNER_SPECS: SkillSpec[] = SKILL_SPECS.filter((s) => s.surfaces.planner)
 
 // How many replans (planner re-invocations on stall) before giving up on a message.
 const MAX_REPLANS = 2;
-// Total executor turns per player message, across all plan attempts — a hard
-// safety bound so a progressing-but-never-draining loop can't run forever.
-const MAX_TOTAL_EXECUTOR_TURNS = 12;
-// Position delta (blocks) above which we count movement as progress.
+// Steps the executor may take per burst before returning control to the
+// coordinator. Kept small so we checkpoint progress often and can catch a
+// runaway (e.g. over-harvesting) before it does too much.
+const EXECUTOR_BURST_STEPS = 8;
+// Total executor bursts per player message, across all plan attempts — a hard
+// safety bound so a loop can't run forever.
+const MAX_TOTAL_EXECUTOR_TURNS = 24;
+// Consecutive executor bursts that stay busy (inventory/position changing) but
+// never advance the task queue before we treat it as a soft stall and replan.
+// This is the blind-spot fix: "busy" is not the same as "making progress on the
+// task" — a bot chopping a whole forest without completing the task must stop.
+const MAX_TURNS_WITHOUT_ADVANCE = 3;
+// Position delta (blocks) above which we count movement as activity.
 const POSITION_PROGRESS_THRESHOLD = 1.0;
 
 const EXEC_KICKOFF = "A plan has been set. Begin executing the current task queue now.";
@@ -95,6 +104,7 @@ export class HybridBackend implements AgentBackend {
       botConfig,
       local: hybrid.executor,
       systemPrompt: buildExecutorSystemPrompt(bot.username),
+      maxSteps: EXECUTOR_BURST_STEPS,
     });
     console.log(
       `[${bot.username}] hybrid backend — planner=${hybrid.plannerModelHint} (${PLANNER_SPECS.length} tools), executor=${hybrid.executor.model}`,
@@ -146,18 +156,27 @@ export class HybridBackend implements AgentBackend {
     console.log(`${tag} plan set: ${this.taskSummary()} — handing off to executor`);
 
     // ── Execute, with deterministic stall-driven replanning ───────────────
+    //
+    // Two distinct stall signals:
+    //  - HARD stall: a burst with no activity at all (queue/inventory/position
+    //    unchanged) — the executor is truly stuck.
+    //  - SOFT stall: bursts that stay busy but never ADVANCE the task queue for
+    //    MAX_TURNS_WITHOUT_ADVANCE in a row — e.g. over-harvesting without ever
+    //    completing the task. "Busy" is not "progress on the task".
     let replans = 0;
     let totalTurns = 0;
+    let turnsSinceAdvance = 0;
     while (!this.stopped) {
       if (this.isCancelled()) {
         console.log(`${tag} cancelled`);
         return;
       }
       if (totalTurns >= MAX_TOTAL_EXECUTOR_TURNS) {
-        console.warn(`${tag} executor turn budget (${MAX_TOTAL_EXECUTOR_TURNS}) exhausted; stopping`);
+        console.warn(`${tag} executor burst budget (${MAX_TOTAL_EXECUTOR_TURNS}) exhausted; stopping`);
         return;
       }
 
+      const revBefore = this.taskRevision();
       const before = this.snapshot();
       const outcome = await this.executor.runTurn(totalTurns === 0 ? EXEC_KICKOFF : EXEC_CONTINUE);
       totalTurns += 1;
@@ -168,24 +187,35 @@ export class HybridBackend implements AgentBackend {
         return;
       }
       if (this.taskQueueEmpty()) {
-        console.log(`${tag} plan complete (${totalTurns} executor turn(s))`);
+        console.log(`${tag} plan complete (${totalTurns} burst(s))`);
         return;
       }
 
-      if (this.progressed(before, this.snapshot())) {
-        continue; // making headway — keep executing the same plan
+      const advanced = this.taskRevision() > revBefore;
+      if (advanced) {
+        // A task was completed and the queue moved on — real forward progress.
+        turnsSinceAdvance = 0;
+        continue;
+      }
+      turnsSinceAdvance += 1;
+
+      const active = this.progressed(before, this.snapshot());
+      if (active && turnsSinceAdvance < MAX_TURNS_WITHOUT_ADVANCE) {
+        // Busy and hasn't been stuck-on-the-same-task too long — give it slack.
+        continue;
       }
 
-      // Stall: no progress this turn and the queue isn't drained → replan.
+      // Stall (hard = no activity; soft = busy but not advancing) → replan.
+      const reason = active ? "busy but not completing the task" : "no activity";
       replans += 1;
       if (replans > MAX_REPLANS) {
-        console.warn(`${tag} stalled and out of replans (${MAX_REPLANS}); stopping`);
+        console.warn(`${tag} stalled (${reason}) and out of replans (${MAX_REPLANS}); stopping`);
         return;
       }
-      console.log(`${tag} stall detected — re-invoking planner (replan ${replans}/${MAX_REPLANS})`);
+      console.log(`${tag} stall — ${reason}; re-invoking planner (replan ${replans}/${MAX_REPLANS})`);
 
       const revBeforeReplan = this.taskRevision();
-      await this.planner.runTurn(await this.buildReplanContext());
+      await this.planner.runTurn(await this.buildReplanContext(reason));
       if (this.stopped || this.isCancelled()) return;
 
       if (this.taskQueueEmpty()) {
@@ -197,18 +227,22 @@ export class HybridBackend implements AgentBackend {
         console.log(`${tag} planner did not revise the plan; stopping`);
         return;
       }
-      // Revised plan in place — loop back to execute it.
+      turnsSinceAdvance = 0; // fresh plan in place — loop back to execute it.
     }
   }
 
-  private async buildReplanContext(): Promise<string> {
+  private async buildReplanContext(reason: string): Promise<string> {
     const context = await buildPlanningContext(this.opts.bot);
     const current = getBotState(this.opts.bot.username)?.tasks.current() ?? "(none)";
+    const detail =
+      reason === "no activity"
+        ? `it appears stuck (missing tool/material, unreachable target, or a bad step)`
+        : `it is working but never completing the task — likely over-gathering, looping, or the goal is too open-ended`;
     return (
-      `${context}\n\n[execution update] The executor made no progress on the current task ` +
-      `("${current}") — it appears stuck (missing tool/material, unreachable target, or a bad step). ` +
-      `Revise the plan with setTaskQueue to address the blocker (secure the prerequisite first, ` +
-      `pick a different resource, or split the step), or tell the player with say if it can't be done.`
+      `${context}\n\n[execution update] The executor is not making progress on the current task ` +
+      `("${current}") — ${detail}. Revise the plan with setTaskQueue (bound the amount with a concrete ` +
+      `count, secure a missing prerequisite, pick a different resource, or split the step), or tell the ` +
+      `player with say if it can't be done.`
     );
   }
 

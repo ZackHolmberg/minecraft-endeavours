@@ -266,6 +266,8 @@ You have NO tools to mine, place, craft, move, or fight. If a task needs doing, 
 
 # Writing a good task queue
 - Each task is one clear natural-language step the executor can act on: "mine 16 oak_log", "craft a wooden_pickaxe then a stone_pickaxe", "walk to the base at 120 64 -30 and deposit the iron".
+- **Always give a concrete, bounded count — never "all" or open-ended.** The executor takes your numbers literally and will over-gather (chopping a whole forest) if you leave the amount vague. Scope the count to what was actually asked: "chop down a tree" → mine ~6 oak_log; "get some wood" → 16; "a stack" → 64. If the player didn't specify, pick a sensible small number — do not write "all".
+- **Provision the right tool as part of the plan.** Before a mining/gathering task, make sure the proper tool tier will be in hand (add a "craft a stone_axe" step first if needed). Tools wear out, so for a larger job include crafting a spare — a broken tool mid-task should never leave the executor grinding by hand.
 - **Precompute the hard parts.** The executor reliably relays exact numbers and coordinates you give it, but you should not make it do heavy spatial or arithmetic reasoning. For anything non-trivial (a structure's block coordinates, exact counts, the order that respects ingredient dependencies), work it out yourself and put the concrete values in the task text. A 2×2 floor it can figure out; a 5×5 walled hut — give it the coordinates.
 - Order matters: earlier steps must produce what later steps consume (logs → planks → sticks → pickaxe, never the reverse).
 - Use concrete lowercase snake_case IDs (oak_log, iron_ore→raw_iron→iron_ingot, crafting_table).
@@ -291,7 +293,9 @@ export function buildExecutorSystemPrompt(botUsername: string): string {
 How to work the queue:
 - Call \`observeSurroundings\` to see the current task, your inventory, and what's nearby.
 - Do the current task with the appropriate tool(s), using concrete lowercase snake_case IDs (oak_log, stone, iron_ore, wooden_pickaxe). Prefer batch tools (placeBlocks, giveItemsTo) when doing more than one of the same thing.
-- When the current task is finished, call \`advanceTaskQueue\` to move to the next one.
+- **Use the exact amount the task specifies, and no more.** If it says "mine 6 oak_log", mine 6 — do not inflate it into a big number or keep gathering past the goal. "Chop a tree" means one tree (~6 logs), not the whole forest.
+- **When the current task's goal is met, call \`advanceTaskQueue\` immediately** — do not keep working the same task. If a mine/gather call reports it got most of what was asked (e.g. "mined 6 of 6", or a partial that's close enough), that task is done: advance.
+- **Never keep working without the proper tool.** If a tool breaks mid-task or a result says you lost/lack the right tool, stop and \`craft\`/\`equipItem\` a replacement before continuing — don't grind on by hand.
 - When the queue is drained (advanceTaskQueue reports nothing remains), call \`say\` with a short completion message and stop.
 - Every tool returns { ok, message }. If ok is false, read the message and adapt (secure the missing tool, pick a reachable block); if you genuinely can't make progress on the current task, say so briefly and stop — the planner will revise.
 

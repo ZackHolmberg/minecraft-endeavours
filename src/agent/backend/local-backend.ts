@@ -103,6 +103,12 @@ export interface LocalBackendOptions {
   local?: LocalModelConfig;
   /** System prompt override (the hybrid executor prompt). Defaults to the standalone agent prompt. */
   systemPrompt?: string;
+  /**
+   * Max tool-calling steps per turn. The hybrid coordinator passes a small
+   * value so it checkpoints progress frequently (and can catch a runaway
+   * before it does too much); standalone use keeps the larger default.
+   */
+  maxSteps?: number;
 }
 
 /** Outcome of one executor turn, for the hybrid coordinator. */
@@ -115,6 +121,7 @@ export interface ExecutorOutcome {
 
 export class LocalBackend implements AgentBackend {
   private readonly local: LocalModelConfig;
+  private readonly maxSteps: number;
   private readonly cooldown = new RateLimitCooldown();
   private readonly transcript: ChatMessage[];
   private readonly pending: string[] = [];
@@ -140,6 +147,7 @@ export class LocalBackend implements AgentBackend {
       );
     }
     this.local = local;
+    this.maxSteps = opts.maxSteps ?? MAX_STEPS_PER_MESSAGE;
     const systemPrompt = opts.systemPrompt ?? buildLocalSystemPrompt(opts.bot.username);
     this.transcript = [{ role: "system", content: systemPrompt }];
     console.log(
@@ -198,7 +206,7 @@ export class LocalBackend implements AgentBackend {
     let stepOutTokens = 0;
     let steps = 0;
 
-    for (let step = 1; step <= MAX_STEPS_PER_MESSAGE; step++) {
+    for (let step = 1; step <= this.maxSteps; step++) {
       steps = step;
 
       if (this.isCancellationRequested()) {
