@@ -72,3 +72,45 @@ Add your Minecraft username to `OPS=` in `.env`, then restart the server. In-gam
 ## Access control
 
 The server runs in offline-mode (no Mojang auth) to support AI NPC bots, so access is gated by the **whitelist**: only usernames listed in `WHITELIST=` in `.env` can join. Add friends' Minecraft usernames there (comma-separated) and restart.
+
+## Why Docker, and not Apple's `container`
+
+Evaluated September 2026 (`apple/container` 1.4.1, macOS 26.1, M4 Pro) and
+**rejected**. Recorded here so it doesn't get re-litigated.
+
+**The blocker: Apple's `container` can only publish ports to localhost.** Every
+container gets an IP on a NAT'd, isolated `vmnet` subnet (`192.168.64.0/24`),
+"reachable by that IP from the host and from other containers on the same
+network" — and the publish section of [Apple's networking
+docs](https://github.com/apple/container/blob/main/docs/networking.md) is titled
+*"Forward traffic from `localhost` to your container."* Publishing is a
+userspace forwarder bound to a loopback socket, not kernel NAT. There is no
+bridged or macvlan mode; `container network create` only makes more isolated
+private subnets.
+
+That kills the setup described under [From outside the
+network](#from-outside-the-network): the router would forward 25565 to this
+Mac's LAN IP and hit nothing.
+
+> This is **not** the same as the macOS 26.1 port-forwarding bug
+> ([apple/container#919](https://github.com/apple/container/issues/919)) — that
+> one was real, hit `container` 0.6.0, and is fixed. The loopback-only design is
+> current on `main` and is not fixed by updating macOS.
+
+**A `socat` TCP relay on the host would work** for Minecraft specifically (it's
+TCP, one long-lived connection per player), but the server would then see every
+player as connecting from the relay — breaking per-IP bans and making the logs
+show a single address. Username whitelisting is unaffected.
+
+**Secondary gaps:** no `--restart` flag (so no `restart: unless-stopped`), no
+healthchecks (`mc-health` has nowhere to run), and no compose equivalent.
+
+**There is no performance upside.** Both runtimes run the same arm64 Linux
+image; tick rate is set by the JVM and the Aikar GC flags, not by the container
+runtime. `container`'s headline win is sub-second cold start, which is a
+dev-loop benefit — this server starts once and runs for weeks. Docker Desktop
+idles at ~543 MB and 0.0% CPU with the container stopped, and quitting Docker
+Desktop reclaims that without migrating anything.
+
+**Revisit if** Apple ships bridged networking — that's the one gap without a
+clean workaround. Everything else here is solvable.
