@@ -1,9 +1,51 @@
 import mineflayer, { type Bot } from "mineflayer";
 import { pathfinder } from "mineflayer-pathfinder";
+import { recordEvent, recordEventAll } from "../observability/telemetry.js";
 import type { BotConfig } from "../types.js";
 
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
+/**
+ * A connection must stay up this long before the backoff resets. Resetting
+ * on `spawn` alone meant a server that accepts logins but then stalls (the
+ * observed spawn → 30s keepAliveError loop) got hammered at a fixed 1s
+ * backoff forever.
+ */
+const STABLE_CONNECTION_MS = 60_000;
+/** Log when the event loop was blocked this long — keepalive dies at 30s. */
+const LOOP_LAG_WARN_MS = 2_000;
+const LOOP_LAG_SAMPLE_MS = 1_000;
+/** Record a telemetry `loop_lag` event for stalls at least this long. */
+const LOOP_LAG_TELEMETRY_MS = 500;
+
+let lagMonitorStarted = false;
+/** Bots that get the process-wide loop_lag events. */
+const lagTelemetryBots = new Set<string>();
+
+/**
+ * Process-wide event-loop stall detector. mineflayer answers keepalives from
+ * the event loop; if something synchronous blocks it for >30s the client
+ * times itself out with `keepAliveError` even though the server is fine.
+ * A logged stall right before a disconnect points at us; no stall points at
+ * the server / host (e.g. Paper "Can't keep up!" or host memory pressure).
+ */
+function startLoopLagMonitor(): void {
+  if (lagMonitorStarted) return;
+  lagMonitorStarted = true;
+  let expected = Date.now() + LOOP_LAG_SAMPLE_MS;
+  const timer = setInterval(() => {
+    const now = Date.now();
+    const lag = now - expected;
+    expected = now + LOOP_LAG_SAMPLE_MS;
+    if (lag >= LOOP_LAG_WARN_MS) {
+      console.warn(`orchestrator: event loop was blocked for ~${Math.round(lag / 1000)}s`);
+    }
+    if (lag >= LOOP_LAG_TELEMETRY_MS) {
+      recordEventAll([...lagTelemetryBots], { kind: "loop_lag", lagMs: lag });
+    }
+  }, LOOP_LAG_SAMPLE_MS);
+  timer.unref();
+}
 
 /**
  * Connection state surfaced through the supervisor so the dashboard (phase 3)
@@ -49,6 +91,10 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
   let reconnectTimer: NodeJS.Timeout | null = null;
   let spawned = false;
   let connectedSince: number | null = null;
+  let stableTimer: NodeJS.Timeout | null = null;
+
+  startLoopLagMonitor();
+  lagTelemetryBots.add(botConfig.username);
 
   const connect = (): void => {
     if (stopped) return;
@@ -68,9 +114,13 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
 
     bot.once("spawn", () => {
       console.log(`${tag} spawned in world (pos=${formatPos(bot)})`);
-      backoffMs = INITIAL_BACKOFF_MS;
+      stableTimer = setTimeout(() => {
+        stableTimer = null;
+        backoffMs = INITIAL_BACKOFF_MS;
+      }, STABLE_CONNECTION_MS);
       spawned = true;
       connectedSince = Date.now();
+      recordEvent(botConfig.username, { kind: "connection", state: "connected", reason: null, inWorldMs: null });
     });
 
     bot.on("kicked", (reason) => {
@@ -83,7 +133,22 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
     });
 
     bot.once("end", (reason) => {
-      console.warn(`${tag} disconnected: ${reason}`);
+      const upFor = connectedSince ? ` after ${Math.round((Date.now() - connectedSince) / 1000)}s in-world` : " before spawning";
+      console.warn(`${tag} disconnected: ${reason}${upFor}`);
+      if (currentBot === bot) {
+        recordEvent(botConfig.username, {
+          kind: "connection",
+          state: "disconnected",
+          reason: String(reason ?? "").slice(0, 200) || null,
+          inWorldMs: connectedSince ? Date.now() - connectedSince : null,
+        });
+      }
+      if (stableTimer) {
+        clearTimeout(stableTimer);
+        stableTimer = null;
+      }
+      // Don't null out a newer bot if this is a stale instance's late `end`.
+      if (currentBot !== bot) return;
       currentBot = null;
       spawned = false;
       connectedSince = null;
@@ -96,6 +161,7 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
     if (stopped || reconnectTimer) return;
     const delay = backoffMs;
     console.log(`${tag} reconnecting in ${delay}ms`);
+    recordEvent(botConfig.username, { kind: "connection", state: "reconnecting", reason: `retry in ${delay}ms`, inWorldMs: null });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
@@ -121,6 +187,10 @@ export function startBotSupervisor(opts: BotSupervisorOptions): BotSupervisor {
     },
     async stop() {
       stopped = true;
+      if (stableTimer) {
+        clearTimeout(stableTimer);
+        stableTimer = null;
+      }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

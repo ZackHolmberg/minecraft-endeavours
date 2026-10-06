@@ -4,10 +4,10 @@ import type { ModelHint } from "../types.js";
  * Map a config-level `model_hint` (sonnet / haiku / opus) to the actual
  * Claude model identifier the Agent SDK expects.
  *
- * ARCHITECTURE.md "Default model selection":
- *   sonnet — main NPC reasoning loop
- *   haiku  — cheap background summarization (reserved for future use)
- *   opus   — opt-in for genuinely complex multi-step plans
+ * Current standing choice (config/bots.yml, config.ts default): `haiku` drives
+ * the main NPC loop — the system prompt and tool descriptions are tuned for it
+ * (short, prioritized rules; see system-prompt.ts). `sonnet` / `opus` remain
+ * available as opt-in tiers for heavier planning.
  */
 export function modelIdFor(hint: ModelHint): string {
   switch (hint) {

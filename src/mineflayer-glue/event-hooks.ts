@@ -3,15 +3,26 @@ import type { Block } from "prismarine-block";
 import type { Window } from "prismarine-windows";
 import { getAgent } from "../agent/npc-agent.js";
 import {
-  addPoi,
+  addDeath,
+  addPois,
+  type AddPoiInput,
   isUtilityBlockType,
   upsertContainer,
 } from "../memory/world-knowledge.js";
+import { noteRoutedChat, recordEvent } from "../observability/telemetry.js";
 import {
   getCurrentConversationPartner,
   isAddressed,
+  isStopCommand,
   type ChatEvent,
 } from "../orchestrator/chat-router.js";
+import {
+  defendTick,
+  idleLookTick,
+  maybeAutoEat,
+  maybeEquipArmor,
+  noteHurt,
+} from "../skills/auto-behaviors.js";
 import type { BotState } from "../state/index.js";
 
 /**
@@ -20,8 +31,18 @@ import type { BotState } from "../state/index.js";
  * flag so the skill exits promptly, without waiting for the chat to drain
  * through the queued agent loop.
  */
-const CANCELLABLE_SKILLS = new Set(["followPlayer", "attack", "flee"]);
-const STOP_REGEX = /\b(stop|halt|wait)\b/i;
+const CANCELLABLE_SKILLS = new Set([
+  "followPlayer",
+  "attack",
+  "flee",
+  "fish",
+  "smelt",
+  "goTo",
+  "mineBlock",
+  "mineBlocks",
+  "placeBlocks",
+  "pillarUp",
+]);
 
 const CONTAINER_BLOCK_TYPES = new Set([
   "chest",
@@ -47,6 +68,10 @@ const CONTAINER_BLOCK_TYPES = new Set([
 ]);
 
 const UTILITY_SCAN_INTERVAL_MS = 5_000;
+/** Idle-look + defensive-swing cadence. Cheap: a few distance checks. */
+const REFLEX_TICK_MS = 400;
+/** Window after a death in which a "<bot> was slain by …" line is its cause. */
+const DEATH_MESSAGE_WINDOW_MS = 3_000;
 const UTILITY_SCAN_RADIUS = 8;
 const CURSOR_REACH = 6;
 
@@ -154,23 +179,96 @@ export function attachBotEventHooks(
   // events) so we don't burn CPU when the bot's mining or following — the
   // bot doesn't need a real-time POI update, just "remember this when you
   // pass by". Idempotent on (type, position) so re-scanning is free.
+  const utilityIds = collectUtilityIds(bot);
   const utilityScan = setInterval(() => {
-    void scanForUtilityBlocks(bot, username, tag);
+    void scanForUtilityBlocks(bot, username, tag, utilityIds);
+    // Retry armor upgrades picked up while a skill was busy.
+    maybeEquipArmor(bot, state);
   }, UTILITY_SCAN_INTERVAL_MS);
+
+  // Player-like reflexes (see skills/auto-behaviors.ts). All of them bail
+  // while a skill is in flight, so they never fight the agent for control.
+  const reflexTick = setInterval(() => {
+    if (!bot.entity) return;
+    defendTick(bot, state);
+    idleLookTick(bot, state);
+  }, REFLEX_TICK_MS);
+  bot.on("health", () => maybeAutoEat(bot, state));
+  bot.on("playerCollect", (collector) => {
+    if (collector !== bot.entity) return;
+    // Let the inventory slot update land before inspecting it.
+    setTimeout(() => maybeEquipArmor(bot, state), 500);
+  });
+
+  bot.on("entityHurt", (entity, source) => {
+    if (entity !== bot.entity) return;
+    noteHurt(bot, source);
+    const who = source ? source.username ?? source.name ?? "something" : "something";
+    console.log(`${tag} hurt by ${who} (health ${Math.round(bot.health)}/20)`);
+    recordEvent(username, {
+      kind: "hurt",
+      health: Math.round((bot.health ?? 0) * 10) / 10,
+      by: source ? source.username ?? source.name ?? null : null,
+    });
+  });
+
+  // Death capture → world.json deaths[] + actions log, so the agent can
+  // answer "where did you die?" / go back for its items. mineflayer has no
+  // death cause, so we pair the event with the server's "<bot> was slain by
+  // …" chat line if it arrives within a few seconds.
+  let pendingDeath: { position: { x: number; y: number; z: number }; at: number; cause: string } | null = null;
+  let deathFlush: NodeJS.Timeout | null = null;
+  const flushDeath = (): void => {
+    deathFlush = null;
+    const d = pendingDeath;
+    pendingDeath = null;
+    if (!d) return;
+    recordEvent(username, { kind: "death", at: d.at, pos: d.position, cause: d.cause.slice(0, 200) });
+    const where = `(${d.position.x}, ${d.position.y}, ${d.position.z})`;
+    state.actions.record(`died at ${where}: ${d.cause}; my items dropped there (they despawn after ~5 min)`);
+    void addDeath(username, { position: d.position, cause: d.cause, timestamp: d.at }).catch((err) => {
+      console.warn(`${tag} death capture failed:`, err);
+    });
+  };
+  bot.on("death", () => {
+    const p = bot.entity?.position;
+    const position = p ? { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) } : { x: 0, y: 0, z: 0 };
+    pendingDeath = { position, at: Date.now(), cause: "unknown cause" };
+    console.warn(`${tag} died at (${position.x}, ${position.y}, ${position.z})`);
+    // Abort whatever was running — a mid-path goal or attack loop after
+    // respawn would walk the bot somewhere nonsensical.
+    state.cancellation.request();
+    (bot as Bot & { pathfinder?: { stop(): void } }).pathfinder?.stop();
+    deathFlush = setTimeout(flushDeath, DEATH_MESSAGE_WINDOW_MS);
+  });
+  bot.on("messagestr", (message) => {
+    if (!pendingDeath || !message.startsWith(`${username} `)) return;
+    pendingDeath.cause = message.slice(username.length + 1).trim();
+    if (deathFlush) clearTimeout(deathFlush);
+    flushDeath();
+  });
+
   bot.once("end", () => {
     clearInterval(utilityScan);
+    clearInterval(reflexTick);
+    if (deathFlush) {
+      clearTimeout(deathFlush);
+      flushDeath();
+    }
     pendingContainerOpen.delete(username);
   });
 }
 
-async function scanForUtilityBlocks(bot: Bot, username: string, tag: string): Promise<void> {
-  if (!bot.entity) return;
-  // Collect utility block IDs once per scan; cheap to rebuild and keeps
-  // us insulated from registry changes between minecraft-data versions.
+function collectUtilityIds(bot: Bot): number[] {
   const ids: number[] = [];
   for (const block of bot.registry.blocksArray) {
     if (isUtilityBlockType(block.name)) ids.push(block.id);
   }
+  return ids;
+}
+
+async function scanForUtilityBlocks(bot: Bot, username: string, tag: string, ids: number[]): Promise<void> {
+  if (!bot.entity) return;
   if (ids.length === 0) return;
   const positions = bot.findBlocks({
     point: bot.entity.position,
@@ -178,21 +276,23 @@ async function scanForUtilityBlocks(bot: Bot, username: string, tag: string): Pr
     maxDistance: UTILITY_SCAN_RADIUS,
     count: 32,
   });
+  const inputs: AddPoiInput[] = [];
   for (const p of positions) {
     const block = bot.blockAt(p);
     if (!block) continue;
-    try {
-      const result = await addPoi(username, {
-        type: block.name,
-        position: { x: p.x, y: p.y, z: p.z },
-        source: "auto",
-      });
-      if (result.added) {
-        console.log(`${tag} auto-poi: ${block.name} at (${p.x}, ${p.y}, ${p.z})`);
-      }
-    } catch (err) {
-      console.warn(`${tag} auto-poi write failed:`, err);
-    }
+    inputs.push({ type: block.name, position: { x: p.x, y: p.y, z: p.z }, source: "auto" as const });
+  }
+  if (inputs.length === 0) return;
+  try {
+    // One read + at most one write per scan (was one per block).
+    const results = await addPois(username, inputs);
+    results.forEach((r, i) => {
+      if (!r.added) return;
+      const { type, position: q } = inputs[i]!;
+      console.log(`${tag} auto-poi: ${type} at (${q.x}, ${q.y}, ${q.z})`);
+    });
+  } catch (err) {
+    console.warn(`${tag} auto-poi write failed:`, err);
   }
 }
 
@@ -212,7 +312,8 @@ function maybePreempt(
 ): void {
   const tool = state.currentTool.current();
   if (!tool || !CANCELLABLE_SKILLS.has(tool.name)) return;
-  if (!STOP_REGEX.test(message)) return;
+  // Strict whole-message match: "wait, also grab coal" must not preempt.
+  if (!isStopCommand(username, message)) return;
   const partner = getCurrentConversationPartner(username);
   if (partner !== sender) return;
   state.cancellation.request();
@@ -226,8 +327,16 @@ function dispatch(
   event: ChatEvent,
 ): void {
   const match = isAddressed(username, allBots, event);
+  recordEvent(username, {
+    kind: "chat_in",
+    player: event.sender,
+    routed: match !== null,
+    route: match?.reason ?? null,
+    isStop: isStopCommand(username, event.message),
+  });
   if (!match) return;
   console.log(`${tag} ROUTE ${event.channel}→${username} reason=${match.reason}`);
+  noteRoutedChat(username, { player: event.sender, route: match.reason, at: Date.now() });
   const agent = getAgent(username);
   if (!agent) {
     console.warn(`${tag} no agent registered; chat from ${event.sender} dropped`);

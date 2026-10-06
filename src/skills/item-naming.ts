@@ -26,7 +26,25 @@ type ItemData = { id: number; name: string; displayName?: string };
 type BlockData = { id: number; name: string; displayName?: string };
 
 export function normalizeName(raw: string): string {
-  return raw.trim().toLowerCase().replace(/\s+/g, "_");
+  return raw.trim().toLowerCase().replace(/^minecraft:/, "").replace(/\s+/g, "_");
+}
+
+/**
+ * Players say "sticks", "oak logs", "torches", "potatoes". Try the registry
+ * key as given, then with a plural suffix stripped. Purely lexical — only
+ * accepted if the singular is an actual registry key.
+ */
+function lookupWithPlural<T>(table: Record<string, T>, normalized: string): { data: T; key: string } | null {
+  const direct = table[normalized];
+  if (direct) return { data: direct, key: normalized };
+  for (const suffix of ["es", "s"]) {
+    if (normalized.endsWith(suffix)) {
+      const key = normalized.slice(0, -suffix.length);
+      const data = table[key];
+      if (data) return { data, key };
+    }
+  }
+  return null;
 }
 
 export interface Resolved<T> {
@@ -46,8 +64,8 @@ export function resolveItem(bot: Bot, raw: string): Resolved<ItemData> | NotReso
     return { ok: false, message: "is required" };
   }
   const normalized = normalizeName(raw);
-  const data = bot.registry.itemsByName[normalized] as ItemData | undefined;
-  if (data) return { ok: true, data, normalized };
+  const hit = lookupWithPlural(bot.registry.itemsByName as Record<string, ItemData>, normalized);
+  if (hit) return { ok: true, data: hit.data, normalized: hit.key };
   return {
     ok: false,
     message: `unknown item "${raw}"${suggestionTail(Object.keys(bot.registry.itemsByName), normalized)}`,
@@ -59,8 +77,8 @@ export function resolveBlock(bot: Bot, raw: string): Resolved<BlockData> | NotRe
     return { ok: false, message: "is required" };
   }
   const normalized = normalizeName(raw);
-  const data = bot.registry.blocksByName[normalized] as BlockData | undefined;
-  if (data) return { ok: true, data, normalized };
+  const hit = lookupWithPlural(bot.registry.blocksByName as Record<string, BlockData>, normalized);
+  if (hit) return { ok: true, data: hit.data, normalized: hit.key };
   return {
     ok: false,
     message: `unknown block "${raw}"${suggestionTail(Object.keys(bot.registry.blocksByName), normalized)}`,

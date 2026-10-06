@@ -29,8 +29,25 @@ import {
   listSupervisors,
   type BotConnectionState,
 } from "../mineflayer-glue/bot-factory.js";
+import type { ConversationEntry } from "../memory/conversation-log.js";
+import {
+  readWorldKnowledge,
+  type Container,
+  type Death,
+  type POI,
+} from "../memory/world-knowledge.js";
 import { getCurrentConversationPartner } from "../orchestrator/chat-router.js";
 import { getBotState, type RecentlySeenPlayer } from "../state/index.js";
+import { loadJson, memoryFileFor } from "../state/persist.js";
+import { aggregate } from "./aggregate.js";
+import {
+  getCurrentTask,
+  getRingInfo,
+  RUN_ID,
+  RUN_STARTED_AT,
+  viewRecentEvents,
+} from "./telemetry.js";
+import type { TelemetryAggregate, TelemetryEvent } from "./telemetry-types.js";
 
 export interface BotSnapshot {
   username: string;
@@ -44,6 +61,54 @@ export interface BotSnapshot {
   state: StateFields;
   agent: AgentFields | null;
   chat: { currentPartner: string | null };
+  /** Live telemetry from the in-memory event ring. */
+  telemetry: TelemetryFields;
+  /** Durable per-bot memory read from disk (refreshed at most every ~5s); null until the first read lands. */
+  memory: MemoryFields | null;
+}
+
+export type TaskStartEvent = Extract<TelemetryEvent, { kind: "task_start" }>;
+export type TaskEndEvent = Extract<TelemetryEvent, { kind: "task_end" }>;
+
+export interface TelemetryFields {
+  runId: string;
+  runStartedAt: number;
+  /** Aggregate over the last 30 minutes. */
+  last30m: TelemetryAggregate;
+  /** Aggregate over the whole run (windowStart = process start). */
+  run: TelemetryAggregate;
+  /** True when the in-memory ring wrapped, so `run` covers only the retained tail. */
+  runTruncated: boolean;
+  /** The task in flight right now, if any. */
+  currentTask: {
+    taskId: string;
+    startedAt: number;
+    runningMs: number;
+    /** From its task_start event (null if not found in the ring). */
+    request: string | null;
+    toolCalls: number;
+    toolFailures: number;
+    firstReplyMs: number | null;
+  } | null;
+  /** Last ~15 finished tasks, newest first, joined with their task_start (null if it fell out of the ring). */
+  recentTasks: Array<{ start: TaskStartEvent | null; end: TaskEndEvent }>;
+  /** Last ~30 notable events, newest first: everything except look reflexes, successful skills, and chat_in/chat_out. */
+  notable: TelemetryEvent[];
+}
+
+export interface MemoryFields {
+  /** Unix ms of the disk read this reflects. */
+  refreshedAt: number;
+  /** Newest-first `latest` lists (by timestamp / last_opened). */
+  pois: { count: number; latest: POI[] };
+  containers: { count: number; latest: Container[] };
+  deaths: { count: number; latest: Death[] };
+  /** conversation.json: total entries on disk + the last ~8 (oldest first). */
+  conversation: { count: number; tail: ConversationEntry[] };
+  /** tasks.json as persisted (null when the file doesn't exist). */
+  tasks: { currentTask: string | null; queued: string[] } | null;
+  /** Read error for world.json, if any (other files fail soft to empty). */
+  error: string | null;
 }
 
 export interface BotFields {
@@ -109,6 +174,8 @@ export function getBotSnapshot(username: string): BotSnapshot | null {
     state: snapshotStateFields(username, capturedAt),
     agent: snapshotAgentFields(username),
     chat: { currentPartner: getCurrentConversationPartner(username) },
+    telemetry: snapshotTelemetryFields(username, capturedAt),
+    memory: snapshotMemoryFields(username, capturedAt),
   };
   return snapshot;
 }
@@ -183,6 +250,196 @@ function snapshotAgentFields(username: string): AgentFields | null {
     lastTurnError: agent.getLastTurnError(),
     windowStats: agent.getWindowStats(),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telemetry + memory. Both are cached: aggregates recompute only when the
+// ring changed (and at most every AGG_MIN_INTERVAL_MS), memory is re-read
+// from disk at most every MEMORY_REFRESH_MS, asynchronously — the 500ms tick
+// only ever returns the last cached value.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LAST_WINDOW_MS = 30 * 60 * 1000;
+const AGG_MIN_INTERVAL_MS = 2_000;
+const RECENT_TASKS = 15;
+const NOTABLE_EVENTS = 30;
+const MEMORY_REFRESH_MS = 5_000;
+const MEMORY_LATEST = 5;
+const CONVERSATION_TAIL = 8;
+
+interface TelemetryCache {
+  version: number;
+  computedAt: number;
+  fields: Omit<TelemetryFields, "currentTask">;
+  /** task_start events by taskId for the current-task lookup. */
+  starts: Map<string, TaskStartEvent>;
+}
+const telemetryCache = new Map<string, TelemetryCache>();
+
+function snapshotTelemetryFields(username: string, now: number): TelemetryFields {
+  let cached = telemetryCache.get(username);
+  try {
+    const info = getRingInfo(username);
+    const stale = !cached || (cached.version !== info.version && now - cached.computedAt >= AGG_MIN_INTERVAL_MS)
+      || now - cached.computedAt >= LAST_WINDOW_MS / 30; // let the 30m window slide even when idle
+    if (stale) {
+      const events = viewRecentEvents(username);
+      cached = {
+        version: info.version,
+        computedAt: now,
+        fields: {
+          runId: RUN_ID,
+          runStartedAt: RUN_STARTED_AT,
+          last30m: aggregate(events, now - LAST_WINDOW_MS, now),
+          run: aggregate(events, RUN_STARTED_AT, now),
+          runTruncated: info.wrapped,
+          ...recentTasksAndNotable(events),
+        },
+        starts: startsById(events),
+      };
+      telemetryCache.set(username, cached);
+    }
+  } catch (err) {
+    console.warn(`[${username}] snapshot telemetry failed:`, err);
+  }
+  const fields = cached?.fields ?? {
+    runId: RUN_ID,
+    runStartedAt: RUN_STARTED_AT,
+    last30m: aggregate([], now - LAST_WINDOW_MS, now),
+    run: aggregate([], RUN_STARTED_AT, now),
+    runTruncated: false,
+    recentTasks: [],
+    notable: [],
+  };
+  const t = getCurrentTask(username);
+  return {
+    ...fields,
+    currentTask: t
+      ? {
+          taskId: t.taskId,
+          startedAt: t.startedAt,
+          runningMs: now - t.startedAt,
+          request: cached?.starts.get(t.taskId)?.request ?? null,
+          toolCalls: t.toolCalls,
+          toolFailures: t.toolFailures,
+          firstReplyMs: t.firstReplyAt !== null ? t.firstReplyAt - t.startedAt : null,
+        }
+      : null,
+  };
+}
+
+function startsById(events: readonly TelemetryEvent[]): Map<string, TaskStartEvent> {
+  // Only the tail matters (current task / last 15); scan backwards a bounded amount.
+  const out = new Map<string, TaskStartEvent>();
+  for (let i = events.length - 1; i >= 0 && out.size < RECENT_TASKS + 2; i--) {
+    const e = events[i]!;
+    if (e.kind === "task_start" && e.taskId) out.set(e.taskId, e);
+  }
+  return out;
+}
+
+function isNotable(e: TelemetryEvent): boolean {
+  switch (e.kind) {
+    case "reflex":
+      return e.reflex !== "look";
+    case "skill":
+      return !e.ok;
+    case "chat_in":
+    case "chat_out":
+      return false;
+    default:
+      return true;
+  }
+}
+
+function recentTasksAndNotable(
+  events: readonly TelemetryEvent[],
+): Pick<TelemetryFields, "recentTasks" | "notable"> {
+  const ends: TaskEndEvent[] = [];
+  const notable: TelemetryEvent[] = [];
+  const starts = new Map<string, TaskStartEvent>();
+  // Newest first; stop once both lists are full and every wanted start found.
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.kind === "task_start" && e.taskId) starts.set(e.taskId, e);
+    if (e.kind === "task_end" && ends.length < RECENT_TASKS) ends.push(e);
+    if (notable.length < NOTABLE_EVENTS && isNotable(e)) notable.push(e);
+    if (
+      ends.length >= RECENT_TASKS &&
+      notable.length >= NOTABLE_EVENTS &&
+      ends.every((end) => !end.taskId || starts.has(end.taskId))
+    ) {
+      break;
+    }
+  }
+  return {
+    recentTasks: ends.map((end) => ({ start: (end.taskId && starts.get(end.taskId)) || null, end })),
+    notable,
+  };
+}
+
+interface MemoryCache {
+  value: MemoryFields | null;
+  refreshedAt: number;
+  inFlight: boolean;
+}
+const memoryCache = new Map<string, MemoryCache>();
+
+function snapshotMemoryFields(username: string, now: number): MemoryFields | null {
+  let c = memoryCache.get(username);
+  if (!c) {
+    c = { value: null, refreshedAt: 0, inFlight: false };
+    memoryCache.set(username, c);
+  }
+  if (!c.inFlight && now - c.refreshedAt >= MEMORY_REFRESH_MS) {
+    const entry = c;
+    entry.inFlight = true;
+    void readMemory(username)
+      .then((v) => {
+        entry.value = v;
+      })
+      .catch((err) => {
+        console.warn(`[${username}] snapshot memory read failed:`, err);
+      })
+      .finally(() => {
+        entry.refreshedAt = Date.now();
+        entry.inFlight = false;
+      });
+  }
+  return c.value;
+}
+
+async function readMemory(username: string): Promise<MemoryFields> {
+  let error: string | null = null;
+  let world: { pois: POI[]; containers: Container[]; deaths: Death[] } = { pois: [], containers: [], deaths: [] };
+  try {
+    world = await readWorldKnowledge(username);
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+  // Same tolerant loader the state stores use; missing / unreadable → null.
+  const convo = loadJson<{ entries?: ConversationEntry[] }>(memoryFileFor(username, "conversation.json"));
+  const entries = Array.isArray(convo?.entries) ? convo.entries : [];
+  const tasksRaw = loadJson<{ currentTask?: unknown; queued?: unknown }>(memoryFileFor(username, "tasks.json"));
+  const tasks = tasksRaw
+    ? {
+        currentTask: typeof tasksRaw.currentTask === "string" ? tasksRaw.currentTask : null,
+        queued: Array.isArray(tasksRaw.queued) ? tasksRaw.queued.filter((t): t is string => typeof t === "string") : [],
+      }
+    : null;
+  return {
+    refreshedAt: Date.now(),
+    pois: { count: world.pois.length, latest: newest(world.pois, (p) => p.timestamp) },
+    containers: { count: world.containers.length, latest: newest(world.containers, (c) => c.last_opened) },
+    deaths: { count: world.deaths.length, latest: newest(world.deaths, (d) => d.timestamp) },
+    conversation: { count: entries.length, tail: entries.slice(-CONVERSATION_TAIL) },
+    tasks,
+    error,
+  };
+}
+
+function newest<T>(items: T[], at: (t: T) => number): T[] {
+  return [...items].sort((a, b) => (at(b) ?? 0) - (at(a) ?? 0)).slice(0, MEMORY_LATEST);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
 import { equipItem } from "./inventory.js";
 import { resolveItem } from "./item-naming.js";
-import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { navigate } from "./navigation.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const BED_SEARCH_RADIUS = 32;
@@ -26,6 +26,7 @@ const FISH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — fish often take a while 
 const FOOD_PREFERENCE: ReadonlyArray<string> = [
   "cooked_beef",
   "cooked_porkchop",
+  "golden_carrot",
   "cooked_mutton",
   "cooked_salmon",
   "cooked_chicken",
@@ -119,10 +120,16 @@ export async function eat(bot: Bot, { item }: EatParams = {}): Promise<SkillResu
   };
 }
 
-function pickBestFood(bot: Bot): string | null {
+/**
+ * Best food in inventory per FOOD_PREFERENCE. `allowRottenFlesh: false` is
+ * used by the auto-eat reflex — it only falls back to rotten flesh when
+ * actually starving, which the caller decides.
+ */
+export function pickBestFood(bot: Bot, { allowRottenFlesh = true } = {}): string | null {
   const items = bot.inventory.items();
   const have = new Set(items.map((i) => i.name));
   for (const candidate of FOOD_PREFERENCE) {
+    if (!allowRottenFlesh && candidate === "rotten_flesh") continue;
     if (have.has(candidate)) return candidate;
   }
   return null;
@@ -221,14 +228,12 @@ export async function sleepIn(bot: Bot, { pos }: SleepInParams = {}): Promise<Sk
   if (!resolved.ok) return resolved;
   const { block, source } = resolved;
 
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
-  try {
-    await pBot.pathfinder.goto(new goals.GoalNear(block.position.x, block.position.y, block.position.z, BED_REACH));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `couldn't reach ${block.name} at ${fmt(block.position)} (${source}): ${message}` };
-  }
+  const nav = await navigate(
+    bot,
+    new goals.GoalNear(block.position.x, block.position.y, block.position.z, BED_REACH),
+    { label: `${block.name} at ${fmt(block.position)} (${source})`, target: block.position },
+  );
+  if (!nav.ok) return nav;
 
   try {
     await bot.sleep(block);

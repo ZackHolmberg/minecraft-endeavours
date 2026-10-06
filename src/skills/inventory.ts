@@ -4,9 +4,10 @@ import pathfinderPkg from "mineflayer-pathfinder";
 const { goals } = pathfinderPkg;
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
+import { getBotState } from "../state/index.js";
 import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
-import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { navigate } from "./navigation.js";
 import type { SkillResult } from "./types.js";
 
 const PICKUP_DEFAULT_RADIUS = 8;
@@ -57,7 +58,10 @@ export async function pickUpNearby(
   }
 
   let collected = 0;
+  const cancellation = getBotState(bot.username)?.cancellation;
   for (const target of targets) {
+    // Honour a stop between drops (also when called inside mineBlock(s)).
+    if (cancellation?.isRequested()) break;
     // Re-check that the item still exists — natural pickup may have already
     // claimed it while we were walking to a previous one.
     const stillThere = bot.entities[target.entityId];
@@ -243,19 +247,23 @@ export async function giveItemsTo(
     resolved.push({ name: r.normalized, itemId: r.data.id, want: entry.count });
   }
 
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
   const playerPos = playerInfo.entity.position;
-  try {
-    await pBot.pathfinder.goto(
-      new goals.GoalNear(playerPos.x, playerPos.y, playerPos.z, GIVE_DROP_REACH),
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `couldn't reach ${player} for handoff: ${message}` };
-  }
+  const nav = await navigate(
+    bot,
+    new goals.GoalNear(playerPos.x, playerPos.y, playerPos.z, GIVE_DROP_REACH),
+    { label: `${player} (for handoff)`, target: playerPos },
+  );
+  if (!nav.ok) return { ok: false, message: `gave nothing: ${nav.message}`, state: nav.state };
 
-  const liveEntity = bot.players[player]?.entity;
+  // Players rarely stand still during a walk-over; close the gap once more
+  // so the toss actually lands at their feet instead of short of them.
+  let liveEntity = bot.players[player]?.entity;
+  if (liveEntity && bot.entity.position.distanceTo(liveEntity.position) > GIVE_DROP_REACH + 1.5) {
+    const p = liveEntity.position;
+    // Best effort — on failure, toss from where we are.
+    await navigate(bot, new goals.GoalNear(p.x, p.y, p.z, GIVE_DROP_REACH), { label: player, target: p });
+    liveEntity = bot.players[player]?.entity;
+  }
   if (liveEntity) {
     try {
       await bot.lookAt(liveEntity.position.offset(0, liveEntity.height ?? 1.6, 0));

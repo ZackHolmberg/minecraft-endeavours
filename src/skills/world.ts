@@ -7,7 +7,11 @@ import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { pickUpNearby } from "./inventory.js";
 import { resolveBlock, resolveItem } from "./item-naming.js";
+import { navigate } from "./navigation.js";
 import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { PILLAR_MAX_HEIGHT, pillarUpBy, waitForGrounded } from "./pillar.js";
+import { builtStructureReason } from "./structure-guard.js";
+import { recordEvent } from "../observability/telemetry.js";
 import { getBotState } from "../state/index.js";
 import type { Coords, SkillResult } from "./types.js";
 
@@ -18,6 +22,9 @@ const MINE_BLOCKS_DEFAULT_MAX_COUNT = 32;
 const MINE_BLOCKS_MAX_COUNT_CAP = 128;
 const POST_DIG_PICKUP_RADIUS = 4;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
+// How many nearest matches to pull per scan so a protected (player-built)
+// nearest block doesn't hide an unprotected one just behind it.
+const CANDIDATE_SCAN_COUNT = 48;
 // Hard ceiling on a single dig. mineflayer resolves dig via a local
 // blockUpdate event; if the server rejects the dig (out of reach, wrong face)
 // no blockUpdate ever arrives and the promise hangs forever. Cap it so the
@@ -27,6 +34,11 @@ const DIG_TIMEOUT_MS = 30_000;
 // dig likely "succeeded" locally but the server didn't break the block.
 // Bail with a diagnostic message instead of looping forever.
 const SAME_BLOCK_RETRY_LIMIT = 2;
+
+const PLACE_REACH = 4.5;
+// Right-clicking these opens a UI / toggles state instead of placing on them.
+const INTERACTIVE_RE =
+  /chest|barrel|table|furnace|smoker|anvil|door|gate|bed|button|lever|shulker|hopper|dispenser|dropper|crafter|loom|stonecutter|grindstone|lectern|bell|note_block|jukebox|beacon|brewing|composter|cauldron|respawn_anchor|repeater|comparator|daylight|sign/;
 
 const FACE_OFFSETS: ReadonlyArray<{ vec: Vec3; label: string }> = [
   { vec: new Vec3(0, -1, 0), label: "bottom" },
@@ -40,6 +52,8 @@ const FACE_OFFSETS: ReadonlyArray<{ vec: Vec3; label: string }> = [
 export interface MineBlockParams {
   type: string;
   count?: number;
+  /** Also mine blocks that look like part of a player-built structure. Only when a player asked for demolition. */
+  allowStructures?: boolean;
 }
 
 /**
@@ -48,9 +62,9 @@ export interface MineBlockParams {
  */
 export async function mineBlock(
   bot: Bot,
-  { type, count = 1 }: MineBlockParams,
+  { type, count = 1, allowStructures = false }: MineBlockParams,
 ): Promise<SkillResult> {
-  return mineBlocks(bot, { types: [type], maxCount: count });
+  return mineBlocks(bot, { types: [type], maxCount: count, allowStructures });
 }
 
 export interface MineBlocksParams {
@@ -60,6 +74,8 @@ export interface MineBlocksParams {
   maxCount?: number;
   /** Search radius for any one block. Defaults to the 64-block standard. */
   maxDistance?: number;
+  /** Also mine blocks that look like part of a player-built structure. Only when a player asked for demolition. */
+  allowStructures?: boolean;
 }
 
 /**
@@ -77,6 +93,13 @@ export interface MineBlocksParams {
  * range mid-batch); `equipBestHarvestTool` is the safety net if a tool
  * mismatch surfaces at dig time.
  *
+ * Built-structure guard: candidates that look like part of a player build
+ * (see structure-guard.ts) are skipped unless `allowStructures` is set —
+ * this is what stops "can't path in → mine the wall" re-plans.
+ *
+ * Cancellable: checks the cancellation flag between blocks (and the walk to
+ * each block aborts on it too).
+ *
  * Failure model: a fatal mid-batch error (path failure, dig timeout, same-
  * block retry exhaustion) returns ok:false with `state.mined` (total) +
  * `state.byType` so the agent can re-plan. Running out of candidates is
@@ -88,6 +111,7 @@ export async function mineBlocks(
     types,
     maxCount = MINE_BLOCKS_DEFAULT_MAX_COUNT,
     maxDistance = SEARCH_RADIUS,
+    allowStructures = false,
   }: MineBlocksParams,
 ): Promise<SkillResult> {
   if (!Array.isArray(types) || types.length === 0) {
@@ -155,16 +179,31 @@ export async function mineBlocks(
       .filter((s) => !s.startsWith("0 ") || mineable.length === 1)
       .join(", ");
 
+  const cancellation = getBotState(bot.username)?.cancellation;
+  cancellation?.begin();
+
   let mined = 0;
   let lastTargetKey: string | null = null;
   let sameBlockRetries = 0;
+  // Positions refused by the structure guard, reported so the agent knows
+  // why "there's planks right there" didn't get mined.
+  const protectedSeen = new Map<string, { name: string; reason: string }>();
+  const protectedNote = (): string => {
+    if (protectedSeen.size === 0) return "";
+    const [pos, first] = protectedSeen.entries().next().value!;
+    return ` — left ${protectedSeen.size} block(s) alone because they look player-built (e.g. ${first.reason} at (${pos})); don't break into buildings, use the door. Pass allowStructures:true only if a player explicitly asked you to demolish them`;
+  };
 
   while (mined < maxCount) {
-    const block = bot.findBlock({
-      point: bot.entity.position,
-      matching: idList,
-      maxDistance,
-    });
+    if (cancellation?.isRequested()) {
+      return {
+        ok: mined > 0,
+        message: `mining cancelled after ${mined} block(s)${mined > 0 ? ` (${formatByType()})` : ""}`,
+        state: { mined, byType: minedByType, cancelled: true, position: posOf(bot) },
+      };
+    }
+
+    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen);
     if (!block) {
       const summary = formatByType();
       const skippedNote = skipped.length > 0
@@ -173,18 +212,18 @@ export async function mineBlocks(
       if (mined === 0) {
         return {
           ok: false,
-          message: types.length === 1
-            ? `no ${mineable[0]!.name} within ${maxDistance} blocks`
-            : `no mineable blocks within ${maxDistance} blocks${skippedNote}`,
-          state: { mined, byType: minedByType, skipped },
+          message: (types.length === 1
+            ? `no ${protectedSeen.size > 0 ? "minable " : ""}${mineable[0]!.name} within ${maxDistance} blocks`
+            : `no mineable blocks within ${maxDistance} blocks${skippedNote}`) + protectedNote(),
+          state: { mined, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, position: posOf(bot) },
         };
       }
       return {
         ok: true,
-        message: types.length === 1
+        message: (types.length === 1
           ? `mined ${mined} ${mineable[0]!.name}; no more within ${maxDistance} blocks`
-          : `mined ${mined} blocks (${summary}); no more within ${maxDistance} blocks${skippedNote}`,
-        state: { mined, byType: minedByType, skipped },
+          : `mined ${mined} blocks (${summary}); no more within ${maxDistance} blocks${skippedNote}`) + protectedNote(),
+        state: { mined, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, position: posOf(bot) },
       };
     }
 
@@ -214,13 +253,14 @@ export async function mineBlocks(
     const thisName = nameById.get(block.type) ?? block.name;
     const oneResult = await mineOneBlock(pBot, block, thisName);
     if (!oneResult.ok) {
+      if (cancellation?.isRequested()) continue; // loop top reports the cancel
       const summary = formatByType();
       return {
         ok: false,
         message: types.length === 1
           ? `${oneResult.message} (mined ${mined} of ${maxCount} so far)`
           : `${oneResult.message} (after ${mined} mined: ${summary})`,
-        state: { mined, byType: minedByType },
+        state: { mined, byType: minedByType, position: posOf(bot) },
       };
     }
 
@@ -237,8 +277,57 @@ export async function mineBlocks(
     message: types.length === 1
       ? `mined ${mined} ${mineable[0]!.name}`
       : `mined ${mined} blocks (${summary})${skippedNote}`,
-    state: { mined, byType: minedByType, skipped },
+    state: { mined, byType: minedByType, skipped, position: posOf(bot) },
   };
+}
+
+/**
+ * Nearest block of any `ids` that passes the built-structure guard (or the
+ * nearest outright when `allowStructures`). Refused positions are recorded in
+ * `protectedSeen` for the result message.
+ */
+function findMineCandidate(
+  bot: Bot,
+  ids: number[],
+  maxDistance: number,
+  allowStructures: boolean,
+  protectedSeen: Map<string, { name: string; reason: string }>,
+): Block | null {
+  if (allowStructures) {
+    return bot.findBlock({ point: bot.entity.position, matching: ids, maxDistance });
+  }
+  const positions = bot.findBlocks({
+    point: bot.entity.position,
+    matching: ids,
+    maxDistance,
+    count: CANDIDATE_SCAN_COUNT,
+  });
+  // Telemetry: count positions newly refused by this scan (repeat scans re-see them).
+  const seenBefore = protectedSeen.size;
+  let firstNew: string | null = null;
+  const reportSkips = (): void => {
+    const added = protectedSeen.size - seenBefore;
+    if (added > 0) recordEvent(bot.username, { kind: "structure_skip", block: firstNew ?? "unknown", skipped: added });
+  };
+  for (const pos of positions) {
+    const block = bot.blockAt(pos);
+    if (!block) continue;
+    const reason = builtStructureReason(bot, block);
+    if (!reason) {
+      reportSkips();
+      return block;
+    }
+    const k = `${pos.x}, ${pos.y}, ${pos.z}`;
+    if (firstNew === null && !protectedSeen.has(k)) firstNew = block.name;
+    protectedSeen.set(k, { name: block.name, reason });
+  }
+  reportSkips();
+  return null;
+}
+
+function posOf(bot: Bot): { x: number; y: number; z: number } {
+  const p = bot.entity.position;
+  return { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
 }
 
 /**
@@ -259,12 +348,15 @@ async function mineOneBlock(
 
   // Avoid the vanilla 5× mid-air dig penalty (prismarine-block applies
   // /5 when !bot.entity.onGround). First wait briefly in case pathfinder
-  // just landed; if still airborne, try to pillar up from a filler block
-  // so the dig runs at normal speed.
+  // just landed. If still not grounded it's almost always because the bot
+  // is wading/swimming; pillaring one filler block out of the water fixes
+  // the penalty. (On a ladder or mid-fall pillarUpBy refuses cleanly.)
   if (!bot.entity.onGround) {
     await waitForGrounded(bot, 800);
-    if (!bot.entity.onGround) {
-      const pillar = await tryPillarUp(bot);
+    const feet = bot.entity.position.floored();
+    const targetBelowFeet = block.position.x === feet.x && block.position.z === feet.z && block.position.y < feet.y;
+    if (!bot.entity.onGround && !targetBelowFeet) {
+      const pillar = await pillarUpBy(bot, 1);
       if (pillar.ok) {
         console.log(`[${bot.username}] pillared before dig: ${pillar.message}`);
       } else {
@@ -362,14 +454,15 @@ export async function placeBlocks(
     if (state?.cancellation.isRequested()) {
       return {
         ok: placed > 0,
-        message: `placeBlocks cancelled after ${placed}/${blocks.length} blocks`,
-        state: { placed, cancelled: true },
+        message: `placeBlocks cancelled after ${placed}/${blocks.length} blocks (next unplaced: index ${i})`,
+        state: { placed, cancelled: true, nextIndex: i },
       };
     }
 
     const entry = blocks[i]!;
     const result = await placeSingleBlock(bot, entry.type, entry.position);
     if (!result.ok) {
+      if (state?.cancellation.isRequested()) continue; // loop top reports the cancel
       return {
         ok: false,
         message: `placeBlocks failed at index ${i} (${entry.type} @ ${fmt(entry.position.x, entry.position.y, entry.position.z)}): ${result.message}`,
@@ -417,20 +510,27 @@ async function placeSingleBlock(
 
   // Pick a solid neighbor to click on. Prefer bottom (most natural for
   // standing-on-ground placement); fall through to sides; top last.
-  let reference: { block: Block; face: Vec3; label: string } | null = null;
+  // Interactive neighbours (chest, door, table…) are a last resort: right-
+  // clicking them opens/toggles instead of placing, so we sneak for those.
+  type Ref = { block: Block; face: Vec3; label: string };
+  let reference: Ref | null = null;
+  let fallback: Ref | null = null;
   for (const offset of FACE_OFFSETS) {
     const neighborPos = target.plus(offset.vec);
     const neighbor = bot.blockAt(neighborPos);
     if (!neighbor || neighbor.boundingBox !== "block") continue;
     // Face vector points from the reference block toward the target — the
     // opposite of the offset we used to find the neighbor.
-    reference = {
-      block: neighbor,
-      face: offset.vec.scaled(-1),
-      label: offset.label,
-    };
+    const candidate = { block: neighbor, face: offset.vec.scaled(-1), label: offset.label };
+    if (INTERACTIVE_RE.test(neighbor.name)) {
+      fallback ??= candidate;
+      continue;
+    }
+    reference = candidate;
     break;
   }
+  const sneakToPlace = !reference && fallback !== null;
+  reference ??= fallback;
   if (!reference) {
     return {
       ok: false,
@@ -439,16 +539,23 @@ async function placeSingleBlock(
   }
 
   // Walk close enough to click on the reference block (~3 blocks reach).
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
+  // Skip the walk when already in reach — avoids a pointless re-path (and the
+  // shuffle it causes) between every block of a placeBlocks batch.
   const refPos = reference.block.position;
-  try {
-    await pBot.pathfinder.goto(new goals.GoalNear(refPos.x, refPos.y, refPos.z, 3));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+  const eye = bot.entity.position.offset(0, bot.entity.height ?? 1.62, 0);
+  if (eye.distanceTo(refPos.offset(0.5, 0.5, 0.5)) > PLACE_REACH) {
+    const nav = await navigate(bot, new goals.GoalNear(refPos.x, refPos.y, refPos.z, 3), {
+      label: `a spot to place ${name} at ${fmt(target.x, target.y, target.z)}`,
+      target: refPos,
+    });
+    if (!nav.ok) return nav;
+  }
+
+  // Don't place a block into our own body (server rejects it anyway).
+  if (overlapsBot(bot, target)) {
     return {
       ok: false,
-      message: `couldn't reach a placing position for ${name} at ${fmt(target.x, target.y, target.z)}: ${message}`,
+      message: `can't place ${name} at ${fmt(target.x, target.y, target.z)}: the bot is standing in that cell — move first (or use pillarUp to place under yourself)`,
     };
   }
 
@@ -462,6 +569,7 @@ async function placeSingleBlock(
   }
 
   try {
+    if (sneakToPlace) bot.setControlState("sneak", true);
     await bot.placeBlock(reference.block, reference.face);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -469,6 +577,8 @@ async function placeSingleBlock(
       ok: false,
       message: `place failed at ${fmt(target.x, target.y, target.z)} (against ${reference.block.name} ${reference.label}): ${message}`,
     };
+  } finally {
+    if (sneakToPlace) bot.setControlState("sneak", false);
   }
 
   return {
@@ -476,6 +586,38 @@ async function placeSingleBlock(
     message: `placed ${name} at ${fmt(target.x, target.y, target.z)}`,
     state: { position: { x: target.x, y: target.y, z: target.z }, against: reference.block.name },
   };
+}
+
+export interface PillarUpParams {
+  /** Blocks to climb (1–32). */
+  height: number;
+}
+
+/**
+ * Climb straight up by jump-placing filler blocks (cobblestone, dirt, stone,
+ * …) under the bot — how a player gets out of a hole, onto a ledge, or up to
+ * a tree canopy. Cancellable between blocks. Leaves the pillar in place; the
+ * agent can mine it back down afterwards if it should be tidied up.
+ */
+export async function pillarUp(bot: Bot, { height }: PillarUpParams): Promise<SkillResult> {
+  if (!Number.isInteger(height) || height < 1 || height > PILLAR_MAX_HEIGHT) {
+    return { ok: false, message: `height must be an integer between 1 and ${PILLAR_MAX_HEIGHT}, got ${height}` };
+  }
+  const pBot = bot as BotWithPathfinder;
+  pBot.pathfinder?.setGoal(null); // pathfinder would fight the jump controls
+  getBotState(bot.username)?.cancellation.begin();
+  return pillarUpBy(bot, height);
+}
+
+/** True if the bot's hitbox (0.6 × 1.8) intersects the cell at `cell`. */
+function overlapsBot(bot: Bot, cell: Vec3): boolean {
+  const p = bot.entity.position;
+  const half = 0.3;
+  return (
+    p.x + half > cell.x && p.x - half < cell.x + 1 &&
+    p.z + half > cell.z && p.z - half < cell.z + 1 &&
+    p.y + 1.8 > cell.y && p.y < cell.y + 1
+  );
 }
 
 function checkHarvestability(bot: Bot, sample: Block): SkillResult {
@@ -503,6 +645,11 @@ function describeRequiredTool(block: Block): string {
   return "appropriate tool";
 }
 
+/**
+ * Walk to where `block` is visible and in reach. Never digs (canDig=false in
+ * pathfinder-config), so an enclosed target reports no-path rather than the
+ * bot tunnelling through whatever is in the way.
+ */
 async function pathToBlock(bot: BotWithPathfinder, block: Block): Promise<SkillResult> {
   const { x, y, z } = block.position;
   const goal = new goals.GoalLookAtBlock(block.position, bot.world);
@@ -510,13 +657,7 @@ async function pathToBlock(bot: BotWithPathfinder, block: Block): Promise<SkillR
   if (path.status === "noPath") {
     return { ok: false, message: `no path to ${block.name} at ${fmt(x, y, z)}` };
   }
-  try {
-    await bot.pathfinder.goto(goal);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `pathfinding to ${block.name} at ${fmt(x, y, z)} failed: ${message}` };
-  }
-  return { ok: true, message: "arrived" };
+  return navigate(bot, goal, { label: `${block.name} at ${fmt(x, y, z)}`, target: block.position.offset(0.5, 0.5, 0.5) });
 }
 
 /**
@@ -629,100 +770,6 @@ function describeDigSetup(bot: Bot, block: Block): DigDiagnostics {
  * the agent loop. Also calls bot.stopDigging so we don't leak the in-flight
  * dig into the next attempt.
  */
-/**
- * Poll `bot.entity.onGround` until true or timeout elapses. Useful right
- * after pathfinder returns — for a tick or three the bot may still be
- * mid-jump even though it's done moving, and any dig in that window incurs
- * the vanilla 5× speed penalty.
- */
-async function waitForGrounded(bot: Bot, timeoutMs: number): Promise<boolean> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (bot.entity.onGround) return true;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  return bot.entity.onGround;
-}
-
-const PILLAR_FILLER_PRIORITY = [
-  "cobblestone",
-  "cobbled_deepslate",
-  "dirt",
-  "netherrack",
-  "stone",
-  "sand",
-  "gravel",
-] as const;
-
-/**
- * Place a single filler block under the bot's feet so it stops being mid-air.
- * Standard pillar trick: look down, hold jump, place against the block one
- * level below the bot while at the apex. Best-effort — returns `ok: false`
- * (with a reason) when no filler is in inventory, no solid block sits within
- * reach below, or mineflayer's place call rejects. Caller proceeds either way.
- */
-async function tryPillarUp(bot: Bot): Promise<SkillResult> {
-  const items = bot.inventory.items();
-  let filler: Item | null = null;
-  for (const name of PILLAR_FILLER_PRIORITY) {
-    const found = items.find((i) => i.name === name);
-    if (found) {
-      filler = found;
-      break;
-    }
-  }
-  if (!filler) {
-    return { ok: false, message: "no filler block (cobblestone/dirt/etc.) in inventory" };
-  }
-
-  const feet = bot.entity.position;
-  const fx = Math.floor(feet.x);
-  const fz = Math.floor(feet.z);
-  // Find the nearest solid block within 3 below the bot's feet to click on.
-  let refBlock: Block | null = null;
-  for (let dy = 1; dy <= 3; dy++) {
-    const candidate = bot.blockAt(new Vec3(fx, Math.floor(feet.y) - dy, fz));
-    if (candidate && candidate.boundingBox === "block") {
-      refBlock = candidate;
-      break;
-    }
-  }
-  if (!refBlock) {
-    return { ok: false, message: "no solid block within 3 below feet to pillar from" };
-  }
-
-  if (bot.heldItem?.type !== filler.type) {
-    try {
-      await bot.equip(filler, "hand");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, message: `couldn't equip ${filler.name}: ${message}` };
-    }
-  }
-
-  try {
-    await bot.lookAt(refBlock.position.offset(0.5, 1.0, 0.5), true);
-  } catch {
-    // lookAt rarely throws; if it does, fall through to place attempt.
-  }
-
-  bot.setControlState("jump", true);
-  try {
-    // Give the bot a tick to leave the ground so the place lands above feet
-    // rather than rejecting as "occupied".
-    await new Promise((r) => setTimeout(r, 120));
-    await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
-  } catch (err) {
-    bot.setControlState("jump", false);
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `pillar place failed: ${message}` };
-  }
-  bot.setControlState("jump", false);
-
-  await waitForGrounded(bot, 600);
-  return { ok: true, message: `placed ${filler.name} under feet` };
-}
-
 async function digWithTimeout(bot: Bot, block: Block): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   try {

@@ -5,15 +5,20 @@ const { goals } = pathfinderPkg;
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
 import { resolveBlock } from "./item-naming.js";
+import { navigate } from "./navigation.js";
 import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 const DEFAULT_REACH = 1;
 const SEARCH_RADIUS_FOR_BLOCK = 64;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
-const FOLLOW_DEFAULT_DIST = 2;
+// 3 reads like a person tagging along; 2 has the bot stepping on heels and
+// shoving into the player every time they stop.
+const FOLLOW_DEFAULT_DIST = 3;
 const FOLLOW_MAX_DIST = 16;
 const FOLLOW_TICK_MS = 250;
+// Glance at the followed player while idle, like a person waiting would.
+const FOLLOW_LOOK_RANGE = 8;
 
 export interface GoToParams {
   target: GoToTarget;
@@ -31,24 +36,19 @@ export async function goTo(bot: Bot, { target, reach = DEFAULT_REACH }: GoToPara
   const { destination, label } = resolved;
   const goal = new goals.GoalNear(destination.x, destination.y, destination.z, reach);
 
+  // Quick reachability probe. getPathTo's first compute slice is ~40ms, so
+  // this only catches small enclosed search spaces (sealed room, island) —
+  // long trips come back "partial" and are judged by navigate's watchdog.
   const path = pBot.pathfinder.getPathTo(pBot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS);
   if (path.status === "noPath") {
     return { ok: false, message: `no path to ${label} at ${fmt(destination)}` };
   }
 
-  try {
-    await pBot.pathfinder.goto(goal);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `pathfinding to ${label} failed: ${message}` };
-  }
-
-  const arrived = bot.entity.position;
-  return {
-    ok: true,
-    message: `arrived near ${label} at ${fmt(destination)}`,
-    state: { position: { x: round2(arrived.x), y: round2(arrived.y), z: round2(arrived.z) } },
-  };
+  // No cancellation.begin() here: runSkill already resets the flag for a
+  // top-level goTo, and goTo is also called *inside* pickUpNearby (and so
+  // inside mineBlock / mineBlocks) — resetting here would wipe a stop meant
+  // for the enclosing batch skill.
+  return navigate(bot, goal, { label: `${label} at ${fmt(destination)}`, target: destination });
 }
 
 /**
@@ -107,6 +107,11 @@ export async function followPlayer(
       const current = bot.players[player]?.entity;
       if (!current) {
         return { ok: false, message: `lost sight of ${player} (left server or moved out of range)` };
+      }
+      // Pathfinder only steers while walking; when parked next to the player
+      // the bot would otherwise stare at whatever it last walked toward.
+      if (!pBot.pathfinder.isMoving() && current.position.distanceTo(bot.entity.position) <= FOLLOW_LOOK_RANGE) {
+        bot.lookAt(current.position.offset(0, current.height ?? 1.62, 0)).catch(() => {});
       }
       await sleep(FOLLOW_TICK_MS);
     }
@@ -169,6 +174,3 @@ function fmt(v: Vec3): string {
   return `(${Math.round(v.x)}, ${Math.round(v.y)}, ${Math.round(v.z)})`;
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}

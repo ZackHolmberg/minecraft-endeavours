@@ -4,9 +4,9 @@
  * `data/orchestrator/memory/<bot-username>/world.json`.
  *
  * Read by `observeSurroundings` to surface `knownStorage`, written by the
- * `remember` skill when a player names a location. Container snapshots and
- * automatic POI/death capture are deferred — wire them via mineflayer events
- * in a later phase. The file shape is forward-compatible with those additions.
+ * `remember` skill when a player names a location. Container snapshots,
+ * utility-block POIs, and deaths are auto-captured by mineflayer event hooks
+ * in `mineflayer-glue/event-hooks.ts`.
  *
  * Reads return `EMPTY` when the file doesn't exist yet, so callers never need
  * to special-case first-launch. Writes are atomic via tmp-then-rename to
@@ -82,9 +82,32 @@ export async function readWorldKnowledge(username: string): Promise<WorldKnowled
       deaths: parsed.deaths ?? [],
     };
   } catch (err) {
+    // Set the bad file aside and start fresh rather than failing every
+    // read/write forever (matches conversation-log / persist behavior).
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`world.json for ${username} is malformed: ${message}`);
+    const aside = `${path}.corrupt-${Date.now()}`;
+    console.warn(`world.json for ${username} is malformed (${message}); moved to ${aside}, starting fresh`);
+    await rename(path, aside).catch(() => {});
+    return structuredClone(EMPTY);
   }
+}
+
+/**
+ * Per-bot write serialization. Every mutator below is read-modify-write on
+ * the whole file, and several fire concurrently (the 5s utility scan, the
+ * windowClose container snapshot, `remember`, death capture). Without a lock
+ * two writers read the same base, the later rename wins, and the other's
+ * update is silently lost — or both share the `.tmp` path and the second
+ * rename throws ENOENT. Chaining mutations per username fixes both.
+ */
+const writeChains = new Map<string, Promise<unknown>>();
+
+function withWorldLock<T>(username: string, fn: () => Promise<T>): Promise<T> {
+  const prev = writeChains.get(username) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  // Keep the chain alive regardless of this step's outcome.
+  writeChains.set(username, next.catch(() => undefined));
+  return next;
 }
 
 export async function writeWorldKnowledge(username: string, world: WorldKnowledge): Promise<void> {
@@ -111,26 +134,49 @@ export async function addPoi(
   username: string,
   input: AddPoiInput,
 ): Promise<{ added: boolean; existing?: POI }> {
-  const world = await readWorldKnowledge(username);
-  const existing = world.pois.find(
-    (p) =>
-      p.type === input.type &&
-      p.position.x === input.position.x &&
-      p.position.y === input.position.y &&
-      p.position.z === input.position.z,
-  );
-  if (existing) return { added: false, existing };
+  const [result] = await addPois(username, [input]);
+  return result!;
+}
 
-  const poi: POI = {
-    type: input.type,
-    position: input.position,
-    timestamp: Date.now(),
-    source: input.source,
-  };
-  if (input.name !== undefined) poi.name = input.name;
-  world.pois.push(poi);
-  await writeWorldKnowledge(username, world);
-  return { added: true };
+/**
+ * Batch form of {@link addPoi}: one read + at most one write for the whole
+ * list. Used by the utility-block proximity scan, which can see dozens of
+ * blocks per tick and used to do a full read/write cycle per block.
+ */
+export async function addPois(
+  username: string,
+  inputs: AddPoiInput[],
+): Promise<Array<{ added: boolean; existing?: POI }>> {
+  return withWorldLock(username, async () => {
+    const world = await readWorldKnowledge(username);
+    const results: Array<{ added: boolean; existing?: POI }> = [];
+    let dirty = false;
+    for (const input of inputs) {
+      const existing = world.pois.find(
+        (p) =>
+          p.type === input.type &&
+          p.position.x === input.position.x &&
+          p.position.y === input.position.y &&
+          p.position.z === input.position.z,
+      );
+      if (existing) {
+        results.push({ added: false, existing });
+        continue;
+      }
+      const poi: POI = {
+        type: input.type,
+        position: input.position,
+        timestamp: Date.now(),
+        source: input.source,
+      };
+      if (input.name !== undefined) poi.name = input.name;
+      world.pois.push(poi);
+      dirty = true;
+      results.push({ added: true });
+    }
+    if (dirty) await writeWorldKnowledge(username, world);
+    return results;
+  });
 }
 
 export interface UpsertContainerInput {
@@ -150,27 +196,45 @@ export async function upsertContainer(
   username: string,
   input: UpsertContainerInput,
 ): Promise<{ created: boolean }> {
-  const world = await readWorldKnowledge(username);
-  const idx = world.containers.findIndex(
-    (c) =>
-      c.position.x === input.position.x &&
-      c.position.y === input.position.y &&
-      c.position.z === input.position.z,
-  );
-  const record: Container = {
-    type: input.type,
-    position: input.position,
-    last_opened: Date.now(),
-    last_opened_by: input.openedBy,
-    contents: input.contents,
-  };
-  if (idx >= 0) {
-    world.containers[idx] = record;
-  } else {
-    world.containers.push(record);
-  }
-  await writeWorldKnowledge(username, world);
-  return { created: idx < 0 };
+  return withWorldLock(username, async () => {
+    const world = await readWorldKnowledge(username);
+    const idx = world.containers.findIndex(
+      (c) =>
+        c.position.x === input.position.x &&
+        c.position.y === input.position.y &&
+        c.position.z === input.position.z,
+    );
+    const record: Container = {
+      type: input.type,
+      position: input.position,
+      last_opened: Date.now(),
+      last_opened_by: input.openedBy,
+      contents: input.contents,
+    };
+    if (idx >= 0) {
+      world.containers[idx] = record;
+    } else {
+      world.containers.push(record);
+    }
+    await writeWorldKnowledge(username, world);
+    return { created: idx < 0 };
+  });
+}
+
+/** Most recent deaths kept on disk — older ones are noise for the agent. */
+const MAX_DEATHS = 20;
+
+/**
+ * Append a death record (auto-captured by the `death` hook in
+ * `mineflayer-glue/event-hooks.ts`). Trimmed to the newest {@link MAX_DEATHS}.
+ */
+export async function addDeath(username: string, death: Death): Promise<void> {
+  await withWorldLock(username, async () => {
+    const world = await readWorldKnowledge(username);
+    world.deaths.push(death);
+    if (world.deaths.length > MAX_DEATHS) world.deaths = world.deaths.slice(-MAX_DEATHS);
+    await writeWorldKnowledge(username, world);
+  });
 }
 
 /**

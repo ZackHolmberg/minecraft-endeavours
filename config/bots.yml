@@ -1,21 +1,17 @@
 bots:
-  # TEMPORARY: Steve_AI flipped to hybrid for the Phase C live test.
-  # Requires the model server up first: ./scripts/llmStart.sh
-  # To revert to the plain Claude bot, restore:
-  #   - username: Steve_AI
-  #     model_hint: sonnet
-  #     backend: claude
+  # Steve_AI runs on Claude Haiku via the plain Claude backend — the standing
+  # default for the foreseeable future. Don't switch to the local model
+  # (backend: local / hybrid) or another Claude tier without sign-off.
   - username: Steve_AI
-    backend: hybrid
-    planner:
-      model_hint: sonnet     # Claude tier that plans (default sonnet; opus for heavier planning)
-    executor:
-      baseUrl: http://127.0.0.1:8080/v1
-      model: mlx-community/Qwen3-8B-4bit
+    model_hint: haiku
+    backend: claude
+    session_mode: per_task   # fresh Haiku session per task; `persistent` = one long-lived session (rollback)
 
-# To run a bot on the local model directly (executor only, no planner):
-#   - username: Qwen_AI
-#     backend: local
-#     local:
+# Not in use — kept for reference. Hybrid (Claude plans / Qwen executes):
+#   - username: Steve_AI
+#     backend: hybrid
+#     planner:
+#       model_hint: sonnet
+#     executor:
 #       baseUrl: http://127.0.0.1:8080/v1
 #       model: mlx-community/Qwen3-8B-4bit

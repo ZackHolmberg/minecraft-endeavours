@@ -76,6 +76,8 @@ export interface ObserveSurroundingsState {
     name?: string;
   }>;
   recentActions: string[];
+  /** Most recent death (auto-captured), so "go get my stuff" has a target. */
+  lastDeath: { pos: { x: number; y: number; z: number }; cause: string; minutesAgo: number } | null;
   recentlySeenPlayers: Array<{ name: string; lastSeen: number; lastPos: { x: number; y: number; z: number } | null }>;
   currentTask: string | null;
   remainingTasks: string[];
@@ -199,11 +201,20 @@ export async function observeSurroundings(
       knownUtilities,
       knownWaypoints,
       recentActions: botState?.actions.recent() ?? [],
+      lastDeath: summarizeLastDeath(world.deaths),
       recentlySeenPlayers: botState?.presence.recentlySeen() ?? [],
       currentTask: botState?.tasks.current() ?? null,
       remainingTasks: botState?.tasks.remaining() ?? [],
     },
   };
+}
+
+function summarizeLastDeath(
+  deaths: Array<{ position: { x: number; y: number; z: number }; cause: string; timestamp: number }>,
+): ObserveSurroundingsState["lastDeath"] {
+  const d = deaths[deaths.length - 1];
+  if (!d) return null;
+  return { pos: d.position, cause: d.cause, minutesAgo: Math.round((Date.now() - d.timestamp) / 60_000) };
 }
 
 function collectNoteworthyBlockIds(bot: Bot): number[] {
@@ -346,15 +357,16 @@ function collectDroppedItems(bot: Bot, radius: number): ObserveSurroundingsState
 
 function yawToCardinal(yawRad: number): string {
   const deg = ((yawRad * 180) / Math.PI + 360) % 360;
-  // Yaw 0 = south, +90 = west, 180 = north, 270 = east.
-  if (deg < 22.5 || deg >= 337.5) return "south";
-  if (deg < 67.5) return "south-west";
+  // mineflayer yaw = π − notchian yaw: 0 = north (−Z), +90° = west,
+  // 180° = south, 270° = east (see mineflayer/lib/conversions.js).
+  if (deg < 22.5 || deg >= 337.5) return "north";
+  if (deg < 67.5) return "north-west";
   if (deg < 112.5) return "west";
-  if (deg < 157.5) return "north-west";
-  if (deg < 202.5) return "north";
-  if (deg < 247.5) return "north-east";
+  if (deg < 157.5) return "south-west";
+  if (deg < 202.5) return "south";
+  if (deg < 247.5) return "south-east";
   if (deg < 292.5) return "east";
-  return "south-east";
+  return "north-east";
 }
 
 function timePhase(timeOfDay: number): "day" | "night" | "dusk" | "dawn" {

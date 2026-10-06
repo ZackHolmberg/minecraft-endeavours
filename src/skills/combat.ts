@@ -10,16 +10,37 @@ import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js"
 import type { SkillResult } from "./types.js";
 
 const ATTACK_REACH = 3;
-const ATTACK_COOLDOWN_MS = 600;
 const ATTACK_TICK_MS = 100;
+/** Hard ceiling on one attack call so an unreachable target can't pin the turn. */
+const ATTACK_MAX_MS = 90_000;
+/** Give up if we've been unable to land a swing for this long. */
+const ATTACK_NO_SWING_MS = 20_000;
+/** Break off a fight with a mob at or below this health (out of 20). */
+const ATTACK_LOW_HEALTH = 6;
 const FLEE_DEFAULT_DIST = 16;
 const FLEE_MAX_DIST = 64;
 const FLEE_TICK_MS = 250;
 const FLEE_REPATH_INTERVAL_MS = 1_500;
+const FLEE_MAX_MS = 45_000;
 
 // Rough tier ordering — later entries are stronger. Used to pick the best
 // available weapon when entering combat.
 const WEAPON_TIERS = ["wooden", "stone", "golden", "iron", "diamond", "netherite"];
+
+/**
+ * Full-charge swing interval for the held item (vanilla attack speed:
+ * sword 1.6/s, axes ~0.8–1.0/s, hand 4/s — we use the hand as "anything
+ * else" since the slowest non-weapon is still faster than 1/s). Swinging
+ * before the cooldown refills deals proportionally less damage.
+ */
+export function swingCooldownMs(heldName: string | undefined): number {
+  if (!heldName) return 300;
+  if (heldName.endsWith("_sword")) return 650;
+  if (heldName.endsWith("_axe")) {
+    return heldName.startsWith("wooden_") || heldName.startsWith("stone_") ? 1_300 : 1_050;
+  }
+  return 300;
+}
 
 
 export interface AttackParams {
@@ -58,8 +79,12 @@ export async function attack(bot: Bot, { entity }: AttackParams): Promise<SkillR
 
   pBot.pathfinder.setGoal(new goals.GoalFollow(target, ATTACK_REACH - 1), true);
 
+  const isPlayerTarget = target.type === "player";
+  const cooldownMs = swingCooldownMs(bot.heldItem?.name);
+  const startedAt = Date.now();
   let swings = 0;
   let lastSwingAt = 0;
+  let lastDist = bot.entity.position.distanceTo(target.position);
   try {
     while (true) {
       if (state?.cancellation.isRequested()) {
@@ -71,20 +96,48 @@ export async function attack(bot: Bot, { entity }: AttackParams): Promise<SkillR
       }
       const live = bot.entities[target.id];
       if (!live || !live.isValid) {
+        // Entities also vanish when they walk out of tracking range; only
+        // call it a kill if they were close when they disappeared.
+        const killed = lastDist <= ATTACK_REACH + 3;
         return {
           ok: true,
-          message: `killed ${entity} after ${swings} swing(s)`,
-          state: { swings, killed: true },
+          message: killed
+            ? `killed ${entity} after ${swings} swing(s)`
+            : `lost track of ${entity} (~${Math.round(lastDist)} blocks away) after ${swings} swing(s)`,
+          state: { swings, killed },
+        };
+      }
+      const now = Date.now();
+      if (!isPlayerTarget && bot.health <= ATTACK_LOW_HEALTH) {
+        return {
+          ok: false,
+          message: `broke off attacking ${entity}: my health is ${Math.round(bot.health)}/20 — flee from it, then eat`,
+          state: { swings, lowHealth: true },
+        };
+      }
+      if (now - startedAt > ATTACK_MAX_MS) {
+        return { ok: false, message: `gave up attacking ${entity} after ${ATTACK_MAX_MS / 1000}s (${swings} swing(s))`, state: { swings } };
+      }
+      if (now - Math.max(lastSwingAt, startedAt) > ATTACK_NO_SWING_MS) {
+        return {
+          ok: false,
+          message: `couldn't get within reach of ${entity} for ${ATTACK_NO_SWING_MS / 1000}s (${Math.round(lastDist)} blocks away) — it may be unreachable`,
+          state: { swings },
         };
       }
       const dist = bot.entity.position.distanceTo(live.position);
-      if (dist <= ATTACK_REACH) {
-        const now = Date.now();
-        if (now - lastSwingAt >= ATTACK_COOLDOWN_MS) {
-          bot.attack(live);
-          swings += 1;
-          lastSwingAt = now;
+      lastDist = dist;
+      if (dist <= ATTACK_REACH && now - lastSwingAt >= cooldownMs) {
+        // Face the target like a player would; the server doesn't require
+        // it, but a bot hitting things behind its back looks broken.
+        try {
+          await bot.lookAt(live.position.offset(0, (live.height ?? 1.6) * 0.8, 0), true);
+        } catch {
+          /* cosmetic */
         }
+        bot.attack(live);
+        swings += 1;
+        lastSwingAt = now;
       }
       await sleep(ATTACK_TICK_MS);
     }
@@ -119,8 +172,17 @@ export async function flee(bot: Bot, { from, dist = FLEE_DEFAULT_DIST }: FleePar
   ensureMovements(pBot);
 
   let lastRepath = 0;
+  const startedAt = Date.now();
   try {
     while (true) {
+      if (Date.now() - startedAt > FLEE_MAX_MS) {
+        const sep = Math.round(bot.entity.position.distanceTo(threat.position));
+        return {
+          ok: false,
+          message: `couldn't open ${dist} blocks from ${from} within ${FLEE_MAX_MS / 1000}s (now ${sep}) — I may be cornered; fight or try another direction`,
+          state: { separation: sep },
+        };
+      }
       if (state?.cancellation.isRequested()) {
         const sep = Math.round(bot.entity.position.distanceTo(threat.position));
         return {
@@ -144,8 +206,10 @@ export async function flee(bot: Bot, { from, dist = FLEE_DEFAULT_DIST }: FleePar
 
       const now = Date.now();
       if (now - lastRepath >= FLEE_REPATH_INTERVAL_MS) {
+        // XZ-only goal: a fixed Y on hilly terrain is often unreachable and
+        // the pathfinder would just stand still.
         const away = awayPoint(bot.entity.position, live.position, dist);
-        pBot.pathfinder.setGoal(new goals.GoalNear(away.x, away.y, away.z, 1), false);
+        pBot.pathfinder.setGoal(new goals.GoalNearXZ(away.x, away.z, 2), false);
         lastRepath = now;
       }
 
@@ -169,7 +233,7 @@ function awayPoint(me: Vec3, threat: Vec3, dist: number): Vec3 {
   return new Vec3(me.x + ux * dist, me.y, me.z + uz * dist);
 }
 
-function pickBestWeapon(bot: Bot): Item | null {
+export function pickBestWeapon(bot: Bot): Item | null {
   const items = bot.inventory.items();
   let best: { item: Item; rank: number } | null = null;
   for (const item of items) {

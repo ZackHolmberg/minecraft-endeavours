@@ -3,7 +3,7 @@ export { runSkill } from "./harness.js";
 export { say, whisper } from "./chat.js";
 export { observeSurroundings, type ObserveSurroundingsState } from "./perception.js";
 export { goTo, stop, followPlayer } from "./movement.js";
-export { mineBlock, mineBlocks, placeBlock, placeBlocks } from "./world.js";
+export { mineBlock, mineBlocks, placeBlock, placeBlocks, pillarUp } from "./world.js";
 export {
   pickUpNearby,
   dropItem,

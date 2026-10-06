@@ -11,13 +11,21 @@
 export class CurrentToolTracker {
   private name: string | null = null;
   private since: number | null = null;
+  private token = 0;
 
-  begin(name: string): void {
+  /**
+   * Returns a token for {@link end}. A skill abandoned by a closed per-task
+   * session can finish after the next task's skill has begun; the token keeps
+   * its late `end()` from clearing the newer skill's entry.
+   */
+  begin(name: string): number {
     this.name = name;
     this.since = Date.now();
+    return ++this.token;
   }
 
-  end(): void {
+  end(token?: number): void {
+    if (token !== undefined && token !== this.token) return;
     this.name = null;
     this.since = null;
   }

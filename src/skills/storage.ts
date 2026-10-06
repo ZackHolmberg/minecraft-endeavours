@@ -7,7 +7,7 @@ import { Vec3 } from "vec3";
 import { noteContainerOpening } from "../mineflayer-glue/event-hooks.js";
 import { readWorldKnowledge, type Container } from "../memory/world-knowledge.js";
 import { resolveItem } from "./item-naming.js";
-import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { navigate } from "./navigation.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const CONTAINER_BLOCK_TYPES = new Set([
@@ -18,6 +18,8 @@ const CONTAINER_BLOCK_TYPES = new Set([
 ]);
 
 const CHEST_REACH = 2;
+/** Live scan radius for a chest in plain sight when memory has nothing closer. */
+const CHEST_SEARCH_RADIUS = 16;
 
 export interface DepositToChestParams {
   item: string;
@@ -115,7 +117,8 @@ export async function depositManyToChest(
         await chest.deposit(r.itemId, null, r.want);
         deposited.push({ item: r.name, count: r.want });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const raw = err instanceof Error ? err.message : String(err);
+        const message = /full/i.test(raw) ? `${block.name} is full — deposit into another chest (pass pos) or place a new chest` : raw;
         return {
           ok: false,
           message: `depositManyToChest failed at items[${i}] (${r.name}) after depositing ${deposited.length} of ${resolved.length}: ${message}`,
@@ -231,7 +234,8 @@ export async function withdrawManyFromChest(
           partialNotes.push(`${r.name}: requested ${r.want}, got ${take}`);
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const raw = err instanceof Error ? err.message : String(err);
+        const message = /full/i.test(raw) ? "my inventory is full — deposit or drop something first" : raw;
         return {
           ok: false,
           message: `withdrawManyFromChest failed at items[${i}] (${r.name}) after withdrawing ${withdrawn.length} of ${resolved.length}: ${message}`,
@@ -255,7 +259,7 @@ export async function withdrawManyFromChest(
 }
 
 type ResolveResult =
-  | { ok: true; block: Block; source: "caller" | "nearest known" | "known with item" }
+  | { ok: true; block: Block; source: "caller" | "nearest known" | "known with item" | "nearby" | "nearby, contents unknown" }
   | { ok: false; message: string };
 
 async function resolveChestBlock(
@@ -279,12 +283,16 @@ async function resolveChestBlock(
   }
 
   const world = await readWorldKnowledge(bot.username);
+  const nearby = findNearbyContainer(bot);
+  const isKnown = (b: Block): boolean =>
+    world.containers.some((c) => c.position.x === b.position.x && c.position.y === b.position.y && c.position.z === b.position.z);
+
   if (world.containers.length === 0) {
+    // Nothing remembered yet — use a chest in plain sight, like a player would.
+    if (nearby) return { ok: true, block: nearby, source: intent === "withdraw" ? "nearby, contents unknown" : "nearby" };
     return {
       ok: false,
-      message: intent === "withdraw"
-        ? `no known containers; open a chest at least once so I can remember its contents, or pass an explicit pos`
-        : `no known containers; pass an explicit pos for the chest to deposit into`,
+      message: `no chest within ${CHEST_SEARCH_RADIUS} blocks and none remembered; walk to one or pass an explicit pos${intent === "deposit" ? " (or craft + place a chest: 8 planks)" : ""}`,
     };
   }
 
@@ -298,6 +306,8 @@ async function resolveChestBlock(
       (entry.c.contents ?? []).some((row) => row.item === itemForWithdraw && row.count > 0),
     );
     if (candidates.length === 0) {
+      // An unopened chest nearby might have it — worth one look.
+      if (nearby && !isKnown(nearby)) return { ok: true, block: nearby, source: "nearby, contents unknown" };
       return {
         ok: false,
         message: `no remembered container holds ${itemForWithdraw}; pass an explicit pos or gather fresh`,
@@ -307,6 +317,10 @@ async function resolveChestBlock(
 
   candidates.sort((a, b) => a.dist - b.dist);
   const pick = candidates[0]!;
+  // For deposits, a chest right here beats a remembered one across the base.
+  if (intent === "deposit" && nearby && bot.entity.position.distanceTo(nearby.position) < pick.dist) {
+    return { ok: true, block: nearby, source: "nearby" };
+  }
   const block = bot.blockAt(new Vec3(pick.c.position.x, pick.c.position.y, pick.c.position.z));
   if (!block) {
     return {
@@ -327,17 +341,20 @@ async function resolveChestBlock(
   };
 }
 
+function findNearbyContainer(bot: Bot): Block | null {
+  const ids = [...CONTAINER_BLOCK_TYPES]
+    .map((n) => bot.registry.blocksByName[n]?.id)
+    .filter((id): id is number => id !== undefined);
+  if (ids.length === 0) return null;
+  return bot.findBlock({ point: bot.entity.position, matching: ids, maxDistance: CHEST_SEARCH_RADIUS });
+}
+
 async function walkToChest(bot: Bot, block: Block): Promise<SkillResult> {
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
   const { x, y, z } = block.position;
-  try {
-    await pBot.pathfinder.goto(new goals.GoalNear(x, y, z, CHEST_REACH));
-    return { ok: true, message: "arrived" };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `couldn't reach ${block.name} at ${fmt(block.position)}: ${message}` };
-  }
+  return navigate(bot, new goals.GoalNear(x, y, z, CHEST_REACH), {
+    label: `${block.name} at ${fmt(block.position)}`,
+    target: block.position,
+  });
 }
 
 function fmt(v: { x: number; y: number; z: number }): string {

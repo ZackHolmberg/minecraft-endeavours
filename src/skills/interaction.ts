@@ -5,7 +5,7 @@ const { goals } = pathfinderPkg;
 import type { Entity } from "prismarine-entity";
 import { Vec3 } from "vec3";
 import { equipItem } from "./inventory.js";
-import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { navigate } from "./navigation.js";
 import type { Coords, SkillResult } from "./types.js";
 
 const BLOCK_REACH = 3;
@@ -47,14 +47,11 @@ export async function activateBlock(
     return { ok: false, message: `block at ${fmt(target)} is air — nothing to activate` };
   }
 
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
-  try {
-    await pBot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, BLOCK_REACH));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `couldn't reach ${block.name} at ${fmt(target)}: ${message}` };
-  }
+  const nav = await navigate(bot, new goals.GoalNear(target.x, target.y, target.z, BLOCK_REACH), {
+    label: `${block.name} at ${fmt(target)}`,
+    target,
+  });
+  if (!nav.ok) return nav;
 
   if (withItem) {
     const equip = await equipItem(bot, { item: withItem, slot: "hand" });
@@ -145,19 +142,15 @@ export async function useOnEntity(
   const target = findEntityByName(bot, entity);
   if (!target) return { ok: false, message: `entity "${entity}" not visible to the bot` };
 
-  const pBot = bot as BotWithPathfinder;
-  ensureMovements(pBot);
-
   // Walk close enough to interact (~3 blocks reach). Use a static GoalNear
   // around the entity's current position rather than GoalFollow — mobs that
   // wander would otherwise turn this into a chase.
   const pos = target.position;
-  try {
-    await pBot.pathfinder.goto(new goals.GoalNear(pos.x, pos.y, pos.z, ENTITY_REACH));
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `couldn't reach ${entity}: ${message}` };
-  }
+  const nav = await navigate(bot, new goals.GoalNear(pos.x, pos.y, pos.z, ENTITY_REACH), {
+    label: entity,
+    target: pos,
+  });
+  if (!nav.ok) return nav;
 
   if (withItem) {
     const equip = await equipItem(bot, { item: withItem, slot: "hand" });

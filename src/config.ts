@@ -8,14 +8,19 @@ import type {
   HybridConfig,
   LocalModelConfig,
   ModelHint,
+  SessionMode,
 } from "./types.js";
 
 const VALID_MODEL_HINTS: readonly ModelHint[] = ["sonnet", "haiku", "opus"];
 const VALID_BACKENDS: readonly BackendKind[] = ["claude", "local", "hybrid"];
 const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 
-const DEFAULT_MODEL_HINT: ModelHint = "sonnet";
+const DEFAULT_MODEL_HINT: ModelHint = "haiku";
 const DEFAULT_BACKEND: BackendKind = "claude";
+const VALID_SESSION_MODES: readonly SessionMode[] = ["per_task", "persistent"];
+// Fresh Claude session per player request, context injected from disk. See
+// ClaudeBackend header and src/memory/conversation-log.ts.
+const DEFAULT_SESSION_MODE: SessionMode = "per_task";
 // Local defaults: mlx_lm.server on 127.0.0.1:8080. Qwen3-8B-4bit (~4.3GB) is the
 // default over 14B (~8GB) — faster prompt-processing and enough GPU headroom on
 // the 24GB box to avoid the recurring Metal-OOM aborts we hit under load with
@@ -102,7 +107,22 @@ function parseBot(entry: unknown, index: number, path: string): BotConfig {
     backend = backendRaw as BackendKind;
   }
 
-  const bot: BotConfig = { username, model_hint, backend };
+  // session_mode is optional — only meaningful for the claude backend.
+  const sessionModeRaw = obj.session_mode;
+  let session_mode: SessionMode = DEFAULT_SESSION_MODE;
+  if (sessionModeRaw !== undefined) {
+    if (
+      typeof sessionModeRaw !== "string" ||
+      !VALID_SESSION_MODES.includes(sessionModeRaw as SessionMode)
+    ) {
+      throw new Error(
+        `${path}: bots[${index}].session_mode must be one of ${VALID_SESSION_MODES.join(", ")}`,
+      );
+    }
+    session_mode = sessionModeRaw as SessionMode;
+  }
+
+  const bot: BotConfig = { username, model_hint, backend, session_mode };
   if (backend === "local") {
     bot.local = parseLocal(obj.local, index, path);
   }

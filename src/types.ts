@@ -6,6 +6,14 @@ export type ModelHint = "sonnet" | "haiku" | "opus";
  */
 export type BackendKind = "claude" | "local" | "hybrid";
 
+/**
+ * How the Claude backend scopes SDK sessions. `per_task` (default): a fresh
+ * session per player request, with all context injected from disk + live
+ * state. `persistent`: one long-lived streaming session per bot (the original
+ * design; conversation lives in SDK memory).
+ */
+export type SessionMode = "per_task" | "persistent";
+
 /** Connection details for a local `mlx_lm.server`-hosted model. */
 export interface LocalModelConfig {
   /** OpenAI-compatible base URL, e.g. `http://127.0.0.1:8080/v1`. */
@@ -28,6 +36,8 @@ export interface BotConfig {
   model_hint: ModelHint;
   /** Which backend drives this bot. Defaults to `"claude"` (unchanged behavior). */
   backend: BackendKind;
+  /** Claude backend session scoping. Defaults to `"per_task"`. */
+  session_mode: SessionMode;
   /** Present when `backend === "local"`. */
   local?: LocalModelConfig;
   /** Present when `backend === "hybrid"`. */

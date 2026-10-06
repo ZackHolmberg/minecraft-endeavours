@@ -3,7 +3,9 @@ import {
   getCurrentConversationPartner,
   noteBotQuestionedPlayer,
 } from "../orchestrator/chat-router.js";
+import { clip, recordEvent, summarizeArgs } from "../observability/telemetry.js";
 import { getBotState } from "../state/index.js";
+import { awaitReflexIdle } from "./auto-behaviors.js";
 import type { SkillResult } from "./types.js";
 
 /**
@@ -28,6 +30,15 @@ const RESULT_LOG_DENYLIST = new Set(["observeSurroundings", "checkInventory"]);
 const MAX_RESULT_LOG_CHARS = 220;
 
 /**
+ * Last-resort ceiling on a single skill call. Individual skills carry their
+ * own tighter timeouts; this only exists so a hung mineflayer promise (a
+ * window that never opens, a pathfinder goal that never resolves) can't pin
+ * the agent's turn forever. `followPlayer` is indefinite by design.
+ */
+const SKILL_WATCHDOG_MS = 10 * 60 * 1000;
+const WATCHDOG_EXEMPT = new Set(["followPlayer"]);
+
+/**
  * Wrap a skill in a try/catch so unexpected exceptions become
  * `{ ok: false, message }` results instead of taking down the bot, and
  * record successful results to the bot's recent-actions log.
@@ -44,18 +55,54 @@ export async function runSkill<P, R extends SkillResult>(
   fn: (params: P) => Promise<R>,
 ): Promise<SkillResult> {
   const state = getBotState(bot.username);
-  state?.currentTool.begin(name);
+  // Don't let a skill's equip / window clicks interleave with an in-flight
+  // reflex (auto-eat, armor, defensive swing). `stop` touches no inventory
+  // and must not be delayed by a reflex.
+  if (name !== "stop") await awaitReflexIdle(bot.username);
+  // Every skill starts with a clean stop flag. Without this a "stop" that
+  // ended one skill (or a death) stays latched and the next skill's
+  // `navigate` aborts instantly as "cancelled". `stop` itself is exempt.
+  if (name !== "stop") state?.cancellation.begin();
+  // A side-channel `stop` (NpcAgent.maybeInterrupt) runs while another skill
+  // is still in flight. It must not overwrite / clear that skill's entry:
+  // the per-task backend's waitForToolIdle and the reflexes key off it.
+  const trackTool = !(name === "stop" && state?.currentTool.current());
+  const toolToken = trackTool ? state?.currentTool.begin(name) : undefined;
 
   let result: SkillResult;
+  let watchdog: NodeJS.Timeout | null = null;
+  let watchdogFired = false;
+  const startedAt = Date.now();
   try {
-    result = await fn(params);
+    const run = fn(params);
+    if (WATCHDOG_EXEMPT.has(name)) {
+      result = await run;
+    } else {
+      const timedOut = new Promise<SkillResult>((resolve) => {
+        watchdog = setTimeout(() => {
+          watchdogFired = true;
+          // Ask the skill to wind down and halt movement; the original
+          // promise is abandoned (it can't be force-cancelled).
+          state?.cancellation.request();
+          (bot as Bot & { pathfinder?: { stop(): void } }).pathfinder?.stop();
+          resolve({ ok: false, message: `${name} timed out after ${SKILL_WATCHDOG_MS / 60_000} min and was abandoned` });
+        }, SKILL_WATCHDOG_MS);
+      });
+      result = await Promise.race([run, timedOut]);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[skill ${name}] threw:`, err);
     result = { ok: false, message: `${name} crashed: ${message}` };
   } finally {
-    state?.currentTool.end();
+    if (watchdog) clearTimeout(watchdog);
+    if (trackTool) state?.currentTool.end(toolToken);
   }
+
+  // The stop flag stays latched until the next skill's begin(), so a stop that
+  // landed during this call is still visible here.
+  const stopRequested = name !== "stop" && !watchdogFired && state?.cancellation.isRequested() === true;
+  recordSkillEvent(bot.username, name, params, result, startedAt, watchdogFired, stopRequested);
 
   if (result.ok && !ACTION_LOG_DENYLIST.has(name)) {
     state?.actions.record(result.message);
@@ -72,6 +119,33 @@ export async function runSkill<P, R extends SkillResult>(
   }
 
   return result;
+}
+
+/** Telemetry `skill` event. Observe-only. */
+function recordSkillEvent(
+  username: string,
+  name: string,
+  params: unknown,
+  result: SkillResult,
+  startedAt: number,
+  timedOut: boolean,
+  stopRequested: boolean,
+): void {
+  try {
+    const st = result.state as { cancelled?: unknown } | undefined;
+    recordEvent(username, {
+      kind: "skill",
+      skill: name,
+      args: summarizeArgs(params),
+      ok: result.ok,
+      durationMs: Date.now() - startedAt,
+      message: clip(result.message ?? ""),
+      cancelled: stopRequested || st?.cancelled === true || /\bcancell?ed\b/i.test(result.message ?? ""),
+      timedOut,
+    });
+  } catch {
+    // never let telemetry reach the skill path
+  }
 }
 
 function truncate(text: string, max: number): string {

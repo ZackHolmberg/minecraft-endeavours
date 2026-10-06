@@ -7,9 +7,19 @@
  * storage+utilities+waypoints / recent actions / task queue) and adds a full
  * inventory summary — all straight from the bot + world memory, no LLM
  * (per the "push deterministic work to middleware" rule).
+ *
+ * `buildAgentContext` is the standalone Claude bot's per-task variant: the same
+ * world lines plus recent deaths (world.json) and the disk-backed recent
+ * conversation log. Disk + live state is the source of truth; the model is
+ * told to trust this block over anything it remembers.
  */
 
 import type { Bot } from "mineflayer";
+import {
+  formatConversation,
+  readRecentConversation,
+} from "../memory/conversation-log.js";
+import { getBotState } from "../state/index.js";
 import { observeSurroundings, type ObserveSurroundingsState } from "../skills/perception.js";
 
 const MAX_BLOCKS = 8;
@@ -18,13 +28,53 @@ const MAX_STORAGE = 5;
 const MAX_UTILITIES = 5;
 const MAX_WAYPOINTS = 5;
 const MAX_ACTIONS = 5;
+const MAX_ACTION_HISTORY = 8;
+
+export const AGENT_CONTEXT_HEADER =
+  "# World context (auto-generated from disk + live game state; this is ground truth — trust it over anything you remember)";
 
 /** Build a compact, literal world-context block for the planner prompt. */
 export async function buildPlanningContext(bot: Bot): Promise<string> {
+  return ["# World context (auto-generated — read literally, do not embellish)", ...(await worldLines(bot))].join(
+    "\n",
+  );
+}
+
+/**
+ * Per-task context for the standalone Claude bot: world lines, recent deaths,
+ * and the recent conversation (which includes the message(s) being answered).
+ */
+export async function buildAgentContext(bot: Bot): Promise<string> {
+  const [world, convo] = await Promise.all([
+    worldLines(bot, true),
+    readRecentConversation(bot.username),
+  ]);
+  const L = [AGENT_CONTEXT_HEADER, ...world];
+  L.push("");
+  L.push("# Recent conversation (oldest first, from disk; includes the message you're answering)");
+  const lines = formatConversation(convo, bot.username);
+  L.push(...(lines.length > 0 ? lines : ["(nothing recent)"]));
+  return L.join("\n");
+}
+
+function ageLabel(at: number): string {
+  const sec = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const m = Math.round(sec / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
+/**
+ * The shared world lines. `actionHistory` swaps the 5-minute recentActions
+ * window for the disk-persisted ActionsLog history with ages — what the
+ * per-task agent needs, since it has no memory of what it did last session.
+ */
+async function worldLines(bot: Bot, actionHistory = false): Promise<string[]> {
   const { state: s } = await observeSurroundings(bot);
   const L: string[] = [];
 
-  L.push("# World context (auto-generated — read literally, do not embellish)");
   L.push(
     `position: ${s.position.x} ${s.position.y} ${s.position.z} (${s.dimension}), facing ${s.facing}`,
   );
@@ -86,7 +136,22 @@ export async function buildPlanningContext(bot: Bot): Promise<string> {
     );
   }
 
-  if (s.recentActions.length > 0) {
+  if (s.lastDeath) {
+    L.push(
+      `last death: ${s.lastDeath.cause} @${fmt(s.lastDeath.pos)} (${s.lastDeath.minutesAgo}m ago)`,
+    );
+  }
+
+  const history = actionHistory
+    ? (getBotState(bot.username)?.actions.history(MAX_ACTION_HISTORY) ?? [])
+    : null;
+  if (history && history.length > 0) {
+    L.push(
+      `recent actions (oldest first): ${history
+        .map((a) => `${clip(a.message, 120)} (${ageLabel(a.at)})`)
+        .join(" | ")}`,
+    );
+  } else if (!history && s.recentActions.length > 0) {
     L.push(`recent actions: ${s.recentActions.slice(-MAX_ACTIONS).join(" | ")}`);
   }
 
@@ -95,7 +160,7 @@ export async function buildPlanningContext(bot: Bot): Promise<string> {
     L.push(`remaining tasks: ${s.remainingTasks.join(" | ")}`);
   }
 
-  return L.join("\n");
+  return L;
 }
 
 /**
@@ -146,6 +211,10 @@ function storageContents(c: ObserveSurroundingsState["knownStorage"][number]): s
     .map((i) => `${i.item} x${i.count}`)
     .join(", ");
   return ` [${top}${c.contents.length > 4 ? ", …" : ""}]`;
+}
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
 function fmt(p: { x: number; y: number; z: number }): string {

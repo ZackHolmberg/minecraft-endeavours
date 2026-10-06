@@ -4,7 +4,10 @@
  * `NpcAgent` owns one `AgentBackend` (the swappable LLM seam) and is otherwise
  * a thin adapter between the chat layer and that backend:
  *  - `pushChat(event, decision)` formats the chat into a user message and hands
- *    it to the backend (dropping it while the backend is rate-limited).
+ *    it to the backend (dropping it while the backend is rate-limited). A bare
+ *    "stop" command while the Claude backend is mid-event halts movement and
+ *    interrupts the event first, so the player isn't ignored until a long
+ *    build finishes (deterministic middleware, no LLM call needed to stop).
  *  - The 7 dashboard getters delegate straight to the backend's
  *    `BackendObservability` surface.
  *
@@ -16,7 +19,14 @@
  */
 
 import type { Bot } from "mineflayer";
-import type { ChatEvent, RouteMatch } from "../orchestrator/chat-router.js";
+import { recordConversation } from "../memory/conversation-log.js";
+import {
+  isStopCommand,
+  type ChatEvent,
+  type RouteMatch,
+} from "../orchestrator/chat-router.js";
+import { runSkill } from "../skills/harness.js";
+import { stop } from "../skills/index.js";
 import type { BotConfig } from "../types.js";
 import { ClaudeBackend } from "./backend/claude-backend.js";
 import { HybridBackend } from "./backend/hybrid-backend.js";
@@ -69,7 +79,31 @@ export class NpcAgent {
       );
       return;
     }
-    this.backend.pushUserMessage(formatUserMessage(event, decision));
+    // Disk-backed conversation log: the next fresh task session reads it back.
+    void recordConversation(this.opts.bot.username, {
+      kind: "player",
+      who: event.sender,
+      channel: event.channel,
+      text: event.message,
+    });
+    const interrupted = this.maybeInterrupt(event);
+    this.backend.pushUserMessage(formatUserMessage(event, decision, interrupted));
+  }
+
+  /**
+   * Player said "stop" while the bot is mid-task: halt movement / cancellable
+   * skills right now and abort the in-flight agent event. The stop message is
+   * still pushed afterwards so the model acknowledges it. Only the Claude
+   * backend supports interruption; others keep the event-hooks side-channel.
+   */
+  private maybeInterrupt(event: ChatEvent): boolean {
+    const { bot } = this.opts;
+    if (!(this.backend instanceof ClaudeBackend)) return false;
+    if (!this.backend.isBusy() || !isStopCommand(bot.username, event.message)) return false;
+    console.log(`[${bot.username}] stop command from ${event.sender} — halting and interrupting current event`);
+    void runSkill(bot, "stop", undefined, () => stop(bot));
+    void this.backend.interruptCurrentEvent();
+    return true;
   }
 
   isRateLimited(): boolean {
@@ -105,12 +139,43 @@ export class NpcAgent {
   }
 }
 
-function formatUserMessage(event: ChatEvent, decision: RouteMatch): string {
-  const channelLabel = decision.channel === "whisper" ? "whisper" : "public chat";
-  const replyTool = decision.channel === "whisper" ? "whisper" : "say";
-  return `[${channelLabel} from ${event.sender}] ${event.message}
-
-(routed because: ${decision.reason}. reply via the ${replyTool} tool on the same channel.)`;
+/**
+ * Turn a routed chat into the model's user message. Kept short and literal —
+ * the system prompt explains the format once. The routing note tells the model
+ * *why* it's seeing this, which matters for un-named routes where silence is
+ * a valid answer.
+ */
+function formatUserMessage(event: ChatEvent, decision: RouteMatch, interrupted: boolean): string {
+  const header =
+    decision.channel === "whisper"
+      ? `[whisper from ${event.sender}] ${event.message}`
+      : `[public chat] <${event.sender}> ${event.message}`;
+  const reply =
+    decision.channel === "whisper" ? `reply with whisper to ${event.sender}` : "reply with say";
+  const notes: string[] = [];
+  switch (decision.reason) {
+    case "name-mention":
+      notes.push(`they said your name; ${reply}`);
+      break;
+    case "all-mention":
+      notes.push(`sent to @all (every bot); ${reply}`);
+      break;
+    case "whisper":
+      notes.push(reply);
+      break;
+    case "continuation":
+      notes.push(`not named, but you just asked them a question, so this is probably the answer; ${reply}`);
+      break;
+    case "follow-up":
+      notes.push(
+        `not named — you were just talking with them. If it's clearly not meant for you, end your turn without calling any tool; otherwise ${reply}`,
+      );
+      break;
+  }
+  if (interrupted) {
+    notes.push("you were in the middle of a task and it has been stopped — confirm briefly, don't resume unless asked");
+  }
+  return `${header}\n(${notes.join(". ")}.)`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

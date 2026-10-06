@@ -11,6 +11,7 @@ import {
 } from "./mineflayer-glue/bot-factory.js";
 import { attachBotEventHooks } from "./mineflayer-glue/event-hooks.js";
 import { installLogBuffer } from "./observability/log-buffer.js";
+import { stopTelemetry } from "./observability/telemetry.js";
 import { PID_PATH, SNAPSHOT_PATH } from "./runtime-paths.js";
 import { startSnapshotWriter } from "./snapshot-writer.js";
 import { createBotState, registerBotState, unregisterBotState } from "./state/index.js";
@@ -67,6 +68,12 @@ const shutdown = async (signal: string): Promise<void> => {
   stopSnapshotWriter();
   await Promise.all(supervisors.map((s) => s.stop()));
   await Promise.all(supervisors.map((s) => unregisterAgent(s.username)));
+  // After the agents stop (they record their in-flight task_end), before exit.
+  try {
+    await stopTelemetry();
+  } catch (err) {
+    console.warn("orchestrator: telemetry flush failed", err);
+  }
   for (const s of supervisors) {
     unregisterBotState(s.username);
     unregisterSupervisor(s.username);
