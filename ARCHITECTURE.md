@@ -56,7 +56,12 @@ Concrete applications shipped:
 Single Node.js process that spawns one NPC agent per configured bot account, supervises reconnects, and routes in-game chat events to the right NPC.
 
 ### NPC Agent
-Per-bot Claude Agent SDK loop. Event-driven (not a tight tick loop) — wakes on chat-to-bot. One long-lived `query()` per bot in streaming-input mode; an async queue of `SDKUserMessage` is its `prompt`. Conversation lives in SDK process memory and does not persist across restarts (see [ROADMAP.md](ROADMAP.md)). System prompt + tool definitions are prompt-cached by the SDK (~2280 cached tokens per warm turn — see [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md)).
+Per-bot Claude Agent SDK loop on **Claude Haiku 4.5**. Event-driven — wakes on chat-to-bot. **Disk is the source of truth; the model keeps as little context as possible.** Two session modes (`session_mode` in `bots.yml`):
+
+- **`per_task` (default)** — each routed player message gets a fresh `query()`, closed when its result arrives. The single user message is a deterministic **context block** (`buildAgentContext` in `src/agent/planning-context.ts`: position/status/inventory/nearby, known storage/utilities/waypoints, last death, persisted recent actions, task queue, and the last ~14 lines of `conversation.json`) followed by the chat line. The system prompt tells the model this block is ground truth and overrides anything it remembers. Messages arriving mid-task are queued and coalesced into the next fresh task. Follow-ups ("now put it in the chest") resolve from the on-disk conversation log, so restarts lose nothing.
+- **`persistent`** (rollback) — the original single long-lived streaming-input `query()`; still gets the context block per message.
+
+The system prompt interpolates only the username, so the system prompt + tool-definition prefix stays byte-stable and prompt-caches across sessions. Guardrails in `claude-backend.ts` / `skill-tools.ts`: 50-turn cap per task (then one "tell the player where things stand" follow-up), a **repeat-failure guard** (a third identical failing call is refused unrun; after 6 failures every failure carries a stop-and-report nudge), and explicit Haiku thinking (`budgetTokens: 2048`). See [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md).
 
 ### Skills
 A library of high-level capabilities exposed to Claude as tools. Each skill is a JS function that orchestrates mineflayer primitives and returns a structured result. Skills are unit-testable independently of Claude.
@@ -75,11 +80,7 @@ The orchestrator drives Claude through the **Claude Agent SDK** (`@anthropic-ai/
 - **The skill layer doesn't change.** If we ever swap to direct Anthropic API + pay-per-token, only the agent runtime layer changes; skills, orchestrator, and bot wiring are identical.
 
 ### Default model selection
-| Use | Model | Why |
-|---|---|---|
-| Main NPC reasoning loop | **Sonnet 4.6** | Sweet spot for tool use, planning, conversational behavior |
-| Memory summarization (background) | **Haiku 4.5** | Cheap, fine for compressing old turns |
-| Complex multi-step plans (opt-in escalation) | **Opus 4.7** | Reserved for when the task genuinely needs it |
+**Claude Haiku 4.5 for the main NPC loop, via the plain `claude` backend** — the standing decision (Oct 2026). Not the local model, not hybrid, not other tiers. Behavior problems are fixed with prompts, tool descriptions, and deterministic middleware, not by switching models. `model_hint` still accepts `sonnet` / `opus`, and the `local` / `hybrid` backends remain in the code but are unused.
 
 ### Orchestrator process model
 **Hybrid (Option C).** Host process for development, Docker Compose service for steady-state — same code, different launcher.
@@ -102,12 +103,16 @@ Versioned in git. One entry per bot. Minimal shape:
 ```yaml
 bots:
   - username: Steve_AI
-    model_hint: sonnet
+    model_hint: haiku
+    backend: claude
+    session_mode: per_task
 ```
 
 Fields:
 - `username` — Minecraft username the bot connects as (must be on the whitelist).
-- `model_hint` — `sonnet` / `haiku` / `opus`. Mapped to a full model ID at the agent boundary (`src/agent/behavior.ts`).
+- `model_hint` — `haiku` (default) / `sonnet` / `opus`. Mapped to a full model ID at the agent boundary (`src/agent/behavior.ts`).
+- `backend` — `claude` (default) / `local` / `hybrid`.
+- `session_mode` — `per_task` (default) / `persistent`. See *NPC Agent*.
 
 `persona`, `owner`, and richer permission fields are deferred (see [ROADMAP.md](ROADMAP.md)).
 
@@ -211,10 +216,16 @@ Real player chat is conversational and underspecified. Claude is taught (via sys
 - **Propose a plan and wait for confirmation** for large multi-step tasks. *"I'll build a 5×5 wood hut next to that oak — sound good?"*
 
 ### Interruption while a skill runs
-Chat arriving during a skill is **queued** until the skill finishes; Claude then handles it on the next turn. For the cancellable tick-loop skills (`followPlayer`, `attack`, `flee`, `fish`), a **side-channel preempt** in `mineflayer-glue/event-hooks.ts` flips the cancellation flag immediately when the current conversation partner says "stop" / "halt" / "wait" — the skill exits within its next tick (~100–250ms) without waiting for the chat to drain through the agent queue. Non-cancellable skills (`mineBlock`, `craft`, `smelt`, etc.) finish to completion; the player's chat is processed when they end.
+Chat arriving during a task is **queued** and handled as the next task. A stop command (`isStopCommand` in `chat-router.ts` — strict: "stop/cancel/nvm…" must lead a ≤5-word message; "wait"/"hold on" only count alone, so "wait, also grab coal" is not a stop) does two things:
+1. **Side-channel preempt** in `event-hooks.ts` flips the cancellation flag immediately for the cancellable skills (`goTo`, `followPlayer`, `mineBlock(s)`, `placeBlocks`, `pillarUp`, `attack`, `flee`, `fish`, `smelt`) — they exit within a tick or between blocks.
+2. `npc-agent.ts` runs the `stop` skill and ends the in-flight task (`Query.close()` in per_task mode, `interrupt()` in persistent). The next task waits up to 35s for the abandoned skill to wind down (re-asserting the stop flag meanwhile) so two skills never drive the bot at once.
+
+Every skill also has a 10-minute watchdog in `runSkill` (`followPlayer` exempt).
 
 ### Conversation continuity
-When Claude's last message to a player contained `?`, the orchestrator flags the (bot, player) pair for 30s; the player's next chat without a name-mention routes to that bot as `reason=continuation`. Detection is `sent.includes("?")` (`runSkill` → `noteBotQuestionedPlayer`) — relaxed from the original strict `endsWith` in commit `026836e` because the model often appends an acknowledgment after the question. Avoids the awkward *"Steve, small"* requirement.
+- **Name aliases:** the bot answers to its username or its base name with an `_AI` / `_Bot` / `_NPC` suffix stripped (`Steve_AI` → "steve").
+- **Question window:** when the bot's last message to a player contained `?`, that player's next un-named chat within **45s** routes back as `reason=continuation`.
+- **Follow-up window:** for **20s** after any bot reply, the player's un-named chat routes back as `reason=follow-up` (so "thanks" / "now make planks" work). The routing note tells the model silence is fine if the line clearly wasn't meant for it.
 
 ## Memory model
 
@@ -231,37 +242,40 @@ Per-bot JSON file at `data/orchestrator/memory/<bot-username>/world.json` storin
 **Automatic capture (mineflayer events → direct write):**
 - Container `windowOpen` / `windowClose` → snapshot contents into `containers[]`. Shipped in v0.3+: hook in `mineflayer-glue/event-hooks.ts` correlates the window to a block via a per-bot hint (set by the chest skills before they call `openChest`) with a `blockAtCursor(6)` fallback for chests opened via `activateBlock` or any other path.
 - Bot enters ~8-block proximity of a crafting table / furnace / smithing table / etc. → upsert as POI in `pois[]`. Shipped in v0.3+: periodic 5s scan in `event-hooks.ts` walks `findBlocks` for the utility-block ID set and calls the idempotent `addPoi`. Cleared on `bot.on("end")`.
-- Bot death event → record position and cause. (Pending.)
+- Bot death event → record position and cause (parsed from the server death message within 3s) into `deaths[]` (newest 20), plus an actions-log line. Shipped.
+
+Writes to `world.json` are serialized per bot (the 5s POI scan, container snapshots and `remember` used to race).
 
 **Claude-driven capture (`remember` skill):**
 - Player names a location (*"this is our base"*, *"call this spot the wheat farm"*) → Claude calls `remember(type, name, pos)`.
 - Anything requiring judgment about what's worth recording.
 
-### Conversation memory — free-form, Claude-managed
-Per-bot running dialog state held by the Claude Agent SDK. Short-term: verbatim turns. Long-term: periodic summarization (Haiku 4.5) when history grows. Persistence across orchestrator restart is still deferred (see [ROADMAP.md](ROADMAP.md)).
+### Conversation memory — on disk
+`src/memory/conversation-log.ts` → `data/orchestrator/memory/<bot>/conversation.json`: the last 60 entries (player lines, bot lines, one outcome line per finished task). The context block renders the last ~14 from the past hour. In `per_task` mode this is the *only* conversation memory; the SDK session is discarded after each task.
+
+All per-bot durable files live in `data/orchestrator/memory/<bot>/`: `world.json`, `conversation.json`, `tasks.json`, `actions.json`. Writes are temp-then-rename; a malformed file starts fresh.
 
 ## Bot state
 
 Per-bot in-memory state that middleware maintains so Claude doesn't have to track it from conversation history. Distinct from memory: these are short-lived or always-current, not durable facts about the world. Most fields are surfaced to Claude through `observeSurroundings`; the in-flight tool name is observability-only (consumed by the dashboard).
 
 ### Recent actions log
-Rolling 5-minute log of bot activity, summarized to short phrases (`"mined 7 oak_log"`, `"walked 200 blocks"`, `"killed 2 zombies"`). `runSkill` appends successful (non-noisy) skill messages; oldest entries drop off. When a player asks *"what have you been doing?"*, Claude reads the log rather than reconstructing from chat history. Not persisted across restarts.
+Rolling 5-minute log of bot activity, summarized to short phrases (`"mined 7 oak_log"`, `"walked 200 blocks"`, `"killed 2 zombies"`). `runSkill` appends successful (non-noisy) skill messages; oldest entries drop off. When a player asks *"what have you been doing?"*, Claude reads the log rather than reconstructing from chat history. Persisted to `actions.json` (last 50, timestamped, via `ActionsLog.history()`); `recent()` still returns the 5-minute view.
 
 ### Player presence
 Per-player table: online/offline, last-seen position, last-seen timestamp. Captured from mineflayer `playerJoin` / `playerLeave` / movement events. Currently-online nearby players appear in `nearbyEntities`; offline-but-recently-seen players appear in `recentlySeenPlayers`. Useful for answering "has Zack been on today?" without Claude guessing.
 
 ### Task queue
-When a player chains requests (*"get wood, then iron, then come back"*), Claude calls `setTaskQueue(["get wood", "get iron", "return"])` to declare the plan, then `advanceTaskQueue()` between items. The orchestrator persists the queue across turns and surfaces `currentTask` + `remainingTasks` in every `observeSurroundings` call. Claude doesn't have to remember the chain from conversation memory — the queue is always in the bot's view of the world.
+When a player chains requests (*"get wood, then iron, then come back"*), Claude calls `setTaskQueue(["get wood", "get iron", "return"])` to declare the plan, then `advanceTaskQueue()` between items. The orchestrator persists the queue to `tasks.json` (survives restarts) and surfaces `currentTask` + `remainingTasks` in every `observeSurroundings` call. Claude doesn't have to remember the chain from conversation memory — the queue is always in the bot's view of the world.
 
 ### Current tool (observability-only)
 Name + start timestamp of the skill currently executing for this bot. Set/cleared by `runSkill` (`src/skills/harness.ts`) inside a `try/finally` so it's always reset even on exception. Read by the dashboard via `getBotSnapshot` to render the live `DOING` field; **not surfaced through `observeSurroundings`** — Claude doesn't need to see its own in-flight tool (it called it).
 
 ### Cancellation flag
-Per-bot cooperative cancellation flag (`src/state/cancellation.ts`) checked by the long-running tick-loop skills (`followPlayer`, `attack`, `flee`, `fish`). Flipped two ways:
-1. Claude calls the `stop` skill explicitly.
-2. **Side-channel preempt** in `mineflayer-glue/event-hooks.ts` — when a cancellable skill is in flight and the current conversation partner sends a message matching `/\b(stop|halt|wait)\b/i`, the flag flips immediately, before the chat queues through the agent loop. This is what makes player-side "stop" actually preempt despite chat being queued.
+Per-bot cooperative cancellation flag (`src/state/cancellation.ts`) checked by the cancellable skills (see *Interruption while a skill runs*) and by `navigate()`. Flipped by the `stop` skill, the chat side-channel preempt, and bot death. `runSkill` resets it at the start of every skill except `stop`, so a stale stop never kills the next skill.
 
-Each cancellable skill calls `cancellation.begin()` on entry to clear any stale request from the previous run.
+### Reflexes (`src/skills/auto-behaviors.ts`)
+Player-like behavior that never costs an LLM call: face the nearest player / conversation partner when idle, auto-eat (food ≤14, or low health), wear better armor after pickup, and swing back at a hostile mob that just hurt the bot (never players, never paths). All reflexes share a per-bot lock that `runSkill` waits on (≤4s), so reflex and skill inventory clicks never interleave.
 
 ### Why the split
 - **World knowledge is exact** — programmatic capture beats Claude summarization for facts (*"7 oak_log in the chest"* vs. *"a few logs I think"*).
@@ -417,3 +431,39 @@ See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearin
 - Heuristic tuning: conversation-continuity window (~30s; `?`-detection relaxed from `endsWith` to `includes` in `026836e`), "stop" regex (`/\b(stop|halt|wait)\b/i`), recent-actions log window (5 min). All judgment calls; tune when something feels wrong in live play.
 
 Agent SDK specifics are now pinned in [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md) — no longer open.
+
+## Telemetry & insight
+
+Observe-only instrumentation; it never changes behavior and never throws into gameplay.
+
+- **Contract:** `src/observability/telemetry-types.ts`. Event kinds:
+  - **Tasks:** `task_start` / `task_end`, which carry queue wait, context-build time, first-reply latency, turns, tokens, cache use, cost and outcome. Also `guard_refusal`.
+  - **Skills:** `skill`.
+  - **Movement:** `nav`, `door`, `pillar`, `structure_skip`.
+  - **Survival:** `reflex`, `hurt`, `death`.
+  - **Chat:** `chat_in` / `chat_out`.
+  - **Health:** `connection`, `loop_lag`, `rate_limit`.
+- **Writer:** `telemetry.ts`.
+  - Buffered async JSONL to `data/orchestrator/telemetry/<bot>/events.jsonl`, flushed every 1s or every 50 events, and on shutdown.
+  - Rotates at 5MB to `events.1.jsonl`.
+  - Keeps an in-memory ring of 20k events per bot for live aggregates.
+  - Events inside a task carry its `taskId`; every event carries the process `runId`.
+  - Routed-chat metadata is handed from `event-hooks` to the backend via `noteRoutedChat` / `takeRoutedChat`.
+- **Aggregation:** `aggregate.ts` is pure, with no I/O. It uses nearest-rank percentiles and normalizes failure messages (coordinates and numbers stripped) for top-failure grouping.
+- **Consumers:**
+  - `snapshot.json` gets `telemetry` (last 30 min plus the whole run) and `memory` (an on-disk view, refreshed every ≤5s).
+  - The dashboard has pages 2–4.
+  - `scripts/botReport.sh` reads the JSONL directly, so it works with the bot down, and prints automatic flags. Thresholds live in `src/report/flags.ts`:
+    - cache hit below 50%: the prefix isn't stable;
+    - p50 first reply above 5s: consider `persistent`;
+    - tasks at or near the turn cap;
+    - context-build timeouts;
+    - skills under 60% success;
+    - harness watchdog hits;
+    - repeated stuck spots within 3 blocks;
+    - disconnects, deaths, loop lag.
+- **Turn counting:** the SDK streams one assistant message per content block, sharing a `message.id`. The backend counts unique ids, or uses the result's `num_turns`. The pre-v0.5 counter included thinking-only blocks and over-reported.
+- **Known gaps:**
+  - The `local` and `hybrid` backends emit partial or no task events.
+  - `nav: no_path` covers both a pathfinder "no path" and a path that ended early.
+  - The report has its own synchronous JSONL reader (`src/report/read-events.ts`) alongside `readAllEvents`. Keep the two in sync if the layout changes.

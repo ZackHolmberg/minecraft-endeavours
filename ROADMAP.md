@@ -13,15 +13,21 @@ Where the project is going. Items we've intentionally deferred from current work
 
 ## Backlog
 
-### Bot death event → `world.json.deaths[]`
+### v0.5 live-test pass (Haiku + player-likeness)
 
-The last gap in the auto-capture half of the memory model. `containers[]` and the `pois[]` utility-block capture are shipped; `deaths[]` is not. The schema field already exists; the hook doesn't.
+**Run `./scripts/botReport.sh --since run` after each play session.** Its flags answer most of the items below: cache hit, first-reply latency, the turn cap, stuck spots, and skill failure rates. The telemetry and dashboard pages are shipped (see ARCHITECTURE.md *Telemetry & insight*).
 
-**Approach:** `bot.on("death", ...)` in `src/mineflayer-glue/event-hooks.ts`. Write `{ position: bot.entity.position (pre-respawn), cause, timestamp }` via a new `addDeath` helper in `src/memory/world-knowledge.ts`. Surface recent deaths in `observeSurroundings` (filter `deaths[]` to last 24h, proximity-sort).
+The v0.5 pass (Haiku switch, per-task sessions, doors, pillar rewrite, structure guard, reflexes, crafting-count fix, disk persistence, `deaths[]` capture) is typecheck-clean but **not run in-game**. Highest-risk items to verify first:
 
-**Cause field:** mineflayer's death event itself doesn't give a clean cause string. The lead is to retain the most recent `entityHurt` event targeting the bot and use its `entity` / `damageSource` as the cause — falls back to `"unknown"` if nothing recent landed. ~40 LOC including the helper + observer surface.
-
-**Value:** the canonical "where did I drop my stuff" recovery loop. Plus surfacing recent deaths in `observeSurroundings` lets the bot proactively warn ("I died here yesterday, let me grab my stuff first").
+- **Per-task session cost:** chat → first `say` latency (a CLI subprocess per task), and `cache_read` on the 2nd task ≈ system prompt + tools. If either is bad, set `session_mode: persistent`.
+- **Stop:** "steve stop" mid-`placeBlocks`/`mineBlocks` halts, acks, and the next task runs normally ("wait, also…" must *not* stop).
+- **Doors:** in/out of a closed-door house, double door, fence-gate pen; closes behind; iron door treated as wall; no open/close flapping in a 1-wide corridor.
+- **Pillar:** `pillarUp(5)` on flat ground and in a 1×1 hole.
+- **Structure guard:** `mineBlock oak_planks` next to a house refuses; trees still chop.
+- **Crafting counts:** 1 log → 4 planks; 2 planks → 4 sticks; pickaxe with no table nearby places one.
+- **Follow-ups from disk:** "steve get wood" → "now put it in the chest"; survives an orchestrator restart.
+- **Reflexes:** faces you when idle, eats at food ≤14, wears dropped armor, swings back at a zombie.
+- **Death:** `deaths[]` entry with cause; `lastDeath` in the context block.
 
 ### Field-untested code paths
 
@@ -50,7 +56,9 @@ From SKILLS.md status table. None gate real play; bundle as one cleanup slice if
 
 ### Dashboard polish (post-v0.3)
 
-- **IPC split** — dashboard and orchestrator share one Node process; quitting the dashboard SIGINTs the orchestrator. Split via Unix socket / WebSocket once long-lived sessions make restart friction painful.
+- **Narrow terminals** — below ~120 columns the Perf / Skills tables clip on the right (no scrolling).
+- **Flag tuning** — the "silent tasks" (>30%) and cost-per-task ($0.05) thresholds in `src/report/flags.ts` are guesses for Haiku; tune after the first real sessions.
+- **Telemetry coverage for local/hybrid** — `LocalBackend` emits no task events; hybrid executor skills have `taskId: null`. Low priority while the bot is Haiku-only.
 - **Per-bot log filtering** — log pane shows orchestrator-wide; no `[username]`-prefix filter on the active tab.
 - **SDK subprocess stdout capture** — Claude Code subprocess's own stdout bypasses the ring buffer; only `console.*` from this process is captured. Pipe subprocess streams into the ring buffer if a bug ever hides there.
 - **Cost projections** — `total_cost_usd` is shown per-turn and per-session; no projection to the 5-hour-window likely spend.
@@ -129,7 +137,7 @@ Probably implement the first; fall back to the second if Claude doesn't self-esc
 
 In rough priority for picking the next slice:
 
-1. **`deaths[]` auto-capture** — small, real player value, closes the memory model gap.
+1. **v0.5 live-test pass** (above) — everything shipped in the Haiku/player-likeness pass is unverified in-game.
 2. **Reconnect live test** — no code; just kill MC mid-turn and confirm.
 3. **Minimal test scaffolding (vitest + 6 smoke tests + CI)** — pays off the moment the next refactor lands.
 4. **Pending catalogue skills (`findBlock` / `findEntity` / `lookAt` / `wait`)** as one tiny slice — closes the v0.2 catalogue to 100%.

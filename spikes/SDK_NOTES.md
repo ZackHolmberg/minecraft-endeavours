@@ -172,3 +172,16 @@ Works because Claude Code is installed and logged in on this machine. The SDK sh
 - The model called `observeSurroundings({})` with no `radius` in the spike — fine since it's optional, but a hint that the system prompt should be explicit when a non-default radius is wanted.
 - Spike turn 2: the canned data was identical to turn 1, but the model still said "things have changed". Real concern for slice 4: the system prompt must instruct the model to read observations literally, not narrate them.
 - Spike emits an *empty `user` message-stream* entry for each tool result — these are not real user turns; ignore them when logging chat for players.
+
+---
+
+## v0.5 update: per-task sessions on Haiku (Oct 2026)
+
+The streaming-input plan above is now the `session_mode: persistent` fallback. Default is **`per_task`**: a fresh `query()` per routed player message, closed once its `result` arrives. Relevant SDK usage:
+
+- **Model:** `claude-haiku-4-5-20251001` with explicit `thinking: { type: "enabled", budgetTokens: 2048 }`. Lower it or turn thinking off if tool steps feel sluggish.
+- **Stop:** `Query.close()` in per_task mode, `Query.interrupt()` in persistent mode. The next task waits up to 35s for the abandoned skill (`currentTool`) to clear, re-asserting the stop flag meanwhile.
+- **Caching across sessions:** the cache keys on the prefix, not the session. The system prompt interpolates only the username, and per-task data rides in the user message, so the prefix stays byte-stable. **Unverified live:** confirm that `cache_read` on the 2nd task is about the size of the system prompt plus tools.
+- **Spin-up cost:** each task launches a CLI subprocess and rebuilds the MCP server. Not yet measured. If chat → first reply is slow, fall back to `persistent`.
+- **Turn cap:** 50 per task. On `error_max_turns`, one non-recursive "tell the player where things stand" follow-up is queued.
+- **Assistant messages stream one per content block.** Thinking, text and tool_use blocks arrive as separate assistant messages sharing a `message.id`. Count turns by unique id; the result also carries `num_turns`.

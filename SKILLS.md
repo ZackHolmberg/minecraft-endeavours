@@ -30,6 +30,7 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `checkInventory`, `equipItem`, `activateBlock`, `useOnEntity`, `smelt` | ✅ Implemented in v0.3+ tool-use slice |
 | `useItem`, `eat`, `fish`, `sleepIn` | ✅ Implemented in v0.3+ survival slice |
 | `mineBlocks`, `giveItemsTo`, `equipLoadout`, `craftMany`, `depositManyToChest`, `withdrawManyFromChest` | ✅ Implemented in v0.4 batch-variant slice (see [Batch variants](#batch-variants)) |
+| `pillarUp` | ✅ Implemented in v0.5 player-likeness pass |
 | `findBlock`, `findEntity`, `lookAt`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
@@ -114,6 +115,10 @@ type GoToTarget =
 
 Pre-checks reachability with `pathfinder.getPathTo()`. If the path computation reports `status === "noPath"`, fails fast without committing to a doomed walk — this is the architectural "doomed action" pre-check from the push-work-down-the-stack table.
 
+All movement (every skill, not just `goTo`) goes through `navigate()` in `src/skills/navigation.ts`. It verifies real arrival (`goal.isEnd`), detects being stuck (<1.5 blocks moved in 12s), applies a hard timeout (20s + 1s/block, capped at 5min), and honors the stop flag. Failures include `state.position` and a re-plan hint ("look for its door…").
+
+**Pathfinder policy** (`pathfinder-config.ts`): never digs (`canDig=false`), never 1×1 towers, `maxDropDown=3`, `liquidCost=3`. **Doors:** pathfinder 2.4.5's own `canOpenDoors` only covers fence gates and is buggy, so it stays off. Instead `src/skills/doors.ts` makes wooden/copper doors and fence gates walk-through on cardinal moves, and a per-tick watcher opens the one ahead and closes it behind the bot once it's ≥2 blocks past (unless a player is right there). Iron doors and trapdoors are walls.
+
 | Param | Default | Notes |
 |---|---|---|
 | `reach` | `1` | Stop when within this many blocks of the target. |
@@ -128,8 +133,10 @@ Pre-checks reachability with `pathfinder.getPathTo()`. If the path computation r
 ### `mineBlock` — composite mining (find → path → equip → dig → pickup)
 
 ```ts
-mineBlock(bot, { type: string, count?: number }): Promise<SkillResult>
+mineBlock(bot, { type: string, count?: number, allowStructures?: boolean }): Promise<SkillResult>
 ```
+
+**Structure guard** (`src/skills/structure-guard.ts`): candidates that look player-built are skipped — doors, gates, trapdoors and glass always; crafted blocks (planks, stairs, bricks, wool…) touching another crafted block; anything touching ≥2 crafted blocks. Trees, ores, and terrain are unaffected. The result says how many were left alone and why. `allowStructures: true` bypasses it — only for explicit demolition requests. Also: cancellable between blocks; a mid-air bot pillars one block (`pillarUpBy(1)`) before digging to avoid the 5× air penalty.
 
 The canonical composite skill. Proves the skill model: one Claude tool call ≈ one meaningful task, ~5–6 mineflayer primitives hidden inside.
 
@@ -468,12 +475,26 @@ Resolves a recipe via `bot.recipesFor` and crafts. Inventory-only recipes (2×2)
 
 (3) is what makes the multi-step production loop (mine → smelt → craft) actually work — Claude sees the remembered table in `observeSurroundings.knownUtilities` and `craft` walks the bot back to it from deep in a cave automatically.
 
-Shortfall reporting: when a recipe exists but ingredients are missing, the message names the first missing ingredient and its shortfall — `cannot craft 1 iron_pickaxe: need 3 iron_ingot; have 1` — so Claude can spawn a sub-task with no extra perception calls.
+**`count` = items wanted, not crafts.** `bot.craft(recipe, n)` runs the recipe n times, so the skill runs `ceil(count / recipe.result.count)` crafts and reports items actually produced (fixed in v0.5 — previously "4 sticks" made 16).
+
+**No table nearby:** before falling back to a remembered table, it places a `crafting_table` from inventory, or crafts one from 4 planks and places it (`src/skills/place-helper.ts`).
+
+Shortfall reporting picks the recipe variant closest to completion and lists every missing ingredient, adding "(craft X first)" when it's craftable from inventory — so Claude can spawn a sub-task with no extra perception calls.
 
 | | |
 |---|---|
 | Success | `crafted <N> <item>` · `crafted <N> <item> at crafting_table (x, y, z)` |
 | Failures | `item is required` · `count must be >= 1, got <n>` · `unknown item "<name>"` · `no known recipe for "<item>"` · `cannot craft <N> <item>: need <K> <ingredient>; have <H>` · `no crafting_table within 32 blocks and none remembered in world memory` · `nearest remembered crafting_table is at (x, y, z) (~D blocks away) but the chunk isn't loaded — walk closer first` · `couldn't reach crafting_table at (x, y, z) (<source>): <msg>` · `craft failed for <item>: <msg>` |
+
+---
+
+### `pillarUp` — climb straight up by jump-placing filler
+
+```ts
+pillarUp(bot, { height: number /* 1..32 */ }): Promise<SkillResult>
+```
+
+For genuinely stuck situations (a hole, a ledge, a tree top) — never as travel. Filler priority: cobblestone, dirt, netherrack, stone (no sand/gravel). Pre-checks an empty feet cell, solid full block below, and headroom. Per level: look straight down, hold jump, poll each physics tick until feet ≥ cell + 1.1, release jump, place on the block below, verify it appeared and the bot landed on it; ≤3 attempts per level. (The old version placed on a fixed 120ms timer — before feet clear the cell on tick 3 — so the server rejected it as obstructed, and jump stayed held, causing repeat hopping.) Cancellable; returns `state.placed` and final position. Implementation in `src/skills/pillar.ts`.
 
 ---
 
