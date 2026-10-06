@@ -15,6 +15,18 @@
  *   │ Log (orchestrator-wide; error/warn lines colorized)               │
  *   └───────────────────────────────────────────────────────────────────┘
  *
+ * That grid is page 1. Number keys switch pages (telemetry + memory views,
+ * all fed through `adapters.ts`, rendered by `panels.ts`):
+ *
+ *   1 Overview  — the layout above
+ *   2 Perf      — 30m-vs-run performance table, automatic flags, live
+ *                 notable-event feed, task history (outcome-colored)
+ *   3 Skills    — per-skill stats (worst success first), movement & world
+ *                 panel (nav results, problem spots, doors, pillar, ...),
+ *                 event feed. `w` toggles the 30m window / whole run.
+ *   4 Memory    — what the bot believes from disk: POIs, containers,
+ *                 deaths + task queue, recent conversation tail
+ *
  * Launched by `scripts/dashboard.sh` (which gates on MC server + bot PID).
  * Tab / Shift-Tab cycle bots. Quit with q / Esc / Ctrl+C — only kills this
  * viewer; the bot keeps running.
@@ -22,18 +34,33 @@
 
 import { readFileSync, statSync } from "node:fs";
 
-import blessed from "blessed";
+import blessed, { type Widgets } from "blessed";
 import contrib from "blessed-contrib";
 
 import type { LogEntry, LogLevel } from "../observability/log-buffer.js";
 import type { BotSnapshot } from "../observability/snapshot.js";
 import { SNAPSHOT_PATH } from "../runtime-paths.js";
 import type { SnapshotFilePayload } from "../snapshot-writer.js";
+import { getMemoryView, getTelemetryView } from "./adapters.js";
+import {
+  pickAggregate,
+  renderContainers,
+  renderConversation,
+  renderDeathsAndQueue,
+  renderEventFeed,
+  renderFlags,
+  renderMovementPanel,
+  renderPerfPanel,
+  renderPois,
+  renderSkillTable,
+  renderTaskTable,
+} from "./panels.js";
 
 const POLL_MS = 500;
 const ACTIONS_MAX = 50;
 const LOG_BACKFILL = 80;
 const ERROR_BANNER_TTL_MS = 5 * 60 * 1000;
+const PAGE_NAMES = ["Overview", "Perf", "Skills", "Memory"] as const;
 
 function readSnapshotFile(): SnapshotFilePayload | null {
   try {
@@ -102,6 +129,56 @@ function mountDashboard(): void {
     fg: "white",
   });
 
+  // ─── Pages 2–4 (hidden until selected) ───────────────────────────────────
+  const panel = (row: number, col: number, rowSpan: number, colSpan: number, label: string, wrap = false): Widgets.BoxElement =>
+    grid.set(row, col, rowSpan, colSpan, blessed.box, {
+      label,
+      tags: true,
+      border: { type: "line" },
+      style: { border: { fg: "cyan" } },
+      padding: { left: 1, right: 1 },
+      scrollable: true,
+      wrap, // tables clip; prose panels (flags) wrap
+      hidden: true,
+    }) as Widgets.BoxElement;
+
+  // Page 2 — performance
+  const perfBox = panel(0, 0, 7, 5, " Performance ");
+  const flagsBox = panel(0, 5, 4, 7, " Flags (run) ", true);
+  const feedBox = panel(4, 5, 3, 7, " Notable events ");
+  const tasksBox = panel(7, 0, 5, 12, " Task history (newest first) ");
+  // Page 3 — skills / movement
+  const skillsBox = panel(0, 0, 8, 8, " Skills ");
+  const moveBox = panel(0, 8, 8, 4, " Movement & world ");
+  const feedBox2 = panel(8, 0, 4, 12, " Notable events ");
+  // Page 4 — memory
+  const poiBox = panel(0, 0, 6, 6, " POIs ");
+  const containerBox = panel(0, 6, 3, 6, " Containers ");
+  const deathsBox = panel(3, 6, 3, 6, " Task queue · Deaths ");
+  const convBox = panel(6, 0, 6, 12, " Conversation (conversation.json, oldest first) ");
+
+  const pages: Widgets.BlessedElement[][] = [
+    [statusBox, tokenBox, inventoryBox, actionsBox, logPane],
+    [perfBox, flagsBox, feedBox, tasksBox],
+    [skillsBox, moveBox, feedBox2],
+    [poiBox, containerBox, deathsBox, convBox],
+  ];
+  /** Widget whose label carries the bot name + page tabs, per page. */
+  const titleBoxes: Widgets.BlessedElement[] = [statusBox, perfBox, skillsBox, poiBox];
+  let activePage = 0;
+  /** Page 3 window: true = last 30 min, false = whole run. */
+  let skillsUseWindow = false;
+  /** Extra label text for the page's title box, set by the last render. */
+  const pageSuffix: string[] = ["", "", "", ""];
+
+  const showPage = (index: number): void => {
+    if (index < 0 || index >= pages.length || index === activePage) return;
+    for (const w of pages[activePage]!) w.hide();
+    activePage = index;
+    for (const w of pages[activePage]!) w.show();
+    tick();
+  };
+
   // ─── Multi-bot state ──────────────────────────────────────────────────────
   let usernamesView: string[] = [];
   let activeIndex = 0;
@@ -162,24 +239,33 @@ function mountDashboard(): void {
     const payload = readSnapshotFile();
 
     if (!payload) {
-      statusBox.setContent(
+      titleBoxes[activePage]!.setContent(
         "\n  {yellow-fg}waiting for orchestrator snapshot…{/}\n  {gray-fg}(is the bot running? `./scripts/botStart.sh`){/}",
       );
       screen.render();
       return;
     }
 
-    syncUsernames(payload.snapshots);
-    appendNewLogs(payload.recentLogs);
+    syncUsernames(Array.isArray(payload.snapshots) ? payload.snapshots : []);
+    appendNewLogs(Array.isArray(payload.recentLogs) ? payload.recentLogs : []);
 
     if (usernamesView.length === 0) {
-      statusBox.setContent("\n  {red-fg}no bots registered{/}");
+      titleBoxes[activePage]!.setContent("\n  {red-fg}no bots registered{/}");
       screen.render();
       return;
     }
 
     const username = usernamesView[activeIndex]!;
-    statusBox.setLabel(renderStatusLabel(username, activeIndex, usernamesView.length));
+    // Fit the label to the title box: full tabs + suffix, then full tabs,
+    // then compact tabs ("1 2 [3 Skills] 4") — an overlong label wraps into
+    // the panel body.
+    const titleBox = titleBoxes[activePage]!;
+    const room = typeof titleBox.width === "number" ? titleBox.width - 4 : 999;
+    const suffix = pageSuffix[activePage] ?? "";
+    const full = renderPageLabel(username, activeIndex, usernamesView.length, activePage, false);
+    const compact = renderPageLabel(username, activeIndex, usernamesView.length, activePage, true);
+    const candidates = [suffix ? `${full}· ${suffix} ` : full, full, suffix ? `${compact}· ${suffix} ` : compact, compact];
+    titleBox.setLabel(candidates.find((l) => l.length <= room) ?? compact);
 
     const snap = payload.snapshots.find((s) => s.username === username);
     if (!snap) {
@@ -191,12 +277,60 @@ function mountDashboard(): void {
       return;
     }
 
-    statusBox.setContent(renderStatusPanel(snap));
-    tokenBox.setContent(renderTokenPanel(snap));
-    inventoryBox.setItems(renderInventoryLines(snap));
-    actionsBox.setItems(snap.state.recentActions.slice(-ACTIONS_MAX).reverse());
+    // A malformed / older snapshot must never take the viewer down: each
+    // page renders inside its own guard and falls back to a placeholder.
+    try {
+      renderActivePage(snap);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      titleBoxes[activePage]!.setContent(`{red-fg}render error: ${msg.replace(/[{}]/g, "")}{/}`);
+    }
     screen.title = `minecraft-endeavours · ${username}`;
     screen.render();
+  };
+
+  const innerWidth = (box: Widgets.BlessedElement): number =>
+    typeof box.width === "number" ? Math.max(20, box.width - 4) : 80;
+
+  const renderActivePage = (snap: BotSnapshot): void => {
+    const now = snap.capturedAt ?? Date.now();
+    switch (activePage) {
+      case 0:
+        statusBox.setContent(renderStatusPanel(snap));
+        tokenBox.setContent(renderTokenPanel(snap));
+        inventoryBox.setItems(renderInventoryLines(snap));
+        actionsBox.setItems((snap.state?.recentActions ?? []).slice(-ACTIONS_MAX).reverse());
+        return;
+      case 1: {
+        const view = getTelemetryView(snap);
+        perfBox.setContent(renderPerfPanel(view));
+        flagsBox.setContent(renderFlags(view));
+        feedBox.setContent(renderEventFeed(view, innerWidth(feedBox), now));
+        tasksBox.setContent(renderTaskTable(view, innerWidth(tasksBox), now));
+        return;
+      }
+      case 2: {
+        const view = getTelemetryView(snap);
+        const agg = pickAggregate(view, skillsUseWindow);
+        pageSuffix[2] = skillsUseWindow ? "last 30m (w: run)" : `whole run${view?.runTruncated ? " tail" : ""} (w: 30m)`;
+        skillsBox.setContent(renderSkillTable(agg, innerWidth(skillsBox)));
+        moveBox.setContent(renderMovementPanel(agg, now));
+        feedBox2.setContent(renderEventFeed(view, innerWidth(feedBox2), now));
+        return;
+      }
+      case 3: {
+        const mem = getMemoryView(snap);
+        const src = mem.source === "disk" ? "\n{gray-fg}(snapshot has no memory section — read from disk){/}" : "";
+        pageSuffix[3] = `POIs ${mem.counts.pois ?? mem.pois.length}${mem.source === "disk" ? " (disk)" : ""}`;
+        poiBox.setContent(renderPois(mem, now) + shownOf(mem.pois.length, mem.counts.pois));
+        containerBox.setLabel(` Containers (${mem.counts.containers ?? mem.containers.length}) `);
+        containerBox.setContent(renderContainers(mem, now) + shownOf(mem.containers.length, mem.counts.containers));
+        deathsBox.setContent(renderDeathsAndQueue(mem, now));
+        convBox.setLabel(` Conversation (${mem.counts.conversation ?? mem.conversation.length} on disk, oldest first) `);
+        convBox.setContent(renderConversation(mem, innerWidth(convBox), now, snap.username) + src);
+        return;
+      }
+    }
   };
 
   tick();
@@ -213,6 +347,11 @@ function mountDashboard(): void {
   });
   screen.key(["tab"], () => cycle(1));
   screen.key(["S-tab"], () => cycle(-1));
+  screen.key(["1", "2", "3", "4"], (ch: string) => showPage(Number(ch) - 1));
+  screen.key(["w"], () => {
+    skillsUseWindow = !skillsUseWindow;
+    tick();
+  });
 
   screen.render();
 }
@@ -238,10 +377,17 @@ function renderInventoryLines(snap: BotSnapshot): string[] {
     .map(([name, count]) => `${name} {gray-fg}×{/} ${count}`);
 }
 
-function renderStatusLabel(username: string, index: number, total: number): string {
-  if (total <= 1) return ` ${username} `;
-  return ` [${index + 1}/${total}] ${username} · Tab to cycle `;
+/** "showing newest N of M" footer when the snapshot only carries the latest slice. */
+function shownOf(shown: number, total: number | null): string {
+  return total !== null && total > shown ? `\n{gray-fg}(newest ${shown} of ${total} — full list in world.json){/}` : "";
 }
+
+function renderPageLabel(username: string, index: number, total: number, page: number, compact: boolean): string {
+  const bot = total <= 1 ? username : `[${index + 1}/${total}] ${username}`;
+  const tabs = PAGE_NAMES.map((name, i) => (i === page ? `[${i + 1} ${name}]` : compact ? `${i + 1}` : `${i + 1} ${name}`)).join(" ");
+  return ` ${bot} · ${tabs} `;
+}
+
 
 function renderStatusPanel(snap: BotSnapshot): string {
   const lines: string[] = [];

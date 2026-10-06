@@ -8,7 +8,8 @@
     "start": "tsx src/index.ts",
     "dashboard": "tsx src/dashboard/index.ts",
     "llm:start": "tsx src/local-model/start.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "report": "tsx src/report/index.ts"
   },
   "engines": {
     "node": ">=20"
