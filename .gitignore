@@ -20,3 +20,6 @@ CLAUDE.md
 
 # Local Python virtualenv (MLX spikes)
 .venv/
+
+# v2 eval artifacts (runs, logs)
+v2/runs/
