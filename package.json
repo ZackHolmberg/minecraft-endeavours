@@ -16,7 +16,8 @@
     "ui:dev": "vite --config src/web/ui/vite.config.ts",
     "ui:mock": "tsx src/web/ui/mock/server.ts",
     "eval": "tsx src/eval/runner.ts",
-    "eval:compare": "tsx src/eval/compare.ts"
+    "eval:compare": "tsx src/eval/compare.ts",
+    "test": "vitest run"
   },
   "engines": {
     "node": ">=20"
@@ -43,7 +44,8 @@
     "preact": "^11.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vite": "^8.3.3"
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3"
   },
   "overrides": {
     "lodash": "^4.18.1"
