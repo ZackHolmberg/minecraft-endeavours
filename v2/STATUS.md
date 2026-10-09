@@ -11,18 +11,17 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## In flight (2026-10-09 ~16:00)
-- **v1 core baseline** running (no agent; process `src/eval/runner.ts --label v1-baseline --suite core --wait-limit --out v2/runs/v1-baseline`). Harness agent died at the usage limit before writing `v2/reports/baseline-v1.md` — lead writes it when the run ends. Tier 1 so far 6/8.
-- **Slice 1** committed `5bc85c2` (pending benchmark). Reviewer agent → `v2/reports/slice1-review.md`.
-- **Slice 2a** planner committed `5017410` (37 tests).
-- **Slice 2b** agent: job runner + step executors + recovery ladder + `achieve`/`cancelJob` + job-end re-entry + eval busy signal → `v2/reports/slice2b.md`. Waits for the baseline to finish before live runs.
+## In flight (2026-10-09 ~17:30)
+- Eval chain (background shell): v1 re-run of `t1.eat`,`conv.followup_chest` into `v2/runs/v1-baseline`, then **v2 core run** `v2/runs/v2-s2b` (bot = live worktree @ `4e290f7`-equivalent src `ff27f8d`). Log: `v2/runs/v2-s2b.out` ends with CHAIN_DONE. **Don't edit `src/` until it finishes** (D11).
+- Slice 2b reviewer agent → `v2/reports/slice2b-review.md`.
 - Frozen v1 bot checkout: `../minecraft-endeavours-v1base` (detached `c1587b0`). Don't edit it.
-If a session died mid-flight: check `git status` + those report files; typecheck; whatever exists is the progress.
+If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + report files; whatever exists is the progress.
 
 ## Next steps
-1. Baseline done → write `v2/reports/baseline-v1.md`, set targets, tell owner.
-2. Slice 1 → benchmark core vs baseline → review → commit.
-3. Slice 2b (executor + job runner + `achieve` tool + agent re-entry + eval busy signal) after slice 1 lands (touches same files). Then benchmark.
+1. When `v2-s2b` finishes: summarize vs baseline (`npm run eval:compare -- v2/runs/v1-baseline v2/runs/v2-s2b`), add a row to Benchmark scores, patch baseline-v1.md re-run lines.
+2. Apply slice 2b review fixes; implement D12 pillar `purpose` (pillar.ts `pillarUpBy` param; navigation escape + world.ts water escape = "escape"; eval counts purpose != escape).
+3. Milestone check-in with the owner (first-milestone DoD met if v2 beats v1).
+4. Then slice 2c: prompt/tool-surface trim, request-handling (deliver to player, don't stop at a plan), builder (blueprints + scaffolding) for build_house/portal, pathfinder master pin (D9 #3).
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |

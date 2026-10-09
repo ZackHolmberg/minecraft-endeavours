@@ -35,3 +35,9 @@ Each slice: benchmark before/after, keep only measurable wins, independent revie
 
 ## D10 — Goals run as background jobs; Haiku re-enters only on job end (2026-10-09)
 `achieve({goals})` plans deterministically (pure planner over minecraft-data + hand tables), starts a persisted job, and returns at once; the job executes with per-step postconditions, typed failures and a recovery ladder; `job_end` queues a synthetic event for a fresh Haiku decision. **Why:** v1 spends one Haiku turn per step and a 20-min goal can't live inside one tool call (10-min watchdog, session cost). Mid-job chat gets the job status in the context block. Design: [PLANNER.md](PLANNER.md); contracts `src/planner/types.ts`, `src/jobs/types.ts`. Eval treats a running job as busy (new `job_*` telemetry).
+
+## D11 — Benchmark a frozen checkout, never the live worktree (2026-10-09)
+The eval launches the bot per scenario from `--bot-dir`; editing `src/` in that dir mid-run mixes code versions. Procedure: `git worktree add --detach ../mcv2-bench <sha>` + `ln -s ../minecraft-endeavours-v2/node_modules ../mcv2-bench/node_modules` + copy `.env`, then `--bot-dir ../mcv2-bench`. (The `v2-s2b` run predates this rule; no `src/` edits were made during it.)
+
+## D12 — Pillar violation = pillaring not for escape (2026-10-09)
+`pillar` telemetry gains optional `purpose: "escape" | "requested"`. Escaping a pit/water while mining or via `navigate` escape is player-like; a Haiku-requested `pillarUp` to reach somewhere is the "pillar to travel" violation unless the scenario allows it. Events without `purpose` (v1) all count — conservative for v1.
