@@ -30,10 +30,16 @@ interface Args {
   noReset: boolean;
   /** Debug: multiply every scenario timeout (e.g. 0.1 to exercise the timeout path). */
   timeoutScale: number;
+  suite: "core" | "stretch" | "all";
+  suiteExplicit: boolean;
+  /** reset -> setup -> check only; no bot, no Haiku. */
+  dry: boolean;
+  /** Sleep through Claude usage-limit windows and retry the scenario instead of aborting. */
+  waitLimit: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const a: Partial<Args> & { noReset: boolean; repeat: number; timeoutScale: number } = { noReset: false, repeat: 1, timeoutScale: 1 };
+  const a: Partial<Args> & { noReset: boolean; repeat: number; timeoutScale: number; suite: Args["suite"]; suiteExplicit: boolean; dry: boolean; waitLimit: boolean } = { waitLimit: false, noReset: false, repeat: 1, timeoutScale: 1, suite: "core", suiteExplicit: false, dry: false };
   for (let i = 0; i < argv.length; i++) {
     const f = argv[i]!;
     const v = () => argv[++i] ?? "";
@@ -43,6 +49,13 @@ function parseArgs(argv: string[]): Args {
     else if (f === "--repeat") a.repeat = Math.max(1, Number(v()) || 1);
     else if (f === "--out") a.out = v();
     else if (f === "--no-reset") a.noReset = true;
+    else if (f === "--suite") {
+      const v2 = v();
+      if (v2 !== "core" && v2 !== "stretch" && v2 !== "all") throw new Error("--suite core|stretch|all");
+      a.suite = v2;
+      a.suiteExplicit = true;
+    } else if (f === "--dry") a.dry = true;
+    else if (f === "--wait-limit") a.waitLimit = true;
     else if (f === "--timeout-scale") a.timeoutScale = Number(v()) || 1;
     else throw new Error(`unknown flag ${f}`);
   }
@@ -85,6 +98,70 @@ async function botOnline(h: Harness): Promise<boolean> {
   return (await h.rcon.command("list")).includes(h.info.username);
 }
 
+/** Standard per-scenario reset (bot must be online): see v2/EVAL.md. */
+async function standardReset(h: Harness, sc: Scenario, site: Vec3): Promise<void> {
+  const { rcon, tester } = h;
+  const bot = h.info.username;
+  const mode = sc.gameMode ?? "survival";
+  const sx = site.x + (sc.botStart?.x ?? 0);
+  const sz = site.z + (sc.botStart?.z ?? 0);
+  const sy = (tester.surfaceY(sx, sz) ?? site.y - 1) + 1 + (sc.botStart?.y ?? 0);
+  for (const c of [
+    `gamemode ${mode} ${bot}`,
+    `clear ${bot}`,
+    `clear Tester`,
+    `effect clear ${bot}`,
+    `effect give ${bot} minecraft:instant_health 1 10 true`,
+    `effect give ${bot} minecraft:saturation 1 10 true`,
+    `experience set ${bot} 0 levels`,
+    `experience set ${bot} 0 points`,
+    "weather clear",
+    "time set 1000",
+    "difficulty normal",
+    `execute positioned ${site.x} ${site.y} ${site.z} run kill @e[type=!player,type=!minecraft:villager,type=!minecraft:iron_golem,distance=..64]`,
+    `tp ${bot} ${sx + 0.5} ${sy} ${sz + 0.5}`,
+    `tp Tester ${site.x + 4.5} ${(tester.surfaceY(site.x + 4, site.z) ?? site.y - 1) + 1} ${site.z + 0.5}`,
+  ])
+    await rcon.command(c);
+  await sleep(1500);
+}
+
+/**
+ * --dry: reset -> setup -> check (expect FAIL on the untouched setup) -> dryWin() -> check (expect PASS).
+ * No bot process, no say(); a second mineflayer client named like the bot stands in so RCON gives/tps work.
+ */
+async function dryScenario(h: Harness, sc: Scenario, dummy: Tester): Promise<string> {
+  const ac = new AbortController();
+  const site = h.sites[sc.site];
+  if (!site) return `SKIP site "${sc.site}" missing`;
+  await ensureConnections(h);
+  if (!dummy.alive) await dummy.connect();
+  const bot = h.info.username;
+  await h.rcon.command(`tp Tester ${site.x} ${site.y + 6} ${site.z}`);
+  if (!(await waitFor(() => h.tester.blockNameAt(site) !== null, 90_000))) return "FAIL harness: site chunks did not load";
+  await standardReset(h, sc, site);
+  const ctx = new EvalContext(bot, "Tester", site as Vec3, ac.signal, h.rcon, h.tester, "/nonexistent/events.jsonl");
+  try {
+    await sc.setup(ctx);
+    await sleep(2000);
+    ctx.armed = true;
+    const before = await sc.check(ctx);
+    let line = `empty-setup check: ${before.ok ? "PASS (SUSPECT)" : "fail (expected)"} [${before.detail}]`;
+    if (sc.dryWin) {
+      await sc.dryWin(ctx);
+      await sleep(2500);
+      const after = await sc.check(ctx);
+      line += `\n      simulated win: ${after.ok ? "PASS (expected)" : "FAIL (BROKEN CHECK)"} [${after.detail}]` + (ctx.brokenProtected.size ? ` broken=${ctx.brokenProtected.size}` : "");
+    } else line += "\n      (no dryWin)";
+    return line;
+  } catch (e) {
+    return `ERROR ${(e as Error).stack?.split("\n").slice(0, 3).join(" | ")}`;
+  } finally {
+    ctx.dispose();
+    ac.abort();
+  }
+}
+
 async function runScenario(h: Harness, sc: Scenario, repeat: number): Promise<ScenarioResult> {
   const startedAt = new Date().toISOString();
   const key = `${sc.id}-${repeat}`;
@@ -124,28 +201,7 @@ async function runScenario(h: Harness, sc: Scenario, repeat: number): Promise<Sc
       throw new Error(bp.running ? "bot did not join within timeout (see log)" : "bot process exited during startup (see log)");
     await sleep(3000);
 
-    // Standard reset.
-    const mode = sc.gameMode ?? "survival";
-    const sx = site.x + (sc.botStart?.x ?? 0);
-    const sz = site.z + (sc.botStart?.z ?? 0);
-    const sy = (tester.surfaceY(sx, sz) ?? site.y - 1) + 1 + (sc.botStart?.y ?? 0);
-    for (const c of [
-      `gamemode ${mode} ${bot}`,
-      `clear ${bot}`,
-      `effect clear ${bot}`,
-      `effect give ${bot} minecraft:instant_health 1 10 true`,
-      `effect give ${bot} minecraft:saturation 1 10 true`,
-      `experience set ${bot} 0 levels`,
-      `experience set ${bot} 0 points`,
-      "weather clear",
-      "time set 1000",
-      "difficulty normal",
-      `execute positioned ${site.x} ${site.y} ${site.z} run kill @e[type=!player,type=!minecraft:villager,type=!minecraft:iron_golem,distance=..64]`,
-      `tp ${bot} ${sx + 0.5} ${sy} ${sz + 0.5}`,
-      `tp Tester ${site.x + 4.5} ${(tester.surfaceY(site.x + 4, site.z) ?? site.y - 1) + 1} ${site.z + 0.5}`,
-    ])
-      await rcon.command(c);
-    await sleep(1500);
+    await standardReset(h, sc, site);
 
     ctx = new EvalContext(bot, "Tester", site as Vec3, ac.signal, rcon, tester, bp.eventsPath);
     await sc.setup(ctx);
@@ -209,6 +265,9 @@ async function runScenario(h: Harness, sc: Scenario, repeat: number): Promise<Sc
   // Collect.
   const events = readEvents(bp.eventsPath);
   const m = collectMetrics(events);
+  const limited = events.find((e) => e.kind === "rate_limit" && e.status === "rejected");
+  if (limited && limited.kind === "rate_limit")
+    harnessError = `RATE_LIMITED resetsAt=${limited.resetsAt ?? 0} (Claude usage limit hit during this scenario)`;
   const broken = ctx?.brokenProtected.size ?? 0;
   const earlyOk = firstOkAt !== null;
   const ok = earlyOk && broken === 0 && !harnessError;
@@ -265,19 +324,37 @@ async function main(): Promise<void> {
   const info = inspectBotDir(args.botDir);
   const env = testServerEnv();
   const sites = loadSites().sites;
-  const selected = selectScenarios(args.only);
+  const selected = selectScenarios(args.only, args.only && !args.suiteExplicit ? "all" : args.suite);
   if (selected.length === 0) throw new Error(`no scenarios match --only ${args.only}`);
   const out = resolve(REPO_ROOT, args.out ?? join("v2/runs", `${args.label}-${stamp()}`));
-  mkdirSync(join(out, "logs"), { recursive: true });
-  mkdirSync(join(out, "telemetry"), { recursive: true });
   const resultsPath = join(out, "results.jsonl");
-  writeFileSync(resultsPath, "");
-  writeFileSync(join(out, "meta.json"), JSON.stringify({ args, botDir: info.dir, botUsername: info.username, scenarios: selected.map((s) => s.id), startedAt: new Date().toISOString() }, null, 2));
+  if (!args.dry) {
+    mkdirSync(join(out, "logs"), { recursive: true });
+    mkdirSync(join(out, "telemetry"), { recursive: true });
+    writeFileSync(resultsPath, "");
+  }
+  if (!args.dry) writeFileSync(join(out, "meta.json"), JSON.stringify({ args, botDir: info.dir, botUsername: info.username, scenarios: selected.map((s) => s.id), startedAt: new Date().toISOString() }, null, 2));
   if (!args.noReset && !hasPristine()) throw new Error("no pristine world snapshot; run scout + `npx tsx src/eval/world.ts snapshot` (or pass --no-reset)");
 
   const rcon = makeRcon(env);
   const tester = new Tester(env.host, env.port, env.version, "Tester", info.username);
   const h: Harness = { args, info, env, rcon, tester, out, sites };
+  if (args.dry) {
+    if (!args.noReset) await restorePristine();
+    await rcon.connect();
+    const dummy = new Tester(env.host, env.port, env.version, info.username, "Tester", false);
+    await h.tester.connect();
+    await sleep(5500);
+    await dummy.connect();
+    console.log(`[eval] DRY run of ${selected.length} scenario(s) (no bot process, no Haiku)`);
+    for (const sc of selected) {
+      console.log(`[dry] ${sc.id}: ${await dryScenario(h, sc, dummy)}`);
+    }
+    dummy.end();
+    tester.end();
+    rcon.close();
+    return;
+  }
   console.log(`[eval] ${selected.length} scenario(s) x ${args.repeat} → ${out}`);
 
   // Ctrl+C: the process 'exit' hook in bot-process.ts kills any running bot group.
@@ -296,10 +373,21 @@ async function main(): Promise<void> {
     for (const sc of selected) {
       console.log(`[eval] ${sc.id} (rep ${rep}) ...`);
       let res: ScenarioResult;
-      try {
-        res = await runScenario(h, sc, rep);
-      } catch (e) {
-        res = blankResult(sc, args.label, rep, `harness: ${(e as Error).message}`);
+      for (;;) {
+        try {
+          res = await runScenario(h, sc, rep);
+        } catch (e) {
+          res = blankResult(sc, args.label, rep, `harness: ${(e as Error).message}`);
+        }
+        const lim = /^RATE_LIMITED resetsAt=(\d+)/.exec(res.harnessError ?? "");
+        if (!lim) break;
+        const until = Number(lim[1]) || Date.now() + 30 * 60_000;
+        if (!args.waitLimit) {
+          appendFileSync(resultsPath, JSON.stringify(res) + "\n");
+          throw new Error(`Claude usage limit hit during ${sc.id}; resets ${new Date(until).toISOString()}. Re-run later, or pass --wait-limit to sleep through it.`);
+        }
+        console.log(`[eval]   usage limit hit; sleeping until ${new Date(until + 60_000).toLocaleString()} then retrying ${sc.id}`);
+        await sleep(Math.max(60_000, until + 60_000 - Date.now()));
       }
       appendFileSync(resultsPath, JSON.stringify(res) + "\n");
       console.log(`[eval]   ${res.ok ? "PASS" : "FAIL"} score=${res.score.toFixed(2)} wall=${(res.wallMs / 1000).toFixed(1)}s turns=${res.turns} cost=$${res.costUsd.toFixed(3)} :: ${res.harnessError ? "HARNESS " + res.harnessError : res.detail}`);

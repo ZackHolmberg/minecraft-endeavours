@@ -35,6 +35,8 @@ export class Tester {
     private readonly version: string,
     readonly username: string,
     private readonly botName: string,
+    /** Walk to nearby dropped items like a human (Tester: yes; --dry stand-in bot: no). */
+    private readonly walkItems = true,
   ) {}
 
   async connect(): Promise<void> {
@@ -80,7 +82,7 @@ export class Tester {
     });
     // Human-like item pickup: walk over to dropped items within 6 blocks (a tossed item lands
     // a few blocks away; a real player would step onto it).
-    const walker = setInterval(() => this.pickupStep(bot), 150);
+    const walker = setInterval(() => this.walkItems && this.pickupStep(bot), 150);
     bot.once("end", () => clearInterval(walker));
     await new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error(`Tester spawn timeout (${this.lastKick})`)), 60_000);

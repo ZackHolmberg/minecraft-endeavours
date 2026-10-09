@@ -6,10 +6,12 @@ Black-box benchmark for the Minecraft bot. It scores any bot checkout (frozen v1
 
 ```bash
 # test server must be up (worktree: ./scripts/start.sh; see v2/TEST_SERVER.md)
-npm run eval -- --bot-dir <checkout> --label <name> [--only "t1.*,t2.door_house"] [--repeat N] [--out dir] [--no-reset] [--timeout-scale 0.1]
+npm run eval -- --bot-dir <checkout> --label <name> [--only "t1.*,t2.door_house"] [--repeat N] [--out dir] [--no-reset] [--timeout-scale 0.1] [--suite core|stretch|all] [--dry]
 npm run eval:compare -- v2/runs/<A> v2/runs/<B>     # markdown deltas to stdout
 npm run typecheck
 ```
+- `--suite`: `core` (default: tiers 1-3 + conv/int/pl/cr, run every slice) | `stretch` (tier 4, milestones) | `all`. `--only` without `--suite` searches all suites. Catalogue spec: `v2/SCENARIOS.md`; code: `src/eval/scenarios/{tier1..4,groups}.ts`.
+- `--dry`: reset -> setup -> check only, no bot process, no say(), no Haiku. A stand-in client named like the bot lets RCON gives/tps work. For each scenario it prints whether the check fails on the untouched setup and passes after `Scenario.dryWin()` (RCON-simulated success). Run `npm run eval -- --bot-dir <any> --label dry --dry --suite all --no-reset` after adding/changing scenarios; look for `BROKEN`/`SUSPECT`/`ERROR` lines.
 - `--bot-dir`: checkout with `src/index.ts`, `config/bots.yml` (bot username = first entry), `.env` (MC_HOST/MC_PORT/MC_VERSION; must point at the test port). The live checkout is refused.
 - Frozen v1: `/Users/zackholmberg/dev/minecraft-endeavours-v1base` (its `node_modules` is a **symlink** to the v2 worktree's; run `npm install` only in the v2 worktree).
 - Output (default `v2/runs/<label>-<YYYYMMDD-HHMM>/`, gitignored): `results.jsonl` (one `ScenarioResult` per line), `summary.md`, `logs/<scenario>-<rep>.log` (bot stdout), `telemetry/<scenario>-<rep>/<bot>/events.jsonl`, `meta.json`.
@@ -38,8 +40,9 @@ export const giveBread: Scenario = {
 2. `ctx.say()` rewrites the word "steve" to the bot's real username (the router only matches `Steve_v2`, not "steve").
 3. Player builds: construct with `ctx.fill/setBlock`, then `ctx.protect(box, label)`. Any protected block that changes **block type** (door open/close is fine) after setup counts in `violations.brokenProtected` and forces `ok=false` (score capped at 0.5).
 4. `check()` must be cheap and idempotent (polled every 5s). Return `score` for partial credit. `waitForDone()` returns early once a poll succeeds.
-5. Set `pillarAllowed`, `maxBotChats` (default 8), `gameMode` when relevant. Scenario coordinates: `ctx.at(dx,dy,dz)` (site-relative), `ctx.surface(x,z)` (standing y).
-6. Smoke it: `npm run eval -- --bot-dir <v1base> --label dbg --only "<id>" --no-reset --out v2/runs/dbg`.
+5. Extra ctx helpers: `placedBlocks(box)` (air->solid since setup), `foodLevel/health(player)`, `timeOfDay()`, `gameTime()` (use for elapsed-time checks), `eventCount("death"|"pillar"|...)` from telemetry, `scratch` (per-run state shared by setup/run/check; never use module-level state), `succeeded`. Scripted multi-message scenarios: use `ctx.sleep/say/waitForBotChat`; a check that could pass trivially early must gate on `scratch` flags (see t1.follow). `holdUntilDone(ctx)` keeps run() alive for tasks the bot may declare done early (t3.survive_night). Optional `dryWin(ctx)` makes `--dry` verify the check.
+6. Set `pillarAllowed`, `maxBotChats` (default 8), `gameMode` when relevant. Scenario coordinates: `ctx.at(dx,dy,dz)` (site-relative), `ctx.surface(x,z)` (standing y).
+7. Smoke it: `npm run eval -- --bot-dir <v1base> --label dbg --only "<id>" --no-reset --out v2/runs/dbg`.
 
 ## Metrics (`ScenarioResult`)
 - `ok`/`score`/`detail`: success latched if **any** poll or the final check passed; score = best seen. `timedOut`: timeout hit without success. `harnessError`: infra failure, not the bot's fault (check `logs/`).
@@ -51,6 +54,7 @@ export const giveBread: Scenario = {
 ## Caveats
 - Paper throttles same-IP logins within 4s; the runner waits 5.5s after the Tester connects before starting the bot.
 - The Tester walks over dropped items within 6 blocks (like a human) so hand-offs register; it otherwise stays put. It is creative so mobs ignore it.
+- `data get` truncates long lists in command feedback, so `ctx.inventory/containerItems` read entries one at a time (`Inventory[i]`, `equipment.<slot>`). Do the same for any new RCON NBT reads.
 - `blockAt/countBlocks` read the Tester's loaded chunks (view distance 6); if a chunk is unloaded the ctx hops the Tester there briefly. Keep scenario boxes within ~80 blocks of the site.
 - Telemetry flushes ~1/s; wall times have ~5s poll granularity. A task still running when the 60s in-flight wait ends is missing from metrics.
 - Bot-side state outside `data/orchestrator/memory` and `.bot-runtime` is not wiped. If v2 stores state elsewhere, extend `wipeBotState` in `bot-process.ts`.

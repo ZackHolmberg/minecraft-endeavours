@@ -65,12 +65,16 @@ export interface Scenario {
   gameMode?: "survival" | "creative";
   /** Pillar-jumping is a violation unless the task needs it (default false). */
   pillarAllowed?: boolean;
+  /** "core" runs every slice (default); "stretch" is tier-4, run at milestones (runner --suite). */
+  suite?: "core" | "stretch";
   /** Bot chat lines above this count = chat-spam violation (default 8). */
   maxBotChats?: number;
   /** World/inventory setup after the standard reset. Register player builds with ctx.protect(). */
   setup(ctx: ScenarioCtx): Promise<void>;
   /** The player's script: usually one ctx.say() then ctx.waitForDone(). */
   run(ctx: ScenarioCtx): Promise<void>;
+  /** (--dry only) Simulate a successful bot via RCON so the harness can verify check() passes. */
+  dryWin?(ctx: ScenarioCtx): Promise<void>;
   /** Success check. Polled every ~5s during run() for early success, and once at the end. */
   check(ctx: ScenarioCtx): Promise<CheckResult>;
 }
@@ -128,6 +132,23 @@ export interface ScenarioCtx {
   countBlocks(box: Box, name: string | RegExp): Promise<number>;
   /** True if any entity matches the selector, e.g. "@e[tag=eval_zombie]". */
   entityExists(selector: string): Promise<boolean>;
+  /** (eval-harness addition) Positions in box that went from air/replaceable to solid since setup ended. */
+  placedBlocks(box: Box): Promise<number>;
+  /** (eval-harness addition) True once a check() poll has passed (waitForDone also returns then). */
+  readonly succeeded: boolean;
+  /** (eval-harness addition) Hunger bar 0..20. */
+  foodLevel(player: string): Promise<number>;
+  /** (eval-harness addition) Health 0..20. */
+  health(player: string): Promise<number>;
+  /** (eval-harness addition) `time query daytime` (0..23999). */
+  timeOfDay(): Promise<number>;
+  /** (eval-harness addition) `time query gametime` (monotonic ticks; use for elapsed-time checks). */
+  gameTime(): Promise<number>;
+  /** (eval-harness addition) Count of the bot's telemetry events of this kind so far, e.g. "death", "pillar". */
+  eventCount(kind: string): number;
+  /** (eval-harness addition) Per-scenario-run scratch space shared by setup/run/check (module-level state is NOT per run). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  scratch: Record<string, any>;
   /** All bot chat lines seen this scenario, in order. */
   readonly botChats: readonly string[];
 }

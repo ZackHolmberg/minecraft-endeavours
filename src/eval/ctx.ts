@@ -1,6 +1,6 @@
 /** ScenarioCtx implementation: wires RCON + Tester + telemetry for one scenario. */
 import type { Rcon } from "./rcon.js";
-import { countEquipment, countItems, mergeCounts, parsePos, stripDataPrefix } from "./snbt.js";
+import { parseItemEntry, parsePos, stripDataPrefix } from "./snbt.js";
 import { readEvents, taskState } from "./telemetry.js";
 import type { Tester } from "./tester.js";
 import type { Box, ScenarioCtx, Vec3 } from "./types.js";
@@ -19,6 +19,10 @@ export class EvalContext implements ScenarioCtx {
   /** Positions of protected blocks that changed type after protection was armed. */
   readonly brokenProtected = new Map<string, string>();
   armed = false;
+  /** First/last block name per position changed after arming (placedBlocks). */
+  private readonly changes = new Map<string, { pos: Vec3; first: string; last: string }>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  scratch: Record<string, any> = {};
   /** Epoch ms of the first say(); null until then. */
   firstSayAt: number | null = null;
   lastSayAt: number | null = null;
@@ -37,6 +41,10 @@ export class EvalContext implements ScenarioCtx {
   ) {
     this.offBlock = t.onBlockChange((c) => {
       if (!this.armed) return;
+      const k = `${c.pos.x},${c.pos.y},${c.pos.z}`;
+      const prev = this.changes.get(k);
+      if (prev) prev.last = c.to;
+      else this.changes.set(k, { pos: c.pos, first: c.from, last: c.to });
       for (const p of this.protectedBoxes)
         if (inBox(c.pos, p.box)) this.brokenProtected.set(`${c.pos.x},${c.pos.y},${c.pos.z}`, `${c.from}->${c.to}@${c.pos.x},${c.pos.y},${c.pos.z}`);
     });
@@ -151,13 +159,37 @@ export class EvalContext implements ScenarioCtx {
   }
 
   // ── state queries ──
-  async inventory(player: string): Promise<Map<string, number>> {
-    const inv = countItems(await this.rcon(`data get entity ${player} Inventory`));
-    const eq = countEquipment(await this.rcon(`data get entity ${player} equipment`));
-    return mergeCounts(inv, eq);
+  /**
+   * `data get` truncates long lists in its feedback (silently dropping items), so read entries one
+   * by one: <path>[0], [1], ... until "Found no elements".
+   */
+  private async readItems(target: string, listPath: string, slots?: string[]): Promise<Map<string, number>> {
+    const m = new Map<string, number>();
+    const add = (out: string) => {
+      const it = parseItemEntry(out);
+      if (it) m.set(it.name, (m.get(it.name) ?? 0) + it.count);
+    };
+    if (slots) for (const sl of slots) add(await this.rcon(`data get ${target} ${sl}`));
+    else
+      for (let i = 0; i < 80; i++) {
+        const out = await this.rcon(`data get ${target} ${listPath}[${i}]`);
+        if (!parseItemEntry(out)) break;
+        add(out);
+      }
+    return m;
   }
-  async containerItems(pos: Vec3): Promise<Map<string, number>> {
-    return countItems(await this.rcon(`data get block ${pos.x} ${pos.y} ${pos.z} Items`));
+  async inventory(player: string): Promise<Map<string, number>> {
+    const inv = await this.readItems(`entity ${player}`, "Inventory");
+    const eq = await this.readItems(
+      `entity ${player}`,
+      "",
+      ["head", "chest", "legs", "feet", "offhand", "body"].map((s) => `equipment.${s}`),
+    );
+    for (const [k, n] of eq) inv.set(k, (inv.get(k) ?? 0) + n);
+    return inv;
+  }
+  containerItems(pos: Vec3): Promise<Map<string, number>> {
+    return this.readItems(`block ${pos.x} ${pos.y} ${pos.z}`, "Items");
   }
   async position(player: string): Promise<Vec3> {
     const p = parsePos(await this.rcon(`data get entity ${player} Pos`));
@@ -183,6 +215,29 @@ export class EvalContext implements ScenarioCtx {
   async entityExists(selector: string): Promise<boolean> {
     return /passed/i.test(await this.rcon(`execute if entity ${selector}`));
   }
+  get succeeded(): boolean {
+    return this.successFlag;
+  }
+  async placedBlocks(b: Box): Promise<number> {
+    let n = 0;
+    for (const c of this.changes.values()) if (inBox(c.pos, b) && REPLACEABLE.test(c.first) && !REPLACEABLE.test(c.last)) n++;
+    return n;
+  }
+  async foodLevel(player: string): Promise<number> {
+    return numData(await this.rcon(`data get entity ${player} foodLevel`));
+  }
+  async health(player: string): Promise<number> {
+    return numData(await this.rcon(`data get entity ${player} Health`));
+  }
+  async timeOfDay(): Promise<number> {
+    return Number(/(\d+)/.exec(await this.rcon("time query daytime"))?.[1] ?? -1);
+  }
+  async gameTime(): Promise<number> {
+    return Number(/(\d+)/.exec(await this.rcon("time query gametime"))?.[1] ?? -1);
+  }
+  eventCount(kind: string): number {
+    return readEvents(this.eventsPath).filter((e) => e.kind === kind).length;
+  }
   get botChats(): readonly string[] {
     return this.t.chats.map((l) => l.text);
   }
@@ -194,6 +249,14 @@ export class EvalContext implements ScenarioCtx {
     for (let i = 0; i < 20 && this.t.blockNameAt(pos) === null; i++) await sleep(500);
     if (back) await this.rcon(`tp ${this.tester} ${back.x} ${back.y} ${back.z}`);
   }
+}
+
+/** Block names that count as "nothing there" for placedBlocks. */
+const REPLACEABLE = /^(air|cave_air|void_air|water|lava|short_grass|tall_grass|fern|large_fern|snow|dead_bush|seagrass|tall_seagrass|vine|poppy|dandelion|fire|light|[a-z_]*flower|[a-z_]*tulip)$/;
+
+function numData(out: string): number {
+  const m = /data: (-?[\d.]+)/.exec(out);
+  return m ? Number(m[1]) : -1;
 }
 
 export function inBox(p: Vec3, b: Box): boolean {

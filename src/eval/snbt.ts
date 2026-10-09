@@ -128,3 +128,14 @@ export function parsePos(out: string): { x: number; y: number; z: number } | nul
     return { x: v[0] as number, y: v[1] as number, z: v[2] as number };
   return null;
 }
+
+/**
+ * One `data get ...` entry → {name, count}. The server truncates long NBT in command feedback
+ * ("..."), but id and count always come first, so regexes are enough (and safe against truncation).
+ */
+export function parseItemEntry(out: string): { name: string; count: number } | null {
+  const id = /id: "(?:minecraft:)?([a-z0-9_]+)"/.exec(out);
+  if (!id) return null;
+  const c = /count: (\d+)/.exec(out);
+  return { name: id[1]!, count: c ? Number(c[1]) : 1 };
+}

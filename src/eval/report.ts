@@ -90,6 +90,9 @@ export function summaryMarkdown(results: ScenarioResult[], title: string): strin
   const tiers = groupBy(results, (r) => r.tier);
   for (const t of [...tiers.keys()].sort()) L.push(row(`T${t}`, aggregateResults(tiers.get(t)!)));
   L.push(row("**overall**", aggregateResults(results)));
+  L.push("", "## Per group (id prefix)", "", "| group | runs | success | mean score | median wall s | turns | tok in | tok out | cache | cost | viol |", "|---|---|---|---|---|---|---|---|---|---|---|");
+  const groups = groupBy(results, (r) => r.id.split(".")[0]!);
+  for (const g of groups.keys()) L.push(row(String(g), aggregateResults(groups.get(g)!)));
   const he = results.filter((r) => r.harnessError).length;
   if (he) L.push("", `WARNING: ${he} run(s) had harness errors (not attributable to the bot).`);
   return L.join("\n") + "\n";
