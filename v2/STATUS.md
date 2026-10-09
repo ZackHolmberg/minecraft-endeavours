@@ -13,7 +13,7 @@
 
 ## In flight (2026-10-09 ~17:30)
 - Eval chain (background shell): v1 re-run of `t1.eat`,`conv.followup_chest` into `v2/runs/v1-baseline`, then **v2 core run** `v2/runs/v2-s2b` (bot = live worktree @ `4e290f7`-equivalent src `ff27f8d`). Log: `v2/runs/v2-s2b.out` ends with CHAIN_DONE. **Don't edit `src/` until it finishes** (D11).
-- Slice 2b review done (`b7bbdda`); fix agent works in worktree `../mcv2-dev` (branch `v2-fixes`, docker disabled there) → appends "## Fixes" to `v2/reports/slice2b-review.md`. Lead commits on `v2-fixes`, then `git merge --ff-only v2-fixes` into `v2` after the benchmark ends.
+- Slice 2b review done (`b7bbdda`); fix agent works in worktree `../mcv2-dev` (branch `v2-fixes`, docker disabled there) → appends "## Fixes" to `v2/reports/slice2b-review.md`. Lead commits on `v2-fixes` (`35ca957` = 2b review fixes), then merges `v2-fixes` into `v2` after the benchmark ends; dev moves back to the v2 worktree and benchmarks use a frozen `../mcv2-bench` (D11).
 - Frozen v1 bot checkout: `../minecraft-endeavours-v1base` (detached `c1587b0`). Don't edit it.
 If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + report files; whatever exists is the progress.
 
@@ -21,7 +21,7 @@ If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + re
 1. When `v2-s2b` finishes: summarize vs baseline (`npm run eval:compare -- v2/runs/v1-baseline v2/runs/v2-s2b`), add a row to Benchmark scores, patch baseline-v1.md re-run lines.
 2. Apply slice 2b review fixes; implement D12 pillar `purpose` (pillar.ts `pillarUpBy` param; navigation escape + world.ts water escape = "escape"; eval counts purpose != escape).
 3. Milestone check-in with the owner (first-milestone DoD met if v2 beats v1).
-4. Investigate live: jungle-tree drops not picked up (v2-s2b t1.chop_logs: mined 8, collected 4, "no dropped items within 6 blocks"); canopy/2x2 trunk?
+4. Regressions in v2-s2b (agent fixing offline in `../mcv2-dev` → `v2/reports/regressions-1.md`): R1 gather stuck on unreachable jungle species (+leaves impassable), R2 escape-pillaring eats job materials (cobblestone), R3 doors never open now that the door patch is actually applied. Then live re-test. Also: jungle-tree drops not picked up (v2-s2b t1.chop_logs: mined 8, collected 4, "no dropped items within 6 blocks"); canopy/2x2 trunk?
 5. Then slice 2c: prompt/tool-surface trim, request-handling (deliver to player, don't stop at a plan), builder (blueprints + scaffolding) for build_house/portal, pathfinder master pin (D9 #3).
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
