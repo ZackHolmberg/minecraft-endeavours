@@ -1,0 +1,53 @@
+{
+  "seed": "-4172144997902289642",
+  "scoutedAt": "2026-10-09T16:31:19.149Z",
+  "sites": {
+    "forest": {
+      "x": 442,
+      "y": 63,
+      "z": -446,
+      "note": "16 tree trunks within 10 blocks"
+    },
+    "plains": {
+      "x": 760,
+      "y": 64,
+      "z": -12,
+      "note": "flat grass 25x25, height range 1, 0 non-clear columns"
+    },
+    "hills": {
+      "x": 238,
+      "y": 123,
+      "z": 354,
+      "note": "relief 25 blocks (y 110..135) within 14 blocks"
+    },
+    "cave": {
+      "x": -320,
+      "y": 52,
+      "z": -608,
+      "note": "39 cave-exposed ores, 9512 underground air cells within 22 blocks; surface gravel",
+      "underground": {
+        "x": -342,
+        "y": 26,
+        "z": -615
+      }
+    },
+    "spawn": {
+      "x": 0,
+      "y": 63,
+      "z": 0,
+      "note": "nearest land to world origin"
+    },
+    "plains2": {
+      "x": 280,
+      "y": 67,
+      "z": -308,
+      "note": "flat grass 25x25, height range 3, 0 non-clear columns"
+    },
+    "village": {
+      "x": -304,
+      "y": 63,
+      "z": -192,
+      "note": "village_savanna structure origin, ~360 blocks from spawn"
+    }
+  }
+}

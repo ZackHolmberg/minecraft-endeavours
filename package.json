@@ -14,7 +14,9 @@
     "panel:setup": "tsx src/web/server/setup.ts",
     "ui:build": "vite build --config src/web/ui/vite.config.ts",
     "ui:dev": "vite --config src/web/ui/vite.config.ts",
-    "ui:mock": "tsx src/web/ui/mock/server.ts"
+    "ui:mock": "tsx src/web/ui/mock/server.ts",
+    "eval": "tsx src/eval/runner.ts",
+    "eval:compare": "tsx src/eval/compare.ts"
   },
   "engines": {
     "node": ">=20"

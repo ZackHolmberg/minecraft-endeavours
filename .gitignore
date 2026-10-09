@@ -23,3 +23,4 @@ CLAUDE.md
 
 # v2 eval artifacts (runs, logs)
 v2/runs/
+v2/world-pristine/
