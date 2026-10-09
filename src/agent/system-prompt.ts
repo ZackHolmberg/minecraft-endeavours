@@ -1,7 +1,7 @@
 /**
  * Per-bot system prompt for the Claude Agent SDK loop.
  *
- * Tuned for Claude Haiku 4.5 (the standing model — see config/bots.yml).
+ * Tuned for Claude Haiku (originally 4.5, now Haiku 5.5 — see config/bots.yml).
  * Haiku follows a short, prioritized rule list far better than a long essay,
  * so this prompt leads with six numbered must-follow rules, then gives each
  * topic one compact section with concrete do/don't lines and a few examples.

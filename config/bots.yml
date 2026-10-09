@@ -1,5 +1,5 @@
 bots:
-  # Steve_AI runs on Claude Haiku via the plain Claude backend — the standing
+  # Steve_AI runs on Claude Haiku (claude-haiku-5-5) via the plain Claude backend — the standing
   # default for the foreseeable future. Don't switch to the local model
   # (backend: local / hybrid) or another Claude tier without sign-off.
   - username: Steve_AI

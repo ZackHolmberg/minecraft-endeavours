@@ -29,7 +29,7 @@
  *    not in our for-await loop. The loop is for observability (logging
  *    thinking / tool_use), rate-limit handling, and end-of-turn marking.
  *
- * Haiku-era loop hygiene (the bot runs on Haiku 4.5; see config/bots.yml):
+ * Haiku-era loop hygiene (the bot runs on Haiku 5.5; see config/bots.yml):
  *  - Standalone bots get a fresh, deterministic world-context block prepended
  *    to every task message (`buildAgentContext`), so the model plans from
  *    real inventory / surroundings without spending a turn on observation.
@@ -94,10 +94,12 @@ import type {
   WindowStats,
 } from "./types.js";
 
-// Extended-thinking budget for Haiku 4.5 (no adaptive thinking on that tier).
-// Small on purpose: enough to sequence gather → craft → place and to compute
-// placeBlocks coordinates, without adding seconds of latency per tool step.
-const HAIKU_THINKING_BUDGET_TOKENS = 2048;
+// Thinking depth for Haiku 5.5. It only accepts adaptive thinking (a fixed
+// `budgetTokens` is a 400), so effort is the lever. `medium` is the API
+// default, set explicitly so it's visible and tunable: enough to sequence
+// gather → craft → place and compute placeBlocks coordinates; drop to `low`
+// if first-reply latency in botReport.sh runs high.
+const HAIKU_EFFORT = "medium" as const;
 // Upper bound on building the per-message world context. If the bot is mid-
 // reconnect or the block scan stalls, send the chat without context rather
 // than holding the queue.
@@ -303,6 +305,9 @@ export class ClaudeBackend implements AgentBackend {
   private lastTurnError: LastTurnError | null = null;
   private turnsThisEvent = 0;
   private warnedThisEvent = false;
+  // Haiku 5.5 runs safety classifiers with no server-side fallback; a refused
+  // task would otherwise end silently.
+  private refusedThisEvent = false;
   // Messages handed to the SDK whose `result` hasn't arrived yet.
   private eventsInFlight = 0;
   private interruptRequested = false;
@@ -340,11 +345,10 @@ export class ClaudeBackend implements AgentBackend {
       prompt: input,
       options: {
         model: modelIdFor(hint),
-        // Explicit per tier. Haiku 4.5 predates adaptive thinking, so give it
-        // a small fixed budget; leave other tiers on the SDK default (adaptive).
-        ...(hint === "haiku"
-          ? { thinking: { type: "enabled" as const, budgetTokens: HAIKU_THINKING_BUDGET_TOKENS } }
-          : {}),
+        // Haiku 5.5: adaptive thinking steered by effort. No fallbackModel on
+        // purpose — the bot runs on Haiku only, so a safety refusal is reported
+        // to the player (see the "assistant" case) rather than retried elsewhere.
+        ...(hint === "haiku" ? { thinking: { type: "adaptive" as const }, effort: HAIKU_EFFORT } : {}),
         systemPrompt: systemPrompt ?? buildSystemPrompt(bot.username),
         mcpServers: { [MCP_SERVER_NAME]: skillsServer },
         // Disable Claude Code's built-in tools — the NPC's surface is the skill layer only.
@@ -424,6 +428,10 @@ export class ClaudeBackend implements AgentBackend {
     this.turnsThisEvent = 0;
     this.lastAssistantMessageId = null;
     this.warnedThisEvent = false;
+    if (this.refusedThisEvent) {
+      this.refusedThisEvent = false;
+      status = "declined by the model's safety check";
+    }
     this.endTelemetryTask(turns, end);
     resetFailureGuard(this.opts.bot.username);
     const label = this.eventLabels.shift();
@@ -477,6 +485,14 @@ export class ClaudeBackend implements AgentBackend {
         if (msg.error === "rate_limit") {
           this.recordRateLimit("assistant_error", null);
           this.startCooldown(null);
+        }
+        const apiMessage = msg.message as
+          | { stop_reason?: string | null; stop_details?: { category?: string | null } | null }
+          | undefined;
+        if (apiMessage?.stop_reason === "refusal" && !this.refusedThisEvent) {
+          this.refusedThisEvent = true;
+          console.warn(`${tag} ${turnLabel} model declined (refusal, category=${apiMessage.stop_details?.category ?? "none"})`);
+          this.notifyRefusal();
         }
         return;
       }
@@ -699,6 +715,17 @@ export class ClaudeBackend implements AgentBackend {
       botBillableInWindow: this.sumWindow(),
     });
     while (this.anchors.length > 5) this.anchors.shift();
+  }
+
+  /** Tell the conversation partner the request was declined, so the bot doesn't just go quiet. */
+  private notifyRefusal(): void {
+    const partner = getCurrentConversationPartner(this.opts.bot.username);
+    if (!partner) return;
+    try {
+      this.opts.bot.whisper(partner, "sorry, I can't help with that one — try asking another way?");
+    } catch (err) {
+      console.warn(`[${this.opts.bot.username}] refusal whisper failed:`, err);
+    }
   }
 
   private startCooldown(resetsAtUnixSeconds: number | null): void {

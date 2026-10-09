@@ -12,11 +12,13 @@ import type { ModelHint } from "../types.js";
 export function modelIdFor(hint: ModelHint): string {
   switch (hint) {
     case "sonnet":
-      return "claude-sonnet-4-6";
+      return "claude-sonnet-5-5";
     case "haiku":
-      return "claude-haiku-4-5-20251001";
+      // Claude Haiku 5.5 (released 2026-10-07). Dateless pinned ID — no alias
+      // or date suffix. Requires adaptive thinking; see claude-backend.ts.
+      return "claude-haiku-5-5";
     case "opus":
-      return "claude-opus-4-7";
+      return "claude-opus-5-5";
   }
 }
 

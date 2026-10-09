@@ -179,7 +179,8 @@ Works because Claude Code is installed and logged in on this machine. The SDK sh
 
 The streaming-input plan above is now the `session_mode: persistent` fallback. Default is **`per_task`**: a fresh `query()` per routed player message, closed once its `result` arrives. Relevant SDK usage:
 
-- **Model:** `claude-haiku-4-5-20251001` with explicit `thinking: { type: "enabled", budgetTokens: 2048 }`. Lower it or turn thinking off if tool steps feel sluggish.
+- **Model:** `claude-haiku-5-5` (Oct 2026; was `claude-haiku-4-5-20251001`) with `thinking: { type: "adaptive" }` + `effort: "medium"`. Haiku 5.5 rejects `{type: "enabled", budgetTokens}` with a 400. Lower effort to `low` if tool steps feel sluggish. Requires agent SDK ≥ 0.3.293 (released on Haiku 5.5's launch day; `supportedModels()` lists "Haiku 5.5").
+- **Refusals:** Haiku 5.5 runs safety classifiers with no server-side fallback. The SDK can retry on `fallbackModel`, but we deliberately leave it unset (Haiku-only policy); an assistant message with `stop_reason: "refusal"` triggers a whisper to the player.
 - **Stop:** `Query.close()` in per_task mode, `Query.interrupt()` in persistent mode. The next task waits up to 35s for the abandoned skill (`currentTool`) to clear, re-asserting the stop flag meanwhile.
 - **Caching across sessions:** the cache keys on the prefix, not the session. The system prompt interpolates only the username, and per-task data rides in the user message, so the prefix stays byte-stable. **Unverified live:** confirm that `cache_read` on the 2nd task is about the size of the system prompt plus tools.
 - **Spin-up cost:** each task launches a CLI subprocess and rebuilds the MCP server. Not yet measured. If chat → first reply is slow, fall back to `persistent`.
