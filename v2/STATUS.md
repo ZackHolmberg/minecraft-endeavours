@@ -24,11 +24,23 @@ If a session died mid-flight: check `git status` + those report files; typecheck
 2. Slice 1 → benchmark core vs baseline → review → commit.
 3. Slice 2b (executor + job runner + `achieve` tool + agent re-entry + eval busy signal) after slice 1 lands (touches same files). Then benchmark.
 
-## Targets
-TBD after baseline.
+## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
+| metric | v1 baseline | v2 target |
+|---|---|---|
+| Core suite success (30 scenarios) | 12/30 (40%) | **≥ 80%** |
+| Tier 1 / Tier 2 / Tier 3 | 75% / 50% / 0% | ≥ 95% / ≥ 85% / ≥ 60% |
+| Protected blocks broken (player builds) | 4 | **0** |
+| Pillar-to-travel / deaths outside combat scenarios | 1 / 0 | 0 / 0 |
+| Haiku turns, single-goal progression (stone/iron pickaxe) | 20–21, failed | **≤ 6** |
+| Iron pickaxe from empty inventory | fail | **< 5 min** |
+| Full iron kit, stretch (`t4.iron_kit`) | not run | ≥ 2/3 runs, < 20 min, ≤ 10 turns |
+| Diamonds, stretch (`t4.diamonds`) | not run | ≥ 50% |
+| p50 first reply | ~2.6 s | ≤ 3 s |
 
 ## Benchmark scores
-None yet.
+| run | core | t1 | t2 | t3 | conv | int | pl | cr | turns | notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| v1-baseline | 12/30 | 6/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 1/2 | 202 | [report](reports/baseline-v1.md) |
 
 ## Open questions for the owner
 - None yet. (Pushing the `v1` tag / `v2` branch to GitHub: will ask before doing it.)
