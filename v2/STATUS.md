@@ -21,7 +21,8 @@ If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + re
 1. When `v2-s2b` finishes: summarize vs baseline (`npm run eval:compare -- v2/runs/v1-baseline v2/runs/v2-s2b`), add a row to Benchmark scores, patch baseline-v1.md re-run lines.
 2. Apply slice 2b review fixes; implement D12 pillar `purpose` (pillar.ts `pillarUpBy` param; navigation escape + world.ts water escape = "escape"; eval counts purpose != escape).
 3. Milestone check-in with the owner (first-milestone DoD met if v2 beats v1).
-4. Then slice 2c: prompt/tool-surface trim, request-handling (deliver to player, don't stop at a plan), builder (blueprints + scaffolding) for build_house/portal, pathfinder master pin (D9 #3).
+4. Investigate live: jungle-tree drops not picked up (v2-s2b t1.chop_logs: mined 8, collected 4, "no dropped items within 6 blocks"); canopy/2x2 trunk?
+5. Then slice 2c: prompt/tool-surface trim, request-handling (deliver to player, don't stop at a plan), builder (blueprints + scaffolding) for build_house/portal, pathfinder master pin (D9 #3).
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
