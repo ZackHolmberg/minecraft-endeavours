@@ -13,8 +13,9 @@
 
 ## In flight (2026-10-09 ~16:00)
 - **v1 core baseline** running (no agent; process `src/eval/runner.ts --label v1-baseline --suite core --wait-limit --out v2/runs/v1-baseline`). Harness agent died at the usage limit before writing `v2/reports/baseline-v1.md` — lead writes it when the run ends. Tier 1 so far 6/8.
-- **Slice 1** agent (honest primitives, D9) — `src/skills/pathfinder-config.ts`, `world.ts`, `inventory.ts`, `config.ts`, `chat-router.ts`, registry/system-prompt wording → `v2/reports/slice1.md`. Offline validation only; lead runs the benchmark after the baseline finishes.
-- **Slice 2a** agent (pure planner) — `src/planner/**` + vitest → `v2/reports/planner.md`.
+- **Slice 1** committed `5bc85c2` (pending benchmark). Reviewer agent → `v2/reports/slice1-review.md`.
+- **Slice 2a** planner committed `5017410` (37 tests).
+- **Slice 2b** agent: job runner + step executors + recovery ladder + `achieve`/`cancelJob` + job-end re-entry + eval busy signal → `v2/reports/slice2b.md`. Waits for the baseline to finish before live runs.
 - Frozen v1 bot checkout: `../minecraft-endeavours-v1base` (detached `c1587b0`). Don't edit it.
 If a session died mid-flight: check `git status` + those report files; typecheck; whatever exists is the progress.
 
