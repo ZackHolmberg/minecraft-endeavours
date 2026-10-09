@@ -11,7 +11,9 @@ import minecraftData from "minecraft-data";
 import pathfinderPkg from "mineflayer-pathfinder";
 import PrismarineBlock from "prismarine-block";
 import { Vec3 } from "vec3";
-import { ensureMovements, hasConfiguredMovements, withDiggingMovements, type BotWithPathfinder } from "../pathfinder-config.js";
+import { diggingDepth, ensureMovements, hasConfiguredMovements, resetMovementsToBase, withDiggingMovements, DIG_SCOPE_MAX_MS, type BotWithPathfinder } from "../pathfinder-config.js";
+import { isBoxedIn, navigate, navFailureOf } from "../navigation.js";
+import { isNaturalTerrain } from "../structure-guard.js";
 
 const { pathfinder } = pathfinderPkg;
 const registry = minecraftData("1.21.9");
@@ -167,6 +169,221 @@ const goal = new goals.GoalBlock(8, 64, 0);
   ensureMovements(b);
   const ours = b.pathfinder.getPathTo(b.pathfinder.movements, target, 3000) as { path: Array<{ toPlace: unknown[] }> };
   assert.ok(ours.path.every((n) => n.toPlace.length === 0), "no block placement in any path node");
+}
+
+// 8. Re-entrant scopes: base is restored only when the OUTERMOST scope exits.
+{
+  const b = fakeBot("depth", new Map());
+  ensureMovements(b);
+  const base = mv(b);
+  assert.equal(diggingDepth(b), 0);
+  await withDiggingMovements(b, {}, async () => {
+    assert.equal(diggingDepth(b), 1);
+    const dig = mv(b);
+    assert.equal(dig.canDig, true);
+    await withDiggingMovements(b, { allowStructures: true }, async () => {
+      assert.equal(diggingDepth(b), 2);
+      assert.equal(mv(b), dig, "nested scope reuses the digging instance");
+    });
+    assert.equal(diggingDepth(b), 1);
+    assert.equal(mv(b), dig, "inner exit must NOT restore base early");
+    assert.equal(mv(b).canDig, true);
+  });
+  assert.equal(diggingDepth(b), 0);
+  assert.equal(mv(b), base);
+  // Overlapping (parallel skills): A enters, B enters, A exits first -> still digging for B.
+  let releaseA!: () => void, releaseB!: () => void;
+  const a = withDiggingMovements(b, {}, () => new Promise<void>((r) => { releaseA = r; }));
+  const bb = withDiggingMovements(b, {}, () => new Promise<void>((r) => { releaseB = r; }));
+  assert.equal(diggingDepth(b), 2);
+  releaseA(); await a;
+  assert.equal(diggingDepth(b), 1);
+  assert.equal(mv(b).canDig, true, "B still has digging after A exits");
+  releaseB(); await bb;
+  assert.equal(mv(b), base);
+  // Throw inside nested scope unwinds the counter.
+  await assert.rejects(withDiggingMovements(b, {}, () => withDiggingMovements(b, {}, async () => { throw new Error("x"); })), /x/);
+  assert.equal(diggingDepth(b), 0);
+  assert.equal(mv(b), base);
+  // Structure guard stays on while any open scope wants it.
+  const wallB = fakeBot("strict", new Map([["0,64,0", "oak_planks"], ["1,64,0", "oak_planks"]]));
+  await withDiggingMovements(wallB, {}, async () => {
+    await withDiggingMovements(wallB, { allowStructures: true }, async () => {
+      const m = wallB.pathfinder.movements as unknown as { exclusionBreak(b: unknown): number };
+      assert.ok(m.exclusionBreak(wallB.blockAt(new Vec3(0, 64, 0))) >= 100, "strict outer scope keeps the guard");
+    });
+  });
+  // Abandoned (watchdogged) scope: reset puts base back, and the zombie's later finally is a no-op
+  // (it must not underflow/clobber the NEXT skill's scope).
+  let finishZombie!: () => void;
+  const zombie = withDiggingMovements(b, {}, () => new Promise<void>((r) => { finishZombie = r; }));
+  assert.equal(diggingDepth(b), 1);
+  resetMovementsToBase(b);
+  assert.equal(diggingDepth(b), 0);
+  assert.equal(mv(b), base, "watchdog reset restores base");
+  let nextRelease!: () => void;
+  const next = withDiggingMovements(b, {}, () => new Promise<void>((r) => { nextRelease = r; }));
+  finishZombie(); await zombie;
+  assert.equal(diggingDepth(b), 1, "zombie exit leaves the new scope alone");
+  assert.equal(mv(b).canDig, true);
+  nextRelease(); await next;
+  assert.equal(mv(b), base);
+  // Timestamp backstop: a scope open past DIG_SCOPE_MAX_MS is reset by the next ensureMovements.
+  let stuck!: () => void;
+  const leaked = withDiggingMovements(b, {}, () => new Promise<void>((r) => { stuck = r; }));
+  const realNow = Date.now;
+  Date.now = () => realNow() + DIG_SCOPE_MAX_MS + 1000;
+  try { ensureMovements(b); } finally { Date.now = realNow; }
+  assert.equal(diggingDepth(b), 0, "stale scope reset");
+  assert.equal(mv(b), base);
+  stuck(); await leaked;
+  assert.equal(mv(b), base);
+  // A leaked digging instance with no open scope is healed back to base.
+  await withDiggingMovements(b, {}, async () => {});
+  const digInst = (b as unknown as { pathfinder: { movements: unknown } }).pathfinder.movements;
+  b.pathfinder.setMovements(mv(b) === base ? (new Movements(b) as never) : (base as never));
+  ensureMovements(b);
+  assert.equal(mv(b), base);
+  void digInst;
+}
+
+// 9. Dig variant is natural-terrain only: blocksCantBreak is the complement of the allowlist.
+{
+  const b = fakeBot("natural", new Map());
+  await withDiggingMovements(b, {}, async () => {
+    const cant = (b.pathfinder.movements as unknown as { blocksCantBreak: Set<number> }).blocksCantBreak;
+    const id = (n: string): number => registry.blocksByName[n]!.id;
+    const mustProtect = [
+      "furnace", "blast_furnace", "smoker", "crafting_table", "chest", "trapped_chest", "barrel", "ender_chest", "bookshelf",
+      "oak_planks", "spruce_planks", "cobblestone", "mossy_cobblestone", "cobbled_deepslate", "stone_bricks", "glass", "glass_pane",
+      "white_wool", "red_bed", "oak_door", "oak_fence", "oak_stairs", "oak_slab", "oak_log", "stripped_oak_log", "oak_sign",
+      "torch", "farmland", "wheat", "hay_block", "redstone_wire", "lever", "tnt", "obsidian", "bedrock", "water", "lava",
+      "white_concrete", "bricks", "glazed_terracotta", "cyan_terracotta", "magenta_glazed_terracotta", "sea_lantern", "ladder",
+    ].filter((n) => registry.blocksByName[n]);
+    for (const n of mustProtect) assert.ok(cant.has(id(n)), `${n} must be unbreakable for pathing`);
+    const mustAllow = [
+      "stone", "granite", "diorite", "andesite", "deepslate", "tuff", "dirt", "grass_block", "coarse_dirt", "podzol", "mycelium",
+      "sand", "red_sand", "gravel", "clay", "sandstone", "terracotta", "orange_terracotta", "netherrack", "basalt", "blackstone",
+      "iron_ore", "deepslate_diamond_ore", "nether_gold_ore", "oak_leaves", "snow_block", "ice", "moss_block", "calcite", "dripstone_block",
+    ].filter((n) => registry.blocksByName[n]);
+    assert.ok(mustAllow.length >= 28, "allowlist sample resolved against minecraft-data");
+    for (const n of mustAllow) assert.ok(!cant.has(id(n)), `${n} is natural terrain: breakable`);
+    for (const n of ["cobblestone", "oak_log", "furnace", "oak_planks"]) assert.equal(isNaturalTerrain(n), false, n);
+    // And the live predicate: safeToBreak honours it.
+    const m = b.pathfinder.movements as unknown as { safeToBreak(blk: unknown): boolean; blocksCantBreak: Set<number> };
+    const mk = (n: string, pos: Vec3) => Object.assign(Block.fromStateId(registry.blocksByName[n]!.defaultState!, 0), { position: pos });
+    assert.equal(m.safeToBreak(mk("furnace", new Vec3(0, 70, 0))), false);
+    assert.equal(m.safeToBreak(mk("cobblestone", new Vec3(0, 70, 0))), false);
+  });
+  // Base policy is unaffected (still canDig=false; and its own safeToBreak is false).
+  assert.equal((b.pathfinder.movements as unknown as { canDig: boolean }).canDig, false);
+}
+
+// 10. isBoxedIn: sealed shaft / deep pit = boxed; open ground, 1-high step, door = not.
+{
+  const flat = (extra: (m: Map<string, string>) => void = () => {}): Map<string, string> => {
+    const m = new Map<string, string>();
+    for (let x = -12; x <= 12; x++) for (let z = -12; z <= 12; z++) m.set(`${x},63,${z}`, "stone");
+    extra(m);
+    return m;
+  };
+  const at = (blocks: Map<string, string>, y = 64): BotWithPathfinder => {
+    const b = fakeBot("box", blocks);
+    b.entity.position = new Vec3(0.5, y, 0.5);
+    return b;
+  };
+  assert.equal(isBoxedIn(at(flat())), false, "open ground");
+  // 1x1 shaft 5 deep: walls x=±1 / z=±1 from y=59..68, floor at y=58 (bot at y=59).
+  const shaft = flat((m) => {
+    for (let y = 58; y <= 62; y++) for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) m.set(`${dx},${y},${dz}`, "stone");
+    for (let y = 58; y <= 63; y++) m.delete(`0,${y},0`);
+    m.set("0,58,0", "stone");
+    for (let y = 59; y <= 63; y++) m.delete(`0,${y},0`);
+  });
+  assert.equal(isBoxedIn(at(shaft, 59)), true, "sealed 1x1 pit deeper than the drop limit");
+  // Wide pit 9x9, 6 deep.
+  const wide = flat((m) => {
+    for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) for (let y = 58; y <= 63; y++) m.delete(`${x},${y},${z}`);
+    for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) m.set(`${x},57,${z}`, "stone");
+  });
+  assert.equal(isBoxedIn(at(wide, 58)), true, "wide pit: every wall is >1 high");
+  // Same pit with a ramp: not boxed.
+  const ramp = flat((m) => {
+    for (let x = -5; x <= 5; x++) for (let z = -4; z <= 4; z++) for (let y = 58; y <= 63; y++) m.delete(`${x},${y},${z}`);
+    for (let x = -5; x <= 5; x++) for (let z = -4; z <= 4; z++) m.set(`${x},57,${z}`, "stone");
+    // stairs rising toward +x: standing cell at x=k is y=58+k (k=1..5), solid below it
+    for (let k = 1; k <= 5; k++) for (let y = 58; y < 58 + k; y++) for (let z = -4; z <= 4; z++) m.set(`${k},${y},${z}`, "stone");
+  });
+  assert.equal(isBoxedIn(at(ramp, 58)), false, "ramp out");
+  // Closed room with a door: not boxed.
+  const room2 = flat((m) => {
+    for (let x = -2; x <= 2; x++) for (let z = -2; z <= 2; z++) if (Math.abs(x) === 2 || Math.abs(z) === 2) for (const y of [64, 65]) m.set(`${x},${y},${z}`, "stone");
+    m.set("2,64,0", "oak_door"); m.delete("2,65,0");
+  });
+  assert.equal(isBoxedIn(at(room2)), false, "door counts as passable");
+  const room3 = new Map(room2); room3.set("2,64,0", "stone"); room3.set("2,65,0", "stone");
+  assert.equal(isBoxedIn(at(room3)), true, "sealed room");
+  const air = at(shaft, 59); air.entity.onGround = false;
+  assert.equal(isBoxedIn(air), false, "not on the ground: not a pit");
+}
+
+// 11. navigate() escape: bounded, once per call, only when boxed in, dig variant is natural-only.
+{
+  const pit = new Map<string, string>();
+  for (let x = -12; x <= 12; x++) for (let z = -12; z <= 12; z++) pit.set(`${x},63,${z}`, "stone");
+  for (let y = 58; y <= 62; y++) for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) pit.set(`${dx},${y},${dz}`, "stone");
+  for (let y = 59; y <= 63; y++) pit.delete(`0,${y},0`);
+  pit.set("0,58,0", "stone");
+  const mkNav = (name: string, blocks: Map<string, string>, y: number, digWorks: boolean) => {
+    const b = fakeBot(name, blocks);
+    b.entity.position = new Vec3(0.5, y, 0.5);
+    const calls: boolean[] = [];
+    (b.pathfinder as unknown as { goto: (g: unknown) => Promise<void> }).goto = async () => {
+      const dig = (b.pathfinder.movements as unknown as { canDig: boolean }).canDig;
+      calls.push(dig);
+      if (!dig || !digWorks) throw new Error("No path to the goal!");
+      b.entity.position = new Vec3(8.5, 64, 0.5); // "arrived"
+    };
+    (b.pathfinder as unknown as { isMining: () => boolean; isBuilding: () => boolean }).isMining = () => false;
+    (b.pathfinder as unknown as { isBuilding: () => boolean }).isBuilding = () => false;
+    return { b, calls };
+  };
+  const target = new Vec3(8.5, 64, 0.5);
+  const goalNear = new goals.GoalNear(8, 64, 0, 1);
+  {
+    const { b, calls } = mkNav("esc1", pit, 59, true);
+    const r = await navigate(b, goalNear as never, { label: "x", target });
+    assert.equal(r.ok, true, r.message);
+    assert.deepEqual(calls, [false, true], "no-dig attempt, then exactly one dig-out");
+    assert.equal((r.state as { escaped?: string }).escaped, "dig");
+    assert.equal(diggingDepth(b), 0);
+    assert.equal(mv(b).canDig, false);
+  }
+  {
+    const { b, calls } = mkNav("esc2", pit, 59, false);
+    const r = await navigate(b, goalNear as never, { label: "x", target });
+    assert.equal(r.ok, false);
+    assert.equal(navFailureOf(r), "no_path");
+    assert.deepEqual(calls, [false, true], "bounded: one escape attempt, no loop");
+  }
+  {
+    const { b, calls } = mkNav("esc3", pit, 59, true);
+    const r = await navigate(b, goalNear as never, { label: "x", target, escape: "none" });
+    assert.equal(r.ok, false);
+    assert.deepEqual(calls, [false], "escape: none never digs");
+    const { b: b4, calls: c4 } = mkNav("esc4", pit, 59, true);
+    const r4 = await navigate(b4, goalNear as never, { label: "x", target, escape: "pillar" });
+    assert.equal(r4.ok, false);
+    assert.deepEqual(c4, [false], "pillar-only mode without filler does not dig");
+  }
+  {
+    const open = new Map<string, string>();
+    for (let x = -12; x <= 12; x++) for (let z = -12; z <= 12; z++) open.set(`${x},63,${z}`, "stone");
+    const { b, calls } = mkNav("esc5", open, 64, true);
+    const r = await navigate(b, goalNear as never, { label: "x", target });
+    assert.equal(r.ok, false);
+    assert.deepEqual(calls, [false], "not boxed in: no escape (plain unreachable target)");
+  }
 }
 
 console.log("movements-lifecycle: all assertions passed");

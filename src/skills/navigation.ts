@@ -20,11 +20,12 @@
 
 import type { Bot } from "mineflayer";
 import type { goals as GoalsNs } from "mineflayer-pathfinder";
-import type { Vec3 } from "vec3";
+import { Vec3 } from "vec3";
 import { recordEvent } from "../observability/telemetry.js";
 import type { Vec } from "../observability/telemetry-types.js";
 import { getBotState } from "../state/index.js";
-import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { diggingDepth, ensureMovements, withDiggingMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { pickFiller, pillarUpBy } from "./pillar.js";
 import type { SkillResult } from "./types.js";
 
 type Goal = InstanceType<typeof GoalsNs.Goal>;
@@ -44,9 +45,137 @@ export interface NavigateOptions {
   target: Vec3;
   /** Override the distance-scaled hard timeout. */
   timeoutMs?: number;
+  /**
+   * What to try (once per call) when navigation fails with no path while the
+   * bot is boxed in (a pit deeper than the drop limit, a shaft it dug):
+   * "full" (default) = pillar out with inventory filler, else a one-off
+   * staircase dig-out under the natural-only dig Movements; "pillar" = only the
+   * pillar; "none" = never (used by the escape's own re-navigation and by
+   * callers that run their own dig retry).
+   */
+  escape?: "full" | "pillar" | "none";
 }
 
+/** Why a failed navigate failed (`state.failure` on the SkillResult). */
+export type NavFailure = "no_path" | "stuck" | "timeout" | "error";
+
+export function navFailureOf(r: SkillResult): NavFailure | null {
+  const f = (r.state as { failure?: NavFailure } | undefined)?.failure;
+  return f ?? null;
+}
+
+const ESCAPE_MAX_PILLAR = 6;
+const BOXED_MAX_CELLS = 150;
+const BOXED_MAX_RADIUS = 6;
+
 export async function navigate(bot: Bot, goal: Goal, opts: NavigateOptions): Promise<SkillResult> {
+  const r = await navigateOnce(bot, goal, opts);
+  const mode = opts.escape ?? "full";
+  if (r.ok || mode === "none" || navFailureOf(r) !== "no_path") return r;
+  if (getBotState(bot.username)?.cancellation.isRequested()) return r;
+  try {
+    return (await tryEscape(bot, goal, opts, mode, r)) ?? r;
+  } catch (err) {
+    console.warn(`[${bot.username}] nav escape threw: ${err instanceof Error ? err.message : String(err)}`);
+    return r;
+  }
+}
+
+/**
+ * Bounded (one attempt per navigate call) escape for a bot with no path that
+ * is enclosed. Order: pillar up with filler from the inventory; else a one-off
+ * dig-out toward the goal under the natural-only dig Movements. Each step
+ * emits the usual `pillar` / `nav` telemetry. Returns null when not applicable.
+ */
+async function tryEscape(
+  bot: Bot,
+  goal: Goal,
+  opts: NavigateOptions,
+  mode: "full" | "pillar",
+  failed: SkillResult,
+): Promise<SkillResult | null> {
+  const pBot = bot as BotWithPathfinder;
+  if (!isBoxedIn(bot)) return null;
+  const cancellation = getBotState(bot.username)?.cancellation;
+  const sub = { ...opts, escape: "none" as const };
+
+  if (pickFiller(bot)) {
+    let climbed = 0;
+    while (climbed < ESCAPE_MAX_PILLAR && isBoxedIn(bot) && !cancellation?.isRequested()) {
+      const p = await pillarUpBy(bot, 1);
+      if (!p.ok) break;
+      climbed += 1;
+    }
+    if (climbed > 0 && !isBoxedIn(bot)) {
+      console.log(`[${bot.username}] nav escape: pillared ${climbed} out of an enclosed spot, re-navigating`);
+      const r2 = await navigateOnce(bot, goal, { ...sub, label: `${opts.label} (after pillar escape)` });
+      return r2.ok ? { ...r2, state: { ...(r2.state ?? {}), escaped: "pillar", pillared: climbed } } : r2;
+    }
+  }
+  if (mode === "pillar" || cancellation?.isRequested() || diggingDepth(pBot) > 0) return null;
+
+  console.log(`[${bot.username}] nav escape: enclosed with no path, trying a natural-terrain dig-out`);
+  const r3 = await withDiggingMovements(pBot, {}, () => navigateOnce(bot, goal, { ...sub, label: `${opts.label} (dig-out escape)` }));
+  if (r3.ok) return { ...r3, state: { ...(r3.state ?? {}), escaped: "dig" } };
+  return failed;
+}
+
+const PASSABLE_NAME_RE = /_door$|_fence_gate$|_trapdoor$/;
+
+/**
+ * True if the bot cannot walk (step up 1, drop <= 3) to anywhere meaningfully
+ * far from where it stands: a bounded flood fill over standing cells that
+ * gives up (=> not boxed in) after BOXED_MAX_CELLS cells or BOXED_MAX_RADIUS
+ * blocks of horizontal spread. Doors/gates count as passable. In liquid -> false.
+ */
+export function isBoxedIn(bot: Bot): boolean {
+  if (!bot.entity.onGround) return false; // mid-air / swimming: not a pit
+  const start = bot.entity.position.floored();
+  const clear = (x: number, y: number, z: number): boolean => {
+    const b = bot.blockAt(new Vec3(x, y, z));
+    if (!b) return false; // unloaded: treat as a wall
+    return b.boundingBox !== "block" || PASSABLE_NAME_RE.test(b.name);
+  };
+  const solid = (x: number, y: number, z: number): boolean => {
+    const b = bot.blockAt(new Vec3(x, y, z));
+    return !!b && b.boundingBox === "block" && !PASSABLE_NAME_RE.test(b.name);
+  };
+  const feet = bot.blockAt(start);
+  if (feet && (feet.name === "water" || feet.name === "lava")) return false;
+  const seen = new Set<string>([`${start.x},${start.y},${start.z}`]);
+  const queue: Array<[number, number, number]> = [[start.x, start.y, start.z]];
+  const dirs: Array<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const visit = (x: number, y: number, z: number): boolean => {
+    const k = `${x},${y},${z}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    queue.push([x, y, z]);
+    return Math.max(Math.abs(x - start.x), Math.abs(z - start.z)) > BOXED_MAX_RADIUS || seen.size > BOXED_MAX_CELLS;
+  };
+  while (queue.length > 0) {
+    const [x, y, z] = queue.shift()!;
+    for (const [dx, dz] of dirs) {
+      const nx = x + dx;
+      const nz = z + dz;
+      if (clear(nx, y, nz) && clear(nx, y + 1, nz)) {
+        // walk or drop (<= 3) to the first floor below
+        for (let k = 0; k <= 3; k++) {
+          if (!clear(nx, y - k, nz)) break; // column blocked
+          if (solid(nx, y - k - 1, nz)) {
+            if (visit(nx, y - k, nz)) return false;
+            break;
+          }
+        }
+      } else if (solid(nx, y, nz) && clear(nx, y + 1, nz) && clear(nx, y + 2, nz) && clear(x, y + 2, z)) {
+        // step up one
+        if (visit(nx, y + 1, nz)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+async function navigateOnce(bot: Bot, goal: Goal, opts: NavigateOptions): Promise<SkillResult> {
   const t0 = Date.now();
   const from = vecOf(bot.entity?.position);
   const distance = bot.entity ? bot.entity.position.distanceTo(opts.target) : 0;
@@ -122,7 +251,8 @@ async function navigateInner(
     if (!abort) {
       const message = err instanceof Error ? err.message : String(err);
       note(/no ?path|noPath/i.test(message) ? "no_path" : "error");
-      return fail(bot, opts, `pathfinding to ${opts.label} failed: ${message}`);
+      const kind = /no ?path|noPath/i.test(message) ? "no_path" : "error";
+      return fail(bot, opts, `pathfinding to ${opts.label} failed: ${message}`, kind);
     }
   } finally {
     clearInterval(watchdog);
@@ -134,7 +264,7 @@ async function navigateInner(
   }
   if (abort) {
     note(abort.startsWith("stuck") ? "stuck" : "timeout");
-    return fail(bot, opts, `movement to ${opts.label} ${abort}`);
+    return fail(bot, opts, `movement to ${opts.label} ${abort}`, abort.startsWith("stuck") ? "stuck" : "timeout");
   }
 
   // Same arrival test pathfinder uses (floored feet, or one up for slabs).
@@ -143,7 +273,7 @@ async function navigateInner(
   if (!isEnd(here) && !isEnd(here.offset(0, 1, 0))) {
     // goto resolved on an empty path without arriving: pathfinder found no route.
     note("no_path");
-    return fail(bot, opts, `path to ${opts.label} ended early`);
+    return fail(bot, opts, `path to ${opts.label} ended early`, "no_path");
   }
   note("arrived");
   return { ok: true, message: `arrived near ${opts.label}`, state: posState(bot) };
@@ -154,12 +284,12 @@ function isBusyInPlace(bot: BotWithPathfinder): boolean {
   return bot.pathfinder.isMining() || bot.pathfinder.isBuilding();
 }
 
-function fail(bot: Bot, opts: NavigateOptions, what: string): SkillResult {
+function fail(bot: Bot, opts: NavigateOptions, what: string, failure: NavFailure): SkillResult {
   const short = bot.entity.position.distanceTo(opts.target);
   return {
     ok: false,
     message: `${what} — stopped ${short.toFixed(1)} blocks from target. If it's inside a building, look for its door; if across water/a cliff, try a different approach point.`,
-    state: posState(bot),
+    state: { ...posState(bot), failure },
   };
 }
 

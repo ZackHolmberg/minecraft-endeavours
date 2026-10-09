@@ -28,7 +28,7 @@ import type { Bot } from "mineflayer";
 import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 import type { Block } from "prismarine-block";
 import { installDoorAssist, patchMovementsForDoors } from "./doors.js";
-import { builtStructureReason } from "./structure-guard.js";
+import { builtStructureReason, isNaturalTerrain } from "./structure-guard.js";
 import { isCreative } from "./game-mode.js";
 
 const { Movements } = pathfinderPkg;
@@ -48,7 +48,22 @@ interface MovementsState {
   base: MovementsT;
   /** Lazily built digging variant, used only inside `withDiggingMovements`. */
   digging?: MovementsT;
+  /** Active (nested / overlapping) digging scopes. Base is restored only at 0. */
+  depth: number;
+  /** Active scopes that want the player-built structure guard on. */
+  strict: number;
+  /** Bumped by `resetMovementsToBase`; scopes from an older generation no longer own the counters. */
+  generation: number;
+  /** When the most recent scope was entered; safety net for abandoned scopes. */
+  digSince: number;
 }
+
+/**
+ * An abandoned (watchdogged) skill can leave a digging scope open. The harness
+ * watchdog resets explicitly; this is the backstop if it doesn't (longest
+ * legitimate scope is one navigate, <= 5 min).
+ */
+export const DIG_SCOPE_MAX_MS = 6 * 60_000;
 
 /**
  * Per-Bot-object configured state. Keyed by the Bot instance (not by
@@ -62,13 +77,18 @@ const states = new WeakMap<object, MovementsState>();
 export function ensureMovements(bot: BotWithPathfinder): void {
   let st = states.get(bot);
   if (!st) {
-    st = { base: buildMovements(bot) };
+    st = { base: buildMovements(bot), depth: 0, strict: 0, generation: 0, digSince: 0 };
     states.set(bot, st);
     bot.pathfinder.setMovements(st.base);
   } else {
+    if (st.depth > 0 && Date.now() - st.digSince > DIG_SCOPE_MAX_MS) {
+      console.warn(`[${bot.username}] digging Movements scope open > ${DIG_SCOPE_MAX_MS / 60_000} min (abandoned skill?); resetting to base`);
+      resetMovementsToBase(bot);
+    }
     // Anyone else calling setMovements with a foreign instance is a bug; heal it.
+    // The digging variant is only legitimate while a scope is open.
     const cur = bot.pathfinder.movements;
-    if (cur !== st.base && cur !== st.digging) bot.pathfinder.setMovements(st.base);
+    if (cur !== st.base && !(st.depth > 0 && cur === st.digging)) bot.pathfinder.setMovements(st.base);
   }
   // The instances are cached for the bot's lifetime but the game mode can
   // change at runtime, so the mode-dependent knob is re-read every call.
@@ -83,13 +103,37 @@ export function hasConfiguredMovements(bot: object): boolean {
   return states.has(bot);
 }
 
+/** Open digging scopes for this bot (0 = base policy; for the harness, checks and tests). */
+export function diggingDepth(bot: object): number {
+  return states.get(bot)?.depth ?? 0;
+}
+
+/**
+ * Force the no-dig policy back, dropping every open scope. Called by the
+ * harness watchdog when it abandons a skill, so a zombie `mineBlocks` can't
+ * leave digging installed (its own `finally` is then a no-op: stale generation).
+ */
+export function resetMovementsToBase(bot: BotWithPathfinder): void {
+  const st = states.get(bot);
+  if (!st) return;
+  st.depth = 0;
+  st.strict = 0;
+  st.generation += 1;
+  bot.pathfinder.setMovements(st.base);
+}
+
 /**
  * Run `fn` with a digging-enabled Movements installed, then restore the
  * no-dig policy in `finally`. Digging is NEVER on globally; use this only
  * around a single navigate/getPathTo call whose target is a natural block the
- * bot is about to mine anyway (e.g. ore buried under dirt). Even then it will
- * not tunnel through anything `builtStructureReason` calls player-built
- * (unless `allowStructures`), and never places blocks.
+ * bot is about to mine anyway (e.g. ore buried under dirt). The dig variant
+ * may only break NATURAL terrain (`isNaturalTerrain` allowlist, via
+ * `blocksCantBreak`), is additionally limited by `builtStructureReason` unless
+ * `allowStructures`, and never places blocks.
+ *
+ * Re-entrant: scopes are counted per bot, and base is restored only when the
+ * outermost scope exits (a nested or overlapping scope can't restore early).
+ * The structure guard stays on while any open scope asked for it.
  */
 export async function withDiggingMovements<T>(
   bot: BotWithPathfinder,
@@ -98,18 +142,39 @@ export async function withDiggingMovements<T>(
 ): Promise<T> {
   ensureMovements(bot);
   const st = states.get(bot)!;
-  if (!st.digging) st.digging = buildMovements(bot, true);
-  // exclusionBreak >= 100 makes pathfinder treat a block as unbreakable.
-  const guard = st.digging.exclusionAreasBreak as unknown as Array<(b: Block) => number>;
-  guard.length = 0;
-  if (!opts.allowStructures) guard.push((b) => (builtStructureReason(bot, b) ? 100 : 0));
+  if (!st.digging) {
+    const dig = buildMovements(bot, true);
+    // exclusionBreak >= 100 makes pathfinder treat a block as unbreakable.
+    const guard = dig.exclusionAreasBreak as unknown as Array<(b: Block) => number>;
+    guard.length = 0;
+    guard.push((b) => (st.strict > 0 && builtStructureReason(bot, b) ? 100 : 0));
+    st.digging = dig;
+  }
+  const strict = !opts.allowStructures;
+  const gen = st.generation;
+  st.depth += 1;
+  if (strict) st.strict += 1;
+  st.digSince = Date.now();
   st.digging.maxDropDown = st.base.maxDropDown;
   bot.pathfinder.setMovements(st.digging);
   try {
     return await fn();
   } finally {
-    bot.pathfinder.setMovements(st.base);
+    if (st.generation === gen) {
+      st.depth = Math.max(0, st.depth - 1);
+      if (strict) st.strict = Math.max(0, st.strict - 1);
+      if (st.depth === 0) bot.pathfinder.setMovements(st.base);
+    }
   }
+}
+
+/** Block ids the dig variant may NOT break: everything outside the natural-terrain allowlist. */
+export function naturalOnlyCantBreak(registry: { blocksArray: Array<{ id: number; name: string; diggable?: boolean }> }): Set<number> {
+  const out = new Set<number>();
+  for (const b of registry.blocksArray) {
+    if (!b.diggable || !isNaturalTerrain(b.name)) out.add(b.id);
+  }
+  return out;
 }
 
 function buildMovements(bot: BotWithPathfinder, digging = false): MovementsT {
@@ -118,6 +183,10 @@ function buildMovements(bot: BotWithPathfinder, digging = false): MovementsT {
   // through player-built walls instead of walking around to a door was the
   // motivating regression — see docstring above for why this is safe.
   m.canDig = digging;
+  // The dig variant may only tunnel through natural terrain (allowlist, not a
+  // denylist): furnaces, tables, containers, planks, cobblestone, glass, wool,
+  // beds, logs, crops... are all off-limits to A*.
+  if (digging) (m as unknown as { blocksCantBreak: Set<number> }).blocksCantBreak = naturalOnlyCantBreak(bot.registry as never);
   // Leave pathfinder's built-in door handling OFF (it's gate-only and its
   // executor branch throws after the first use); ours replaces it.
   m.canOpenDoors = false;

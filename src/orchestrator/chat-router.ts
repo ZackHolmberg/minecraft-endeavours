@@ -147,12 +147,53 @@ export function registerBotAliases(botUsername: string, aliases: readonly string
  */
 export function nameAliases(botUsername: string): string[] {
   const aliases = [botUsername];
-  const base = botUsername.replace(/[_-]?(?:ai|bot|npc)$/i, "");
-  if (base !== botUsername && base.length >= 3) aliases.push(base);
-  for (const extra of configuredAliases.get(botUsername) ?? []) {
-    if (!aliases.some((a) => a.toLowerCase() === extra.toLowerCase())) aliases.push(extra);
-  }
+  const humans = onlineHumanNames(botUsername);
+  const add = (a: string): void => {
+    const lower = a.toLowerCase();
+    if (aliases.some((x) => x.toLowerCase() === lower)) return;
+    // A human who is literally named "Steve" must not have their name read as
+    // addressing the bot (the full username is never dropped).
+    if (humans.has(lower)) return;
+    aliases.push(a);
+  };
+  const base = derivedBaseName(botUsername);
+  if (base) add(base);
+  for (const extra of configuredAliases.get(botUsername) ?? []) add(extra);
   return aliases;
+}
+
+/** `Steve_AI` -> `Steve`; null when there is no AI/Bot/NPC suffix or the base would be < 3 chars. */
+export function derivedBaseName(botUsername: string): string | null {
+  const base = botUsername.replace(/[_-]?(?:ai|bot|npc)$/i, "");
+  return base !== botUsername && base.length >= 3 ? base : null;
+}
+
+/**
+ * Per-bot callback returning the usernames currently online (mineflayer's
+ * `bot.players` keys), registered by `attachBotEventHooks`. Used only to keep
+ * a derived/configured alias from claiming a human player's own name.
+ */
+const onlinePlayers = new Map<string, () => Iterable<string>>();
+
+export function registerOnlinePlayers(botUsername: string, getNames: () => Iterable<string>): void {
+  onlinePlayers.set(botUsername, getNames);
+}
+
+/** Lower-cased usernames online that are not configured bots. */
+function onlineHumanNames(botUsername: string): Set<string> {
+  const out = new Set<string>();
+  const get = onlinePlayers.get(botUsername);
+  if (!get) return out;
+  const bots = new Set([...configuredAliases.keys()].map((b) => b.toLowerCase()));
+  try {
+    for (const n of get()) {
+      const lower = n.toLowerCase();
+      if (!bots.has(lower)) out.add(lower);
+    }
+  } catch {
+    // best-effort
+  }
+  return out;
 }
 
 function mentionsName(text: string, botUsername: string): boolean {
@@ -244,4 +285,5 @@ export function resetChatRouter(): void {
   recentQuestions.clear();
   recentReplies.clear();
   configuredAliases.clear();
+  onlinePlayers.clear();
 }

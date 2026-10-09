@@ -7,6 +7,7 @@ import { clip, recordEvent, summarizeArgs } from "../observability/telemetry.js"
 import { getBotState } from "../state/index.js";
 import { awaitReflexIdle } from "./auto-behaviors.js";
 import { isFlying, land } from "./flight.js";
+import { resetMovementsToBase, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { SkillResult } from "./types.js";
 
 /**
@@ -106,6 +107,14 @@ export async function runSkill<P, R extends SkillResult>(
           // promise is abandoned (it can't be force-cancelled).
           state?.cancellation.request();
           (bot as Bot & { pathfinder?: { stop(): void } }).pathfinder?.stop();
+          // The abandoned skill may be inside a digging-Movements scope; its
+          // `finally` would otherwise restore (or fail to restore) it later,
+          // under whatever skill runs next. Put the no-dig policy back now.
+          try {
+            if ((bot as Partial<BotWithPathfinder>).pathfinder) resetMovementsToBase(bot as BotWithPathfinder);
+          } catch {
+            // best-effort
+          }
           resolve({ ok: false, message: `${name} timed out after ${SKILL_WATCHDOG_MS / 60_000} min and was abandoned` });
         }, SKILL_WATCHDOG_MS);
       });

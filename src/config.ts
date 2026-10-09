@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import yaml from "js-yaml";
-import { registerBotAliases } from "./orchestrator/chat-router.js";
+import { derivedBaseName, registerBotAliases } from "./orchestrator/chat-router.js";
 import type {
   AppConfig,
   BackendKind,
@@ -64,6 +64,17 @@ export function loadConfig(botsYmlPath = "config/bots.yml"): AppConfig {
       }
       owner.set(alias.toLowerCase(), bot.username);
     }
+  }
+  // Derived suffix-stripped names (Steve_AI -> "steve") must not collide with
+  // another bot's username/alias/derived name either: both would answer.
+  for (const bot of bots) {
+    const base = derivedBaseName(bot.username);
+    if (!base) continue;
+    const prior = owner.get(base.toLowerCase());
+    if (prior !== undefined && prior !== bot.username) {
+      throw new Error(`${botsYmlPath}: ${bot.username} also answers to "${base}" (suffix-stripped), which collides with ${prior}`);
+    }
+    owner.set(base.toLowerCase(), bot.username);
   }
   // The chat router matches names against usernames + these aliases.
   for (const bot of bots) registerBotAliases(bot.username, bot.aliases ?? []);

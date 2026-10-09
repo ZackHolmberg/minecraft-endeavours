@@ -14,6 +14,7 @@ import {
   getCurrentConversationPartner,
   isAddressed,
   isStopCommand,
+  registerOnlinePlayers,
   type ChatEvent,
 } from "../orchestrator/chat-router.js";
 import {
@@ -110,6 +111,9 @@ export function attachBotEventHooks(
   state: BotState,
 ): void {
   const tag = `[${username}]`;
+
+  // Lets the router drop an alias a human is using as their own username.
+  registerOnlinePlayers(username, () => Object.keys(bot.players ?? {}));
 
   bot.on("chat", (player, message) => {
     if (player === username) return;

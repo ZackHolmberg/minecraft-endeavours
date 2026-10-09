@@ -32,6 +32,12 @@ interface Opts {
   full?: boolean;
   startInv?: Array<[string, number]>;
   onDig?: (n: number) => void;
+  /**
+   * block keys that LOOK reachable to the first-slice probe ("partial") but whose
+   * no-dig goto rejects with "No path"; with `digFails` the dig goto rejects too.
+   */
+  hard?: Set<string>;
+  digFails?: boolean;
 }
 
 function makeBot(name: string, blocks: Map<string, string>, o: Opts = {}) {
@@ -109,10 +115,17 @@ function makeBot(name: string, blocks: Map<string, string>, o: Opts = {}) {
     const p = goal.pos; // only GoalLookAtBlock targets can be "unreachable" in this stub
     const key = p ? `${p.x},${p.y},${p.z}` : "";
     const digging = (bot.pathfinder.movements as any).canDig;
+    if (o.hard?.has(key)) return { status: "partial", path: [] };
     return { status: o.unreachable?.has(key) && (!digging || o.unreachable.has("*never-dig")) ? "noPath" : "success", path: [] };
   };
+  bot._gotos = [] as boolean[];
   bot.pathfinder.goto = async (goal: any) => {
     const p = goal.pos ?? new Vec3(goal.x, goal.y, goal.z);
+    const canDig = (bot.pathfinder.movements as any).canDig as boolean;
+    if (goal.pos && o.hard?.has(`${p.x},${p.y},${p.z}`)) {
+      bot._gotos.push(canDig);
+      if (!canDig || o.digFails) throw new Error("No path to the goal!");
+    }
     if (goal.pos) lastTarget = goal.pos;
     bot.entity.position = new Vec3(p.x + 0.5, p.y, p.z + 0.5);
     collectNear();
@@ -144,6 +157,17 @@ async function main(): Promise<void> {
     assert.equal(await waitForDropNear(bot, pos, 600), true);
     assert.ok(Date.now() - t0 < 500);
     assert.equal(await waitForDropNear(bot, new Vec3(50, 64, 50), 300), false);
+    // An item that was already lying there does not count (only a NEW spawn does).
+    const old = { id: 2, name: "item", position: pos.offset(0.1, 0, 0.1) };
+    (bot as any).entities[2] = old;
+    assert.equal(await waitForDropNear(bot, pos, 300), false, "pre-existing drop is ignored");
+    setTimeout(() => {
+      const e = { id: 3, name: "item", position: pos.offset(0.2, 0, 0.2) };
+      (bot as any).entities[3] = e;
+      bot.emit("entitySpawn", e as never);
+    }, 100);
+    assert.equal(await waitForDropNear(bot, pos, 600), true, "a new drop next to the old one counts");
+    assert.equal(await waitForDropNear(bot, pos, 300, new Set([2])), true, "explicit pre-dig snapshot: id 3 is new");
   }
 
   // 1. 11 logs, drops appear 200ms AFTER the dig; asking for 10 -> collected 10 (mined 10 or 11).
@@ -202,6 +226,28 @@ async function main(): Promise<void> {
     console.log("  4b:", r.message);
     assert.equal(inv.get("oak_log"), 2);
     assert.equal((bot as any).pathfinder.movements.canDig, false, "digging scope restored");
+  }
+
+  // 4c. Large open region + buried target: the probe says "partial" (not noPath), the no-dig goto
+  //     rejects, and the bounded retry under digging reaches it. Exactly one dig goto per target.
+  {
+    registerBotState("g4c", createBotState());
+    const { bot, inv } = makeBot("g4c", logsColumn(2), { hard: new Set(["3,64,0", "3,65,0"]) });
+    const r = await mineBlock(bot, { type: "oak_log", count: 2 });
+    console.log("  4c:", r.message);
+    assert.equal(inv.get("oak_log"), 2);
+    assert.deepEqual((bot as any)._gotos, [false, true, false, true], "no-dig attempt then ONE dig retry, per target");
+    assert.equal((bot as any).pathfinder.movements.canDig, false, "digging scope restored");
+  }
+  // 4d. Digging doesn't help either: still one retry per target, then skipped as unreachable.
+  {
+    registerBotState("g4d", createBotState());
+    const { bot } = makeBot("g4d", logsColumn(1), { hard: new Set(["3,64,0"]), digFails: true });
+    const r = await mineBlock(bot, { type: "oak_log", count: 1 });
+    console.log("  4d:", r.message);
+    assert.equal(r.ok, false);
+    assert.deepEqual((bot as any)._gotos, [false, true]);
+    assert.equal((bot as any).pathfinder.movements.canDig, false);
   }
 
   // 5. Baseline respected: existing cobblestone doesn't count; stone -> cobblestone delta.

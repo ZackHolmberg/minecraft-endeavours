@@ -58,10 +58,20 @@ const DROP_SPAWN_WAIT_MS = 600;
 const DROP_RESCAN_MS = 120;
 const DROP_NEAR_RADIUS = 2.5;
 
-function hasItemEntityNear(bot: Bot, pos: Vec3, radius: number): boolean {
+/** Ids of the item entities currently loaded (take BEFORE breaking a block). */
+export function snapshotItemIds(bot: Bot): Set<number> {
+  const out = new Set<number>();
   for (const id of Object.keys(bot.entities)) {
     const e = bot.entities[id];
-    if (e && e.name === "item" && e.position.distanceTo(pos) <= radius) return true;
+    if (e && e.name === "item") out.add(e.id);
+  }
+  return out;
+}
+
+function hasNewItemEntityNear(bot: Bot, pos: Vec3, radius: number, known: ReadonlySet<number>): boolean {
+  for (const id of Object.keys(bot.entities)) {
+    const e = bot.entities[id];
+    if (e && e.name === "item" && !known.has(e.id) && e.position.distanceTo(pos) <= radius) return true;
   }
   return false;
 }
@@ -69,12 +79,19 @@ function hasItemEntityNear(bot: Bot, pos: Vec3, radius: number): boolean {
 /**
  * After breaking a block, the item entity arrives a few ticks later (server
  * packet), so a scan immediately after `bot.dig` sees nothing. Resolves true
- * as soon as an item entity is within ~2.5 blocks of `pos` (entitySpawn event,
- * with a short re-scan fallback in case the spawn raced the listener), false
- * after `timeoutMs`. Never throws.
+ * as soon as a NEW item entity (one not in `knownIds`) is within ~2.5 blocks
+ * of `pos` (entitySpawn event, with a short re-scan fallback in case the spawn
+ * raced the listener), false after `timeoutMs`. Items that were already lying
+ * there don't count: pass the `snapshotItemIds` taken before the dig as
+ * `knownIds` (defaults to a snapshot taken now). Never throws.
  */
-export function waitForDropNear(bot: Bot, pos: Vec3, timeoutMs = DROP_SPAWN_WAIT_MS): Promise<boolean> {
-  if (hasItemEntityNear(bot, pos, DROP_NEAR_RADIUS)) return Promise.resolve(true);
+export function waitForDropNear(
+  bot: Bot,
+  pos: Vec3,
+  timeoutMs = DROP_SPAWN_WAIT_MS,
+  knownIds: ReadonlySet<number> = snapshotItemIds(bot),
+): Promise<boolean> {
+  if (hasNewItemEntityNear(bot, pos, DROP_NEAR_RADIUS, knownIds)) return Promise.resolve(true);
   return new Promise((resolve) => {
     let done = false;
     const finish = (v: boolean): void => {
@@ -85,12 +102,12 @@ export function waitForDropNear(bot: Bot, pos: Vec3, timeoutMs = DROP_SPAWN_WAIT
       bot.removeListener("entitySpawn", onSpawn);
       resolve(v);
     };
-    const onSpawn = (e: { name?: string; position: Vec3 }): void => {
-      if (e.name === "item" && e.position.distanceTo(pos) <= DROP_NEAR_RADIUS) finish(true);
+    const onSpawn = (e: { id: number; name?: string; position: Vec3 }): void => {
+      if (e.name === "item" && !knownIds.has(e.id) && e.position.distanceTo(pos) <= DROP_NEAR_RADIUS) finish(true);
     };
-    const timer = setTimeout(() => finish(hasItemEntityNear(bot, pos, DROP_NEAR_RADIUS)), timeoutMs);
+    const timer = setTimeout(() => finish(hasNewItemEntityNear(bot, pos, DROP_NEAR_RADIUS, knownIds)), timeoutMs);
     const poll = setInterval(() => {
-      if (hasItemEntityNear(bot, pos, DROP_NEAR_RADIUS)) finish(true);
+      if (hasNewItemEntityNear(bot, pos, DROP_NEAR_RADIUS, knownIds)) finish(true);
     }, DROP_RESCAN_MS);
     bot.on("entitySpawn", onSpawn);
   });

@@ -5,12 +5,12 @@ const { goals } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
-import { inventoryCounts, inventoryGain, pickUpNearby, waitForDropNear } from "./inventory.js";
+import { inventoryCounts, inventoryGain, pickUpNearby, snapshotItemIds, waitForDropNear } from "./inventory.js";
 import { resolveBlock, resolveItem } from "./item-naming.js";
-import { navigate } from "./navigation.js";
+import { navFailureOf, navigate } from "./navigation.js";
 import { ensureMovements, withDiggingMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import { PILLAR_MAX_HEIGHT, pickFiller, pillarUpBy, waitForGrounded } from "./pillar.js";
-import { builtStructureReason } from "./structure-guard.js";
+import { builtStructureReason, isNaturalTerrain } from "./structure-guard.js";
 import { creativeGive } from "./creative.js";
 import { findPlaceHoverSpot, flyTo, isFlying } from "./flight.js";
 import { isCreative } from "./game-mode.js";
@@ -490,6 +490,7 @@ async function mineOneBlock(
   if (!equipResult.ok) return equipResult;
 
   const digDiag = describeDigSetup(bot, block);
+  const itemsBeforeDig = snapshotItemIds(bot);
   const digStart = Date.now();
   try {
     await digWithTimeout(bot, block);
@@ -512,7 +513,7 @@ async function mineOneBlock(
   // The drop entity spawns a few ticks AFTER bot.dig resolves; scanning right
   // away sees nothing. Wait for it to appear, then collect. The caller counts
   // success by inventory delta, so this result is advisory.
-  await waitForDropNear(bot, block.position.offset(0.5, 0.5, 0.5));
+  await waitForDropNear(bot, block.position.offset(0.5, 0.5, 0.5), undefined, itemsBeforeDig);
   await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
   return { ok: true, message: `mined ${blockNameForMsg}` };
 }
@@ -855,28 +856,56 @@ function describeRequiredTool(block: Block): string {
 
 /**
  * Walk to where `block` is visible and in reach. The default Movements never
- * digs or places, so an enclosed or too-high target reports no-path rather
- * than the bot tunnelling/towering on its own. For a natural target that has
- * no walkable approach (ore under dirt, a stone shelf) we retry ONCE with a
- * scoped digging Movements: it will only break non-player-built blocks (the
- * structure guard, unless allowStructures) and never places; the no-dig policy
- * is restored in `finally`. A high log still fails here (digging can't lift
- * the bot) and the caller skips to the next candidate.
+ * digs or places, so an enclosed or too-high target fails with no-path (or
+ * times out / gets stuck) rather than the bot tunnelling/towering on its own.
+ * When the no-dig navigate fails (no_path / stuck / timeout) toward a NATURAL
+ * mine target, we retry ONCE (per call, i.e. per target) under the scoped
+ * digging Movements: it may only break natural terrain (allowlist, see
+ * `isNaturalTerrain`), honours the structure guard unless allowStructures, and
+ * never places; the no-dig policy is restored in `finally`. We can't gate on
+ * the cheap `getPathTo` probe alone: it only runs the first ~40ms A* slice, so
+ * on open terrain it answers "partial", not "noPath", even for buried ore.
+ * A high log still fails (digging can't lift the bot) and the caller skips to
+ * the next candidate.
  */
 async function pathToBlock(bot: BotWithPathfinder, block: Block, allowStructures = false): Promise<SkillResult> {
   const { x, y, z } = block.position;
   const goal = new goals.GoalLookAtBlock(block.position, bot.world);
   const opts = { label: `${block.name} at ${fmt(x, y, z)}`, target: block.position.offset(0.5, 0.5, 0.5) };
-  const path = bot.pathfinder.getPathTo(bot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS);
-  if (path.status !== "noPath") return navigate(bot, goal, opts);
+  // Natural target only: never dig toward something that is itself player-made
+  // (unless the caller was explicitly asked to demolish).
+  const digEligible = allowStructures || isNaturalTarget(block.name);
 
+  let first: SkillResult | null = null;
+  const probe = bot.pathfinder.getPathTo(bot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS);
+  if (probe.status !== "noPath") {
+    // Pillar-only escape here: the dig retry below covers the dig-out.
+    first = await navigate(bot, goal, { ...opts, escape: digEligible ? "pillar" : "full" });
+    if (first.ok) return first;
+    const failure = navFailureOf(first);
+    const cancelled = (first.state as { cancelled?: boolean } | undefined)?.cancelled === true;
+    if (cancelled || !digEligible || (failure !== "no_path" && failure !== "stuck" && failure !== "timeout")) return first;
+  } else if (!digEligible) {
+    return { ok: false, message: `no path to ${block.name} at ${fmt(x, y, z)} (out of reach without climbing or breaking player-built blocks)` };
+  }
+
+  if (getBotState(bot.username)?.cancellation.isRequested()) {
+    return first ?? { ok: false, message: `movement to ${opts.label} cancelled`, state: { cancelled: true } };
+  }
+  // One scoped digging attempt. If a definite-noPath probe says even digging
+  // can't help, skip the walk.
   const digPath = await withDiggingMovements(bot, { allowStructures }, async () =>
     bot.pathfinder.getPathTo(bot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS),
   );
   if (digPath.status === "noPath") {
-    return { ok: false, message: `no path to ${block.name} at ${fmt(x, y, z)} (out of reach without climbing or breaking player-built blocks)` };
+    return first ?? { ok: false, message: `no path to ${block.name} at ${fmt(x, y, z)} (out of reach without climbing or breaking player-built blocks)` };
   }
-  return withDiggingMovements(bot, { allowStructures }, () => navigate(bot, goal, opts));
+  return withDiggingMovements(bot, { allowStructures }, () => navigate(bot, goal, { ...opts, escape: "none" }));
+}
+
+/** Terrain, ores and trees: things a miner may legitimately tunnel toward. */
+function isNaturalTarget(name: string): boolean {
+  return isNaturalTerrain(name) || /_log$|_wood$|^stripped_/.test(name);
 }
 
 /**
