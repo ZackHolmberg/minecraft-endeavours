@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
-  ActionDef, ActionId, AuditEntry, BackupInfo, ConsoleResponse, JobDetail, JobSummary, MeResponse,
+  ActionDef, ActionId, AuditEntry, BackupInfo, ConsoleResponse, GameMode, JobDetail, JobSummary, MeResponse,
   PlayersResponse, ReportResponse, StatusResponse, WsChannel, WsClientMessage, WsServerMessage,
 } from "../../shared/api.js";
 import type { BotSnapshot } from "../../../observability/snapshot.js";
@@ -44,6 +44,7 @@ const state = {
   server: { state: (process.env.MOCK_SERVER === "down" ? "stopped" : "running") as StatusResponse["server"]["state"], since: START - 5.2 * 3600_000 },
   bot: { running: process.env.MOCK_BOT !== "down", since: runStart, pid: 48213 },
   players: { online: ["Zack", "Alex"], whitelist: ["Zack", "Alex", "Steve_AI", "Notch_Jr"], ops: ["Zack"] } as PlayersResponse,
+  gameModes: { Zack: "creative", Alex: "survival", Steve_AI: "survival" } as Record<string, GameMode>,
   pos: { x: 112.4, y: 64, z: -40.2 },
   health: 17, food: 15,
 };
@@ -153,16 +154,20 @@ const ACTIONS: Array<Omit<ActionDef, "available" | "unavailableReason">> = [
   { id: "bot.restart", label: "Restart", description: "Stop and start the orchestrator.", confirm: true, group: "bot" },
   { id: "world.save", label: "Save world", description: "Run save-all over RCON.", confirm: false, group: "world" },
   { id: "backup.run", label: "Backup", description: "save-all, then archive the world to ./backups (keeps the last 10).", confirm: false, group: "world" },
+  { id: "world.new", label: "New world", description: "Back up, stop the bot and server, move the world folders to backups/worlds/ and the bot's memory to memory-archive/, then start the server on a fresh world. Nothing is deleted; everyone is disconnected; takes a few minutes.", confirm: true, group: "world" },
 ];
 const groupOf = (id: ActionId) => ACTIONS.find((a) => a.id === id)!.group;
 const running = () => jobs.filter((j) => j.state === "running");
 
 function actionDefs(): ActionDef[] {
   const busy = new Set(running().map((j) => groupOf(j.action)));
+  const exclusive = running().some((j) => j.action === "world.new");
   const up = state.server.state === "running";
   return ACTIONS.map((a) => {
     let reason: string | null = null;
-    if (busy.has(a.group)) reason = "Another job in this group is running";
+    if (exclusive) reason = "A new world is being generated";
+    else if (a.id === "world.new") reason = running().length > 0 ? "Another job is running — a new world needs the panel to itself" : state.server.state === "starting" ? "Server is starting — wait until it is reachable (the backup needs RCON)" : null;
+    else if (busy.has(a.group)) reason = "Another job in this group is running";
     else if (a.id === "server.start" && state.server.state !== "stopped") reason = "Server is already running";
     else if ((a.id === "server.stop" || a.id === "server.restart") && state.server.state === "stopped") reason = "Server is stopped";
     else if (a.id === "bot.start" && state.bot.running) reason = "Bot is already running";
@@ -181,15 +186,26 @@ const SCRIPTS: Record<ActionId, string[]> = {
   "bot.stop": ["$ scripts/botStop.sh", "SIGTERM → pid 48213", "[Steve_AI] disconnecting gracefully", "orchestrator exited (0)"],
   "bot.restart": ["$ scripts/botStop.sh", "orchestrator exited (0)", "$ scripts/botStart.sh", "[Steve_AI] connected ✓"],
   "world.save": ["$ rcon save-all", "Saving the game (this may take a moment!)", "Saved the game"],
+  "world.new": [
+    "── Step 1/8: back up the current world", "$ scripts/backup.sh", "Saving world before backup...", "Backup complete: ./backups/world_2026-10-09_14-03-22.tar.gz",
+    "── Step 2/8: stop the bot", "$ scripts/botStop.sh", "  bot stopped (will restart it at the end)",
+    "── Step 3/8: stop the server", "$ scripts/stop.sh", "Stopping Minecraft server (world will be saved)...", "Server stopped.",
+    "── Step 4/8: archive the world folders", "  moved data/world → backups/worlds/2026-10-09_14-03-22/world", "  moved data/world_nether → backups/worlds/2026-10-09_14-03-22/world_nether", "  moved data/world_the_end → backups/worlds/2026-10-09_14-03-22/world_the_end",
+    "── Step 5/8: archive the bot's memory", "  moved data/orchestrator/memory/Steve_AI → data/orchestrator/memory-archive/2026-10-09_14-03-22/Steve_AI",
+    "── Step 6/8: start the server with the new seed", "$ scripts/start.sh", "Starting Minecraft server...",
+    "── Step 7/8: wait for the server to finish generating the world", "  still generating… 30s", "  still generating… 60s", "  server is reachable",
+    "── Step 8/8: restart the bot", "$ scripts/botStart.sh", "", "Archived worlds are kept in backups/worlds/ — delete old ones by hand on the host if disk space matters.", "", "Done. Old world: backups/worlds/2026-10-09_14-03-22",
+  ],
   "backup.run": ["$ rcon save-all", "Saved the game", "$ tar -czf backups/world-….tar.gz data/world", "WARN: file changed as we read it: data/world/session.lock", "archive 418 MB", "pruning: keeping last 10 ✓"],
 };
 
-function startJob(id: ActionId, user: string): JobDetail {
+function startJob(id: ActionId, user: string, seed: string | null = null): JobDetail {
   const job: JobDetail = { id: randomBytes(6).toString("hex"), action: id, state: "running", startedAt: Date.now(), endedAt: null, exitCode: null, startedBy: user, output: [] };
   jobs.unshift(job);
   if (jobs.length > 50) jobs.pop();
   if (id === "server.start" || id === "server.restart") state.server.state = "starting";
-  const lines = SCRIPTS[id];
+  const lines = id === "world.new" ? [`New world — seed: ${seed === null ? "(random)" : JSON.stringify(seed)}`, ...SCRIPTS[id]] : SCRIPTS[id];
+  if (id === "world.new") setTimeout(() => { state.server.state = "starting"; pushStatus(); }, 700 * 10);
   lines.forEach((l, i) =>
     setTimeout(() => {
       job.output.push(l);
@@ -201,7 +217,7 @@ function startJob(id: ActionId, user: string): JobDetail {
     job.exitCode = 0;
     job.endedAt = Date.now();
     if (id === "server.stop") state.server.state = "stopped";
-    if (id === "server.start" || id === "server.restart") { state.server.state = "running"; state.server.since = Date.now(); }
+    if (id === "server.start" || id === "server.restart" || id === "world.new") { state.server.state = "running"; state.server.since = Date.now(); }
     if (id === "bot.stop") state.bot.running = false;
     if (id === "bot.start" || id === "bot.restart") { state.bot.running = true; state.bot.since = Date.now(); }
     if (id === "backup.run") backups.unshift({ file: `world-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.tar.gz`, sizeBytes: 438_000_000, createdAt: Date.now() });
@@ -250,7 +266,7 @@ function snapshot(): BotSnapshot {
     capturedAt: now,
     connection: { state: "connected", connectedSince: state.bot.since, uptimeMs: now - state.bot.since },
     bot: {
-      position: { ...state.pos }, facing: "north", dimension: "overworld", health: state.health, food: state.food, saturation: 3.2, experience: 7,
+      position: { ...state.pos }, facing: "north", dimension: "overworld", gameMode: state.gameModes[BOT] ?? "unknown", health: state.health, food: state.food, saturation: 3.2, experience: 7,
       heldItem: { name: "iron_pickaxe", count: 1 },
       inventory: [
         { name: "oak_log", count: 64 }, { name: "oak_log", count: 12 }, { name: "cobblestone", count: 41 }, { name: "iron_ingot", count: 6 },
@@ -419,9 +435,17 @@ const server = createServer(async (req, res) => {
   if (am && req.method === "POST") {
     const def = actionDefs().find((a) => a.id === am[1]);
     if (!def) return err(res, 404, "not_found", "Unknown action.");
+    const b = await body(req);
+    let seed: string | null = null;
+    if (def.id === "world.new") {
+      if (b.confirm !== "NEW WORLD") return err(res, 400, "bad_request", 'confirm must be exactly "NEW WORLD"');
+      const raw = typeof b.seed === "string" ? b.seed.trim() : b.seed == null ? "" : null;
+      if (raw === null || (raw !== "" && !/^-?[A-Za-z0-9_ ]{1,32}$/.test(raw))) return err(res, 400, "bad_request", "seed must be 1–32 letters, digits, underscores or spaces (optional leading '-')");
+      seed = raw || null;
+    }
     if (!def.available) return err(res, 409, "busy", def.unavailableReason ?? "Unavailable.");
-    const job = startJob(def.id, "admin");
-    addAudit(req, "action", def.id);
+    const job = startJob(def.id, "admin", seed);
+    addAudit(req, "action", def.id === "world.new" ? `world.new seed=${seed === null ? "(random)" : JSON.stringify(seed)} started (job ${job.id})` : def.id);
     pushStatus();
     return json(res, 202, summary(job));
   }
@@ -448,7 +472,12 @@ const server = createServer(async (req, res) => {
     return json(res, 200, r);
   }
   if (path === "/api/console/history") return json(res, 200, consoleHist.slice(0, 100));
-  if (path === "/api/players" && req.method === "GET") return json(res, 200, state.players);
+  const playersResp = (): PlayersResponse => {
+    const online = state.server.state === "running" ? state.players.online : [];
+    const names = [...online, ...(state.bot.running ? [BOT] : [])];
+    return { ...state.players, online, gameModes: Object.fromEntries(names.filter((n) => state.gameModes[n]).map((n) => [n, state.gameModes[n]!])) };
+  };
+  if (path === "/api/players" && req.method === "GET") return json(res, 200, playersResp());
   if (path.startsWith("/api/players/") && req.method === "POST") {
     const b = await body(req);
     const op = path.split("/").pop();
@@ -456,11 +485,19 @@ const server = createServer(async (req, res) => {
     const name = String(b.name ?? "");
     if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) return err(res, 400, "bad_request", "Invalid player name.");
     const P = state.players;
+    if (op === "gamemode") {
+      if (!["survival", "creative", "adventure", "spectator"].includes(b.mode)) return err(res, 400, "bad_request", "mode must be one of survival, creative, adventure, spectator");
+      if (state.server.state !== "running") return err(res, 503, "server_down", "Minecraft server is not running");
+      if (!P.online.includes(name) && !(name === BOT && state.bot.running)) return err(res, 409, "player_offline", `${name} is not online`);
+      state.gameModes[name] = b.mode;
+      addAudit(req, "players", `gamemode ${b.mode} ${name}`);
+      return json(res, 200, playersResp());
+    }
     if (op === "whitelist") P.whitelist = b.add ? [...new Set([...P.whitelist, name])] : P.whitelist.filter((n) => n !== name);
     else if (op === "op") P.ops = b.op ? [...new Set([...P.ops, name])] : P.ops.filter((n) => n !== name);
     else if (op === "kick") P.online = P.online.filter((n) => n !== name);
     addAudit(req, "players", `${op} ${name} ${JSON.stringify(b)}`);
-    return json(res, 200, P);
+    return json(res, 200, playersResp());
   }
   if (path === "/api/bot/snapshot") return json(res, 200, state.bot.running ? [snapshot()] : []);
   if (path === "/api/bot/report") return json(res, 200, report(url.searchParams.get("since") ?? "run"));

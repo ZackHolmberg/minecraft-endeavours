@@ -186,7 +186,7 @@ export class StatusService {
   }
 
   private async compute(): Promise<StatusResponse> {
-    const [ps, reachable] = await Promise.all([composePs(), tcpReachable(25565)]);
+    const [ps, reachable] = await Promise.all([composePs(), tcpReachable(this.cfg.mcPort)]);
     const mc = ps?.get(COMPOSE_SERVICE);
     const state: ServerState = ps === null ? "unknown" : mapState(mc);
     const dd = ps?.get("duckdns");

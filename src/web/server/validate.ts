@@ -48,6 +48,14 @@ export function validateMessage(raw: unknown, field: string, optional = false): 
   return t;
 }
 
+const GAME_MODES = ["survival", "creative", "adventure", "spectator"] as const;
+export function validateGameMode(raw: unknown): (typeof GAME_MODES)[number] {
+  if (typeof raw !== "string" || !(GAME_MODES as readonly string[]).includes(raw)) {
+    throw new ValidationError("mode must be one of survival, creative, adventure, spectator");
+  }
+  return raw as (typeof GAME_MODES)[number];
+}
+
 export function validateBool(raw: unknown, field: string): boolean {
   if (typeof raw !== "boolean") throw new ValidationError(`${field} must be a boolean`);
   return raw;

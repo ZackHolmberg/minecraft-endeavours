@@ -47,10 +47,21 @@ if [ "$MODE" = "prod" ] && [ -f "$PLIST" ]; then
   if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     launchctl kickstart "gui/$(id -u)/$LABEL"
   else
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    # Retry: right after a bootout, launchd can still be unloading the old job.
+    for attempt in 1 2 3 4 5; do
+      launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+      [ "$attempt" = 5 ] && { echo "panelStart: launchctl bootstrap failed — see: launchctl print gui/$(id -u)/$LABEL"; exit 1; }
+      sleep 1
+    done
   fi
-  echo "panelStart: started via launchd ($LABEL). Logs: data/panel/panel.log"
-  exit 0
+  # Confirm it is actually serving rather than trusting launchctl's exit code.
+  PORT="${PANEL_PORT:-$(grep -E '^PANEL_PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2)}"; PORT="${PORT:-8443}"
+  for _ in $(seq 1 60); do
+    nc -z 127.0.0.1 "$PORT" 2>/dev/null && { echo "panelStart: started via launchd ($LABEL) on :$PORT. Logs: data/panel/panel.log"; exit 0; }
+    sleep 0.5
+  done
+  echo "panelStart: launchd job loaded but nothing is listening on :$PORT after 30s — check data/panel/panel.log"
+  exit 1
 fi
 
 mkdir -p data/panel

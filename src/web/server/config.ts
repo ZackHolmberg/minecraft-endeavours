@@ -11,7 +11,18 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const DEV_PROCESS = process.argv.includes("--dev") || process.env.PANEL_DEV === "1";
+
+/**
+ * Repo root. `PANEL_REPO_ROOT` relocates *everything* the panel touches
+ * (scripts, data/, backups/, .bot-runtime/, .env, child cwd) to a throwaway
+ * tree for tests. Honoured only in --dev so a stray env var can never point
+ * the live panel somewhere else.
+ */
+export const REPO_ROOT =
+  DEV_PROCESS && process.env.PANEL_REPO_ROOT
+    ? resolve(process.env.PANEL_REPO_ROOT)
+    : resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 export interface PanelConfig {
   dev: boolean;
@@ -37,6 +48,13 @@ export interface PanelConfig {
   telemetryDir: string;
   backupsDir: string;
   mcDataDir: string;
+  /** `world.new` archive root: <backupsDir>/worlds/<timestamp>/. */
+  worldArchiveDir: string;
+  /** Bot durable memory (per-bot dirs) and where `world.new` archives it. */
+  botMemoryDir: string;
+  botMemoryArchiveDir: string;
+  /** Minecraft TCP port probed for reachability (PANEL_MC_PORT honoured in --dev only, for tests). */
+  mcPort: number;
   scriptsDir: string;
   acme: { staging: boolean; email: string | null; enabled: boolean };
   /** Panel updates the DuckDNS A record itself so it stays reachable while the compose sidecar is stopped. */
@@ -134,6 +152,10 @@ export function loadConfig(argv: string[]): PanelConfig {
     telemetryDir: resolve(REPO_ROOT, "data/orchestrator/telemetry"),
     backupsDir: resolve(REPO_ROOT, "backups"),
     mcDataDir: resolve(REPO_ROOT, "data"),
+    worldArchiveDir: resolve(REPO_ROOT, "backups/worlds"),
+    botMemoryDir: resolve(REPO_ROOT, "data/orchestrator/memory"),
+    botMemoryArchiveDir: resolve(REPO_ROOT, "data/orchestrator/memory-archive"),
+    mcPort: dev ? intEnv("PANEL_MC_PORT", 25565) : 25565,
     scriptsDir: resolve(REPO_ROOT, "scripts"),
     acme: {
       enabled: !dev && process.env.PANEL_ACME !== "0",

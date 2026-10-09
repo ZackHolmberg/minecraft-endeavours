@@ -94,7 +94,25 @@ export type ActionId =
   | "bot.stop" // scripts/botStop.sh
   | "bot.restart" // stop then start
   | "world.save" // rcon save-all
-  | "backup.run"; // scripts/backup.sh
+  | "backup.run" // scripts/backup.sh
+  | "world.new"; // destructive: archive world + bot memory, regenerate (takes WorldNewRequest)
+
+/**
+ * POST /api/actions/world.new body. The only action that takes input.
+ *  - `seed`: optional. Empty/absent = random. Validated server-side against
+ *    /^-?[A-Za-z0-9_ ]{1,32}$/ (Minecraft accepts numbers or text). Never
+ *    written to `.env` or a shell; passed as LEVEL_SEED in the child env only.
+ *  - `confirm`: must equal exactly "NEW WORLD" (typed by the user in the UI).
+ * The job: backup.run → stop bot (if running) → stop server → move world,
+ * world_nether, world_the_end to backups/worlds/<timestamp>/ → move the bot
+ * memory dir(s) to data/orchestrator/memory-archive/<timestamp>/ → start
+ * server with the seed → wait until reachable → restart bot if it was running.
+ * Nothing is deleted. Exclusive across ALL action groups while running.
+ */
+export interface WorldNewRequest {
+  seed?: string;
+  confirm: "NEW WORLD";
+}
 
 export interface ActionDef {
   id: ActionId;
@@ -151,6 +169,14 @@ export interface PlayersResponse {
   online: string[];
   whitelist: string[];
   ops: string[];
+  /** Game mode per online player (from RCON `data get entity <name> playerGameType`); missing = unknown. */
+  gameModes?: Record<string, GameMode>;
+}
+export type GameMode = "survival" | "creative" | "adventure" | "spectator";
+/** POST /api/players/gamemode    { name, mode: GameMode } → PlayersResponse (rcon `gamemode <mode> <name>`) */
+export interface GameModeRequest {
+  name: string; // same name regex as PlayerNameRequest
+  mode: GameMode;
 }
 /** POST /api/players/whitelist   { name, add: boolean } → PlayersResponse */
 /** POST /api/players/op          { name, op: boolean }  → PlayersResponse */

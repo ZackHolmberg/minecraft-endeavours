@@ -6,6 +6,7 @@
  * Env overrides: PANEL_PORT, PANEL_BIND, PANEL_HOSTNAME, PANEL_EXTRA_HOSTS,
  * PANEL_DATA_DIR, PANEL_SECRETS_FILE, PANEL_UI_DIR, PANEL_ACME=0,
  * PANEL_ACME_STAGING=1, PANEL_ACME_EMAIL, PANEL_DUCKDNS_UPDATE=0.
+ * --dev only (tests): PANEL_REPO_ROOT (relocate every repo path), PANEL_MC_PORT.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:https";
@@ -59,7 +60,12 @@ async function main(): Promise<void> {
   const jobs = new JobManager(
     cfg,
     { output: (id, lines) => hub?.jobOutput(id, lines), state: (j) => hub?.jobState(j) },
-    () => void status?.get(0).catch(() => undefined),
+    (job) => {
+      if (job.action === "world.new") {
+        audit({ ip: "local", user: job.startedBy, kind: "action", detail: `world.new job ${job.id} ${job.state} (exit ${job.exitCode ?? "none"})`, ok: job.state === "succeeded" });
+      }
+      void status?.get(0).catch(() => undefined);
+    },
   );
   status = new StatusService(cfg, () => jobs.active());
   const app = new PanelApp(cfg, auth, sessions, status, jobs);

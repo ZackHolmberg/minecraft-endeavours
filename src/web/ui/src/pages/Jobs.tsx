@@ -114,3 +114,42 @@ function JobView({ id }: { id: string }) {
     </div>
   );
 }
+
+/** Compact live output for one job (fetch + WS tail), for embedding in other pages. */
+export function JobOutput({ id }: { id: string }) {
+  const job = useFetch<JobDetail>(`/api/jobs/${encodeURIComponent(id)}`);
+  const now = useNow(1000);
+  const ref = useRef<HTMLDivElement>(null);
+  useChannel(`job:${id}`, (m) => {
+    if (m.type === "job_output" && m.jobId === id) job.setData((p) => (p ? { ...p, output: [...p.output, ...m.lines].slice(-4000) } : p!));
+    if (m.type === "job_state" && m.job.id === id) job.setData((p) => (p ? { ...p, ...m.job } : p!));
+  });
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  }, [job.data?.output.length]);
+  return (
+    <Load {...job} lines={4}>
+      {(j) => (
+        <div class="stack tight">
+          <div class="row wrap small muted" style={{ gap: "4px 12px" }}>
+            <JobBadge j={j} />
+            <span class="tnum">{j.state === "running" ? `running ${fmtMs(now - j.startedAt)}` : `took ${fmtMs((j.endedAt ?? now) - j.startedAt)}`}</span>
+            <a class="btn sm ghost" href={href(`/jobs/${j.id}`)} style={{ marginLeft: "auto" }}>Full output</a>
+          </div>
+          <div class="terminal term-tall" ref={ref} role="log" aria-label={`${ACTION_LABEL[j.action] ?? j.action} output`}>
+            {j.output.length === 0 ? (
+              <div class="ln dim">{j.state === "running" ? "Waiting for output…" : "No output."}</div>
+            ) : (
+              j.output.map((l, i) => (
+                <div class={`ln ${l.startsWith("FAILED") ? "err" : lineClass(l)}`} key={i}>
+                  {l}
+                </div>
+              ))
+            )}
+            {j.state === "running" && <div class="ln dim"><span class="spinner" style={{ width: "10px", height: "10px" }} /> running…</div>}
+          </div>
+        </div>
+      )}
+    </Load>
+  );
+}

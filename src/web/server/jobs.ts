@@ -2,7 +2,9 @@
  * Action allowlist + job runner. Each ActionId maps to a fixed list of argv
  * steps (no user input reaches argv). One job per group at a time; the
  * server and bot groups additionally block each other's restarts implicitly
- * via preconditions re-checked at submit time.
+ * via preconditions re-checked at submit time. `world.new` is the exception:
+ * a scripted multi-step job (world-new.ts) that is exclusive across every
+ * group and whose only input (a validated seed) reaches a child env var.
  */
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
@@ -10,6 +12,7 @@ import { resolve } from "node:path";
 import type { ActionDef, ActionId, JobDetail, JobSummary, StatusResponse } from "../shared/api.js";
 import type { PanelConfig } from "./config.js";
 import { COMPOSE_SERVICE, LineSplitter, spawnStreaming } from "./exec.js";
+import { runWorldNew, type WorldNewTimings } from "./world-new.js";
 
 const OUTPUT_CAP = 2000;
 const JOB_HISTORY = 50;
@@ -22,6 +25,8 @@ interface ActionSpec {
   description: string;
   confirm: boolean;
   group: Group;
+  /** Blocks, and is blocked by, jobs in every group. */
+  exclusive?: boolean;
   steps: (cfg: PanelConfig) => string[][];
   /** null = available, else the reason. */
   precondition: (s: StatusResponse) => string | null;
@@ -74,7 +79,19 @@ const ACTIONS: ReadonlyMap<ActionId, ActionSpec> = new Map<ActionId, ActionSpec>
     steps: (c) => [script(c, "backup.sh")],
     precondition: (s) => (serverUp(s) && s.server.reachable ? null : "Server is not running (backup needs RCON save-all)"),
   }],
+  ["world.new", {
+    label: "New world",
+    description:
+      "Back up, stop the bot and server, move the world folders to backups/worlds/ and the bot's memory to memory-archive/, then start the server on a fresh world. Nothing is deleted; everyone is disconnected; takes a few minutes.",
+    confirm: true, group: "world", exclusive: true,
+    steps: () => [], // scripted: see runWorldNew
+    precondition: (s) =>
+      dockerDown(s) ??
+      (serverUp(s) && !s.server.reachable ? "Server is starting — wait until it is reachable (the backup needs RCON)" : null),
+  }],
 ]);
+
+export const EXCLUSIVE_BUSY = "Another job is running — a new world needs the panel to itself";
 
 export function isActionId(id: string): id is ActionId {
   return ACTIONS.has(id as ActionId);
@@ -93,6 +110,10 @@ export class JobManager {
   private jobs = new Map<string, Job>();
   private order: string[] = [];
   private running = new Map<Group, string>();
+  /** Id of the running exclusive job (world.new), which blocks every group. */
+  private exclusive: string | null = null;
+  /** Test hook: shorter waits for world.new. */
+  worldNewTimings: WorldNewTimings | undefined;
 
   constructor(
     private readonly cfg: PanelConfig,
@@ -102,14 +123,21 @@ export class JobManager {
 
   defs(status: StatusResponse): ActionDef[] {
     return [...ACTIONS].map(([id, a]) => {
-      const busy = this.running.has(a.group);
-      const reason = busy ? "Another job in this group is running" : a.precondition(status);
+      const reason = this.busyReason(a) ?? a.precondition(status);
       return { id, label: a.label, description: a.description, confirm: a.confirm, group: a.group, available: reason === null, unavailableReason: reason };
     });
   }
 
+  private busyReason(a: ActionSpec): string | null {
+    if (this.exclusive) return "A new world is being generated";
+    if (a.exclusive && this.running.size > 0) return EXCLUSIVE_BUSY;
+    return this.running.has(a.group) ? "Another job in this group is running" : null;
+  }
+
   active(): JobSummary[] {
-    return [...this.running.values()].map((id) => summary(this.jobs.get(id)!));
+    const ids = [...this.running.values()];
+    if (this.exclusive) ids.push(this.exclusive);
+    return ids.map((id) => summary(this.jobs.get(id)!));
   }
 
   list(): JobSummary[] {
@@ -122,9 +150,10 @@ export class JobManager {
   }
 
   /** Throws `{code}` errors the router maps to HTTP. */
-  start(id: ActionId, user: string, status: StatusResponse): JobSummary {
+  start(id: ActionId, user: string, status: StatusResponse, input: { seed?: string | null } = {}): JobSummary {
     const spec = ACTIONS.get(id)!;
-    if (this.running.has(spec.group)) throw Object.assign(new Error("Another job in this group is running"), { code: "busy" });
+    const busy = this.busyReason(spec);
+    if (busy) throw Object.assign(new Error(busy), { code: "busy" });
     const reason = spec.precondition(status);
     if (reason) throw Object.assign(new Error(reason), { code: "unavailable" });
 
@@ -147,9 +176,11 @@ export class JobManager {
       this.order.shift();
       this.jobs.delete(old);
     }
-    this.running.set(spec.group, job.id);
+    if (spec.exclusive) this.exclusive = job.id;
+    else this.running.set(spec.group, job.id);
     this.events.state(summary(job));
-    void this.runSteps(job, spec.steps(this.cfg));
+    if (id === "world.new") void this.runWorldNew(job, status, input.seed ?? null);
+    else void this.runSteps(job, spec.steps(this.cfg));
     return summary(job);
   }
 
@@ -166,21 +197,47 @@ export class JobManager {
       code = await this.runStep(job, argv);
       if (code !== 0) break;
     }
+    this.finish(job, code);
+  }
+
+  private async runWorldNew(job: Job, status: StatusResponse, seed: string | null): Promise<void> {
+    let code: number | null = 1;
+    try {
+      code = await runWorldNew({
+        cfg: this.cfg,
+        status,
+        seed,
+        timings: this.worldNewTimings,
+        log: (...lines) => this.append(job, lines),
+        script: (name, env) => {
+          const argv = script(this.cfg, name);
+          this.append(job, [`$ ${displayArgv(argv, this.cfg)}`]);
+          return this.runStep(job, argv, env);
+        },
+      });
+    } catch (err) {
+      this.append(job, [`panel: world.new crashed: ${(err as Error).message}`]); // runWorldNew catches; belt and braces
+    }
+    this.finish(job, code);
+  }
+
+  private finish(job: Job, code: number | null): void {
     job.exitCode = code;
     job.state = code === 0 ? "succeeded" : "failed";
     job.endedAt = Date.now();
-    this.running.delete(job.group);
+    if (this.exclusive === job.id) this.exclusive = null;
+    else this.running.delete(job.group);
     this.events.state(summary(job));
     this.onFinish(summary(job));
   }
 
-  private runStep(job: Job, argv: string[]): Promise<number | null> {
+  private runStep(job: Job, argv: string[], env?: Record<string, string>): Promise<number | null> {
     return new Promise((resolveStep) => {
       let settled = false;
       const split = new LineSplitter((lines) => this.append(job, lines));
       let child;
       try {
-        child = spawnStreaming(argv, { detached: true });
+        child = spawnStreaming(argv, { detached: true, env });
       } catch (err) {
         this.append(job, [`failed to start: ${(err as Error).message}`]);
         resolveStep(null);

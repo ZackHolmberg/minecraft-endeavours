@@ -15,6 +15,7 @@ import type {
   AuditEntry,
   BackupInfo,
   ConsoleResponse,
+  GameMode,
   LogSource,
   MeResponse,
   PlayersResponse,
@@ -39,14 +40,17 @@ import { isActionId, type JobManager } from "./jobs.js";
 import { SlidingLimiter } from "./ratelimit.js";
 import { buildReport, queryEvents } from "./report.js";
 import { clearCookie, COOKIE_NAME, csrfOk, parseCookies, sessionCookie, type Session, type SessionStore } from "./sessions.js";
+import { GameModeCache } from "./gamemodes.js";
 import { botProcess, readSnapshots, type StatusService } from "./status.js";
 import { serveStatic } from "./static.js";
+import { validateWorldNew } from "./world-new.js";
 import { readTailLines } from "./tail.js";
 import {
   intParam,
   PLAYER_NAME_RE,
   validateBool,
   validateConsoleCommand,
+  validateGameMode,
   validateMessage,
   validatePlayerName,
   ValidationError,
@@ -69,6 +73,9 @@ export class PanelApp {
   private consoleLimiter = new SlidingLimiter(30, 60_000);
   private actionLimiter = new SlidingLimiter(12, 60_000);
   private playerLimiter = new SlidingLimiter(30, 60_000);
+  /** world.new is destructive and slow: at most 3 submissions per hour panel-wide (one key, so new sessions can't reset it; on top of actionLimiter). */
+  private worldNewLimiter = new SlidingLimiter(3, 60 * 60_000);
+  private gameModes = new GameModeCache();
   private consoleHistory: ConsoleResponse[] = [];
 
   constructor(
@@ -216,13 +223,31 @@ export class PanelApp {
     }
     const id: ActionId = rawId;
     if (!this.actionLimiter.take(ctx.session!.key)) throw new HttpError(429, "rate_limited", "Too many actions", { "Retry-After": "60" });
-    await readJsonBody(ctx.req); // drain; body ignored
+    const body = await readJsonBody(ctx.req); // ignored except for world.new
+    let seed: string | null = null;
+    let label: string = id;
+    if (id === "world.new") {
+      try {
+        seed = validateWorldNew(body).seed;
+      } catch (err) {
+        audit({ ip: ctx.ip, user, kind: "action", detail: `world.new rejected: ${(err as Error).message}`, ok: false });
+        throw err;
+      }
+      label = `world.new seed=${seed === null ? "(random)" : JSON.stringify(seed)}`;
+      // Counted after validation (a typo'd confirm shouldn't burn an attempt), before any precondition/exec.
+      if (!this.worldNewLimiter.take("world.new")) {
+        audit({ ip: ctx.ip, user, kind: "action", detail: `${label} refused: rate limited`, ok: false });
+        throw new HttpError(429, "rate_limited", "Too many new-world attempts — try again later", { "Retry-After": "3600" });
+      }
+    }
     try {
-      const job = this.jobs.start(id, user, await this.status.get(0));
-      audit({ ip: ctx.ip, user, kind: "action", detail: `${id} started (job ${job.id})`, ok: true });
+      const job = this.jobs.start(id, user, await this.status.get(0), { seed });
+      audit({ ip: ctx.ip, user, kind: "action", detail: `${label} started (job ${job.id})`, ok: true });
       sendJson(ctx.res, 202, job);
     } catch (err) {
-      audit({ ip: ctx.ip, user, kind: "action", detail: `${id} refused: ${(err as Error).message}`, ok: false });
+      // A precondition/busy refusal ran nothing, so it shouldn't spend a world.new attempt.
+      if (id === "world.new") this.worldNewLimiter.refund("world.new");
+      audit({ ip: ctx.ip, user, kind: "action", detail: `${label} refused: ${(err as Error).message}`, ok: false });
       throw err;
     }
   }
@@ -271,16 +296,18 @@ export class PanelApp {
 
   private async players(): Promise<PlayersResponse> {
     const s = await this.status.get();
+    const online = s.server.players?.names ?? [];
     return {
-      online: s.server.players?.names ?? [],
+      online,
       whitelist: this.readNameList("whitelist.json"),
       ops: this.readNameList("ops.json"),
+      gameModes: s.server.reachable ? await this.gameModes.get(online.filter((n) => PLAYER_NAME_RE.test(n))) : {},
     };
   }
 
   private async playerChange(ctx: Ctx, sub: string): Promise<void> {
     const user = ctx.session!.user;
-    if (!["whitelist", "op", "kick", "say"].includes(sub)) throw new HttpError(404, "not_found", "No such endpoint");
+    if (!["whitelist", "op", "kick", "say", "gamemode"].includes(sub)) throw new HttpError(404, "not_found", "No such endpoint");
     if (!this.playerLimiter.take(ctx.session!.key)) throw new HttpError(429, "rate_limited", "Too many player changes", { "Retry-After": "60" });
     const body = await readJsonBody(ctx.req);
     let command: string;
@@ -292,7 +319,8 @@ export class PanelApp {
         detail = `say ${msg}`;
       } else {
         const name = validatePlayerName(body.name);
-        if (sub === "whitelist") command = `whitelist ${validateBool(body.add, "add") ? "add" : "remove"} ${name}`;
+        if (sub === "gamemode") command = `gamemode ${validateGameMode(body.mode)} ${name}`;
+        else if (sub === "whitelist") command = `whitelist ${validateBool(body.add, "add") ? "add" : "remove"} ${name}`;
         else if (sub === "op") command = `${validateBool(body.op, "op") ? "op" : "deop"} ${name}`;
         else {
           const reason = validateMessage(body.reason, "reason", true);
@@ -306,9 +334,17 @@ export class PanelApp {
     }
     await this.requireServer(() => audit({ ip: ctx.ip, user, kind: "players", detail: `${detail} (refused: server down)`, ok: false }));
     const r = await rcon(command);
-    audit({ ip: ctx.ip, user, kind: "players", detail, ok: r.ok });
+    // rcon-cli exits 0 even when the command itself was refused (e.g. target offline).
+    const refused = sub === "gamemode" && r.ok && /no player was found|unknown or incomplete|incorrect argument/i.test(r.output);
+    audit({ ip: ctx.ip, user, kind: "players", detail: refused ? `${detail} (refused: ${r.output.slice(0, 80)})` : detail, ok: r.ok && !refused });
     if (!r.ok) throw new HttpError(502, "rcon_failed", r.output || "RCON command failed");
     if (sub === "say") return sendNoContent(ctx.res);
+    if (sub === "gamemode") {
+      const name = body.name as string;
+      this.gameModes.invalidate(name);
+      if (refused) throw new HttpError(409, "player_offline", `${name} is not online`);
+      this.gameModes.set(name, body.mode as GameMode);
+    }
     await sleep(300); // server persists whitelist.json / ops.json right after the command
     sendJson(ctx.res, 200, await this.players());
   }

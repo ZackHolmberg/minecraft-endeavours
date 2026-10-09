@@ -115,6 +115,8 @@ export interface BotFields {
   position: { x: number; y: number; z: number };
   facing: string;
   dimension: string;
+  /** Bot's own game mode (mineflayer `bot.game.gameMode`); drives creative-aware skills. */
+  gameMode: "survival" | "creative" | "adventure" | "spectator" | "unknown";
   health: number;
   food: number;
   saturation: number;
@@ -198,6 +200,7 @@ function snapshotBotFields(bot: Bot | null): BotFields | null {
     position: { x: round2(p.x), y: round2(p.y), z: round2(p.z) },
     facing: yawToCardinal(bot.entity.yaw),
     dimension: bot.game?.dimension ?? "unknown",
+    gameMode: normalizeGameMode(bot.game?.gameMode),
     health: round2(bot.health ?? 0),
     food: bot.food ?? 0,
     saturation: round2(bot.foodSaturation ?? 0),
@@ -475,4 +478,8 @@ function weather(bot: Bot): "clear" | "rain" | "thunder" {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+function normalizeGameMode(m: unknown): BotFields["gameMode"] {
+  return m === "survival" || m === "creative" || m === "adventure" || m === "spectator" ? m : "unknown";
 }

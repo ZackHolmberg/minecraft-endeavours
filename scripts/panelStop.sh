@@ -14,6 +14,12 @@ else
   PID_FILE="data/panel/panel.pid"
   if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     launchctl bootout "gui/$(id -u)/$LABEL"
+    # bootout returns before launchd finishes tearing the service down; wait so
+    # an immediate panelStart.sh can bootstrap it again (else it fails quietly).
+    for _ in $(seq 1 50); do
+      launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+      sleep 0.2
+    done
     echo "panelStop: LaunchAgent stopped (will start again at next login, or run ./scripts/panelStart.sh)."
     exit 0
   fi

@@ -7,7 +7,7 @@ import { runAction, ACTION_LABEL } from "../lib/actions.js";
 import { href } from "../lib/router.js";
 import { fmtAgo, fmtDuration, fmtMs } from "../lib/format.js";
 import { Alert, Badge, Card, ErrorState, Meter, Skeleton, type Tone } from "../components/ui.js";
-import { IBot, ICpu, IPlay, IRestart, ISave, IServer, IStop, IArchive, IHeart } from "../components/icons.js";
+import { IBot, ICpu, IPlay, IRestart, ISave, IServer, IStop, IArchive, IHeart, IMap } from "../components/icons.js";
 
 type ServerState = StatusResponse["server"]["state"];
 
@@ -268,14 +268,18 @@ function Controls({ d }: { d: StatusResponse }) {
 
   const busyGroups = useMemo(() => {
     const s = new Set<string>();
-    for (const j of d.activeJobs) s.add(j.action.split(".")[0] === "backup" ? "world" : j.action.split(".")[0]!);
+    for (const j of d.activeJobs) {
+      if (j.action === "world.new") GROUPS.forEach((g) => s.add(g.group)); // exclusive across every group
+      else s.add(j.action.split(".")[0] === "backup" ? "world" : j.action.split(".")[0]!);
+    }
     return s;
   }, [d.activeJobs]);
 
   return (
     <div class="grid cols-3">
       {GROUPS.map((g) => {
-        const defs = (actions.data ?? []).filter((a) => a.group === g.group);
+        // world.new takes a seed + typed confirmation, so it lives on the Backups page.
+        const defs = (actions.data ?? []).filter((a) => a.group === g.group && a.id !== "world.new");
         const reasons = [...new Set(defs.filter((a) => !a.available && a.unavailableReason).map((a) => a.unavailableReason!))];
         return (
           <Card key={g.group} title={g.title} actions={busyGroups.has(g.group) ? <Badge tone="info">Job running</Badge> : undefined}>
@@ -310,6 +314,11 @@ function Controls({ d }: { d: StatusResponse }) {
                   <p class="action-reason" id={`why-${g.group}`}>
                     {reasons.join(" · ")}
                   </p>
+                )}
+                {g.group === "world" && (
+                  <a class="btn sm ghost" href={href("/backups")} style={{ marginTop: "8px" }}>
+                    <IMap /> New world…
+                  </a>
                 )}
               </>
             )}

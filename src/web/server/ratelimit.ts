@@ -41,6 +41,11 @@ export class SlidingLimiter {
     return true;
   }
 
+  /** Give back the most recent hit for `key` (an attempt that was refused before doing anything). */
+  refund(key: string): void {
+    this.hits.get(key)?.pop();
+  }
+
   sweep(now = Date.now()): void {
     const cutoff = now - this.windowMs;
     for (const [k, arr] of this.hits) if (arr.length === 0 || arr[arr.length - 1]! <= cutoff) this.hits.delete(k);

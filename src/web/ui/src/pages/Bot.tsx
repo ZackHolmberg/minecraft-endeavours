@@ -8,6 +8,7 @@ import { status } from "../lib/status.js";
 import { navigate } from "../lib/router.js";
 import { fmtAgo, fmtDuration } from "../lib/format.js";
 import { Alert, Badge, Card, Empty, ErrorState, Segmented, Skeleton, type Tone } from "../components/ui.js";
+import { MODE_LABEL, setGameMode } from "../lib/gamemode.js";
 import { IBot } from "../components/icons.js";
 import { LivePanel, MemoryPanel } from "./bot/Live.js";
 import { PerfPanel } from "./bot/Perf.js";
@@ -241,6 +242,7 @@ function BotHeader(props: {
           </div>
         </div>
       </div>
+      {s && <BotGameMode name={s.username} mode={s.bot?.gameMode ?? "unknown"} online={conn === "connected"} />}
       {agent?.lastTurnError && (
         <div style={{ marginTop: "12px" }}>
           <Alert tone="bad" title="Last turn errored">
@@ -249,6 +251,35 @@ function BotHeader(props: {
         </div>
       )}
     </Card>
+  );
+}
+
+function BotGameMode({ name, mode, online }: { name: string; mode: string; online: boolean }) {
+  const [busy, setBusy] = useState(false);
+  const known = mode === "survival" || mode === "creative" || mode === "adventure" || mode === "spectator";
+  const pick = async (m: "survival" | "creative") => {
+    if (m === mode || busy) return;
+    setBusy(true);
+    try {
+      await setGameMode(name, m); // the next snapshot (≤1s) reflects the change
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div class="row wrap between" style={{ marginTop: "12px", gap: "8px 12px" }}>
+      <div class="small muted">
+        Game mode <strong style={{ color: "var(--text)" }}>{known ? MODE_LABEL[mode] : "unknown"}</strong>
+        {busy && <span class="spinner" aria-hidden="true" style={{ width: "12px", height: "12px", marginLeft: "8px" }} />}
+      </div>
+      <div class="seg" role="group" aria-label={`Game mode for ${name}`}>
+        {(["survival", "creative"] as const).map((m) => (
+          <button key={m} type="button" aria-pressed={mode === m} disabled={!online || busy} onClick={() => void pick(m)} title={online ? undefined : "The bot must be connected"}>
+            {MODE_LABEL[m]}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 

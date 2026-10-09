@@ -1,5 +1,6 @@
 import { useState } from "preact/hooks";
-import type { PlayersResponse } from "../../../shared/api.js";
+import type { GameMode, PlayersResponse } from "../../../shared/api.js";
+import { MODE_LABEL, setGameMode } from "../lib/gamemode.js";
 import { api, errorMessage } from "../lib/api.js";
 import { useFetch } from "../lib/hooks.js";
 import { AsyncButton, Badge, Card, Empty, Load, confirm, toast } from "../components/ui.js";
@@ -61,9 +62,11 @@ export function Players() {
                       <div class="grow">
                         <div class="ellipsis" style={{ fontWeight: 600 }}>{n}</div>
                         <div class="row" style={{ gap: "4px" }}>
+                          {modeOf(d.gameModes, n) ? <Badge tone={modeOf(d.gameModes, n) === "creative" ? "info" : "neutral"} plain>{MODE_LABEL[modeOf(d.gameModes, n)!]}</Badge> : <Badge plain>mode ?</Badge>}
                           {d.ops.includes(n) && <Badge tone="info" plain>op</Badge>}
                           {!d.whitelist.includes(n) && <Badge tone="warn" plain>not whitelisted</Badge>}
                         </div>
+                        <ModePicker name={n} mode={modeOf(d.gameModes, n)} onSet={async (m) => { const next = await setGameMode(n, m); if (next) p.setData(next); }} />
                       </div>
                       <button class="btn sm danger" onClick={() => void kick(n)} aria-label={`Kick ${n}`}>
                         Kick
@@ -112,6 +115,45 @@ export function Players() {
         )}
       </Load>
       <Broadcast />
+    </div>
+  );
+}
+
+/** One-tap Survival/Creative; Adventure/Spectator tucked behind a smaller toggle. */
+export function ModePicker({ name, mode, onSet }: { name: string; mode: GameMode | null; onSet: (m: GameMode) => Promise<void> }) {
+  const [busy, setBusy] = useState<GameMode | null>(null);
+  const [more, setMore] = useState(mode === "adventure" || mode === "spectator");
+  const pick = async (m: GameMode) => {
+    if (m === mode || busy) return;
+    setBusy(m);
+    try {
+      await onSet(m);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const btn = (m: GameMode) => (
+    <button key={m} type="button" aria-pressed={mode === m} disabled={busy !== null} onClick={() => void pick(m)}>
+      {busy === m ? <span class="spinner" aria-hidden="true" style={{ width: "12px", height: "12px" }} /> : null} {MODE_LABEL[m]}
+    </button>
+  );
+  return (
+    <div class="row wrap" style={{ gap: "6px", marginTop: "6px" }}>
+      <div class="seg" role="group" aria-label={`Game mode for ${name}`}>
+        {btn("survival")}
+        {btn("creative")}
+      </div>
+      {more && (
+        <div class="seg" role="group" aria-label={`Other game modes for ${name}`}>
+          {btn("adventure")}
+          {btn("spectator")}
+        </div>
+      )}
+      {!more && (
+        <button type="button" class="btn sm ghost small" style={{ minHeight: "32px", padding: "0 8px" }} onClick={() => setMore(true)} aria-label={`More game modes for ${name}`}>
+          More…
+        </button>
+      )}
     </div>
   );
 }
@@ -207,4 +249,9 @@ function Broadcast() {
       <p class="small dim" style={{ marginTop: "6px" }}>Sent with <code>say</code> — appears in chat as [Server].</p>
     </Card>
   );
+}
+
+/** Own-property lookup: names like "constructor" or "toString" are valid usernames. */
+function modeOf(modes: Record<string, GameMode> | undefined, name: string): GameMode | null {
+  return modes && Object.hasOwn(modes, name) ? modes[name]! : null;
 }

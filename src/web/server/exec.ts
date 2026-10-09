@@ -69,10 +69,10 @@ export function run(argv: readonly string[], timeoutMs: number): Promise<RunResu
 }
 
 /** Long-running / streaming child (jobs, `logs -f`). Caller wires stdout/stderr. */
-export function spawnStreaming(argv: readonly string[], opts: { detached: boolean }): ChildProcess {
+export function spawnStreaming(argv: readonly string[], opts: { detached: boolean; env?: Record<string, string> }): ChildProcess {
   return spawn(argv[0]!, argv.slice(1), {
     cwd: REPO_ROOT,
-    env: childEnv(),
+    env: { ...childEnv(), ...(opts.env ?? {}) },
     shell: false,
     detached: opts.detached,
     stdio: ["ignore", "pipe", "pipe"],

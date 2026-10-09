@@ -134,6 +134,8 @@ interface ConfirmReq {
   body?: ComponentChildren;
   confirmLabel: string;
   danger?: boolean;
+  /** Typed confirmation: the confirm button stays disabled until the user types exactly this. */
+  requireText?: string;
   resolve: (ok: boolean) => void;
 }
 const confirmStore = createStore<ConfirmReq | null>(null);
@@ -146,15 +148,19 @@ export function ConfirmHost() {
   const req = useStore(confirmStore);
   const okRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const typeRef = useRef<HTMLInputElement>(null);
+  const [typed, setTyped] = useState("");
   useEffect(() => {
     if (!req) return;
+    setTyped("");
     const prev = document.activeElement as HTMLElement | null;
-    (req.danger ? cancelRef : okRef).current?.focus();
+    if (req.requireText !== undefined) typeRef.current?.focus();
+    else (req.danger ? cancelRef : okRef).current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close(false);
       if (e.key === "Tab") {
         // Keep focus inside the dialog.
-        const els = [cancelRef.current, okRef.current].filter(Boolean) as HTMLElement[];
+        const els = [typeRef.current, cancelRef.current, okRef.current].filter((el) => el && !(el as HTMLButtonElement).disabled) as HTMLElement[];
         const i = els.indexOf(document.activeElement as HTMLElement);
         e.preventDefault();
         els[(i + (e.shiftKey ? -1 : 1) + els.length) % els.length]?.focus();
@@ -170,6 +176,7 @@ export function ConfirmHost() {
     };
   }, [req]);
   if (!req) return null;
+  const blocked = req.requireText !== undefined && typed !== req.requireText;
   function close(ok: boolean) {
     req!.resolve(ok);
     confirmStore.set(null);
@@ -182,11 +189,31 @@ export function ConfirmHost() {
         <div id="confirm-body" class="muted">
           {req.body}
         </div>
+        {req.requireText !== undefined && (
+          <div class="field" style={{ marginTop: "14px" }}>
+            <label for="confirm-type">
+              Type <code>{req.requireText}</code> to confirm
+            </label>
+            <input
+              id="confirm-type"
+              ref={typeRef}
+              class="input mono"
+              value={typed}
+              autocomplete="off"
+              autocapitalize="characters"
+              spellcheck={false}
+              onInput={(e) => setTyped((e.target as HTMLInputElement).value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !blocked) close(true);
+              }}
+            />
+          </div>
+        )}
         <div class="actions">
           <button ref={cancelRef} class="btn" onClick={() => close(false)}>
             Cancel
           </button>
-          <button ref={okRef} class={`btn ${req.danger ? "danger solid" : "primary"}`} onClick={() => close(true)}>
+          <button ref={okRef} class={`btn ${req.danger ? "danger solid" : "primary"}`} disabled={blocked} onClick={() => close(true)}>
             {req.confirmLabel}
           </button>
         </div>
