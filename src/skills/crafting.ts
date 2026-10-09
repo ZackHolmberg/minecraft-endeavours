@@ -10,6 +10,7 @@ import { getBotState } from "../state/index.js";
 import { creativeGive } from "./creative.js";
 import { isCreative } from "./game-mode.js";
 import { resolveItem } from "./item-naming.js";
+import { withPacedClicks } from "./paced-clicks.js";
 import { placeFromInventoryNearby } from "./place-helper.js";
 import { navigate } from "./navigation.js";
 import type { Coords, SkillResult } from "./types.js";
@@ -274,7 +275,8 @@ async function runCraft(
   const times = Math.ceil(count / perCraft);
   const produced = times * perCraft;
   try {
-    await bot.craft(recipe, times, table ?? undefined);
+    // Paced clicks: unpaced 3x3 crafts silently no-op on 1.21 (see paced-clicks.ts).
+    await withPacedClicks(bot, () => bot.craft(recipe, times, table ?? undefined));
     return {
       ok: true,
       message: `crafted ${produced} ${item}${table ? ` at crafting_table ${fmt(table.position)}` : ""}`,
@@ -640,7 +642,10 @@ export async function smelt(
       // too, surface a fuel-specific error so the agent re-fuels rather
       // than (e.g.) re-mining ore.
       const remainingInput = furnace.inputItem();
-      if (furnace.fuelItem() == null && remainingInput && remainingInput.count > 0) {
+      // `furnace.fuel` is the burning item's remaining fraction: the fuel SLOT empties the moment the
+      // last coal is lit, long before it has burned out, so only an unlit furnace is out of fuel.
+      const stillBurning = ((furnace as { fuel?: number | null }).fuel ?? 0) > 0;
+      if (furnace.fuelItem() == null && !stillBurning && remainingInput && remainingInput.count > 0) {
         const needUnits = Math.ceil((goal - collected) / fuelPer);
         const inInv = bot.inventory.count(fuelItem.type, null);
         if (inInv === 0) {

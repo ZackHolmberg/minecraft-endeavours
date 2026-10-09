@@ -83,6 +83,7 @@ import {
   buildSkillsServerFor,
   resetFailureGuard,
 } from "../skill-tools.js";
+import { getJobRunner } from "../../jobs/registry.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import { MAX_TURNS_PER_EVENT } from "../limits.js";
 import type {
@@ -841,6 +842,11 @@ export class ClaudeBackend implements AgentBackend {
   private async waitForToolIdle(): Promise<void> {
     const state = getBotState(this.opts.bot.username);
     if (!state) return;
+    // v2: a running job's steps own the current-tool slot. A new task must not
+    // wait on them or flip the stop flag; its own non-read-only tool calls
+    // cancel the job first (skill-tools.ts), and a player "stop" cancels it
+    // before the message even reaches the queue (npc-agent.ts).
+    if (getJobRunner(this.opts.bot.username)?.isRunning()) return;
     const deadline = Date.now() + TOOL_IDLE_WAIT_MS;
     while (state.currentTool.current() && Date.now() < deadline) {
       state.cancellation.request();
@@ -913,7 +919,13 @@ export class ClaudeBackend implements AgentBackend {
       kind: "task_start",
       request: t.request,
       player: latest?.player ?? null,
-      route: latest?.route ?? (t.request.startsWith("(status report)") ? "orchestrator-note" : "unknown"),
+      route:
+        latest?.route ??
+        (t.request.startsWith("(status report)")
+          ? "orchestrator-note"
+          : t.request.startsWith("[job ")
+            ? "job-event"
+            : "unknown"),
       sessionMode: this.mode,
       coalesced: t.coalesced,
       queueWaitMs: Math.max(0, now - arrived),

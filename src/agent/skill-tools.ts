@@ -29,6 +29,9 @@
 
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Bot } from "mineflayer";
+import { goalsText } from "../jobs/describe.js";
+import { getJobRunner } from "../jobs/registry.js";
+import { shouldCancelJobFor } from "../jobs/tools.js";
 import { recordConversation } from "../memory/conversation-log.js";
 import { markReply, recordEvent, summarizeArgs } from "../observability/telemetry.js";
 import {
@@ -56,6 +59,7 @@ const GUARD_EXEMPT = new Set([
   "stop",
   "setTaskQueue",
   "advanceTaskQueue",
+  "cancelJob",
 ]);
 
 interface FailureRecord {
@@ -126,46 +130,70 @@ function stableKey(value: unknown): string {
   }) ?? "";
 }
 
+/**
+ * v2: while a job runs, any non-read-only tool call is a new instruction from
+ * the player's point of view (see JOB_EXEMPT_TOOLS): cancel the job first (and
+ * wait for its in-flight step to wind down so two skills never fight), then run
+ * the tool. The result says so, so the model doesn't think the job still runs.
+ */
+async function withJobAutoCancel(
+  spec: SkillSpec,
+  bot: Bot,
+  run: () => Promise<SkillResult>,
+): Promise<SkillResult> {
+  const runner = getJobRunner(bot.username);
+  if (!runner || !shouldCancelJobFor(spec.name, runner.isRunning())) return run();
+  const goals = runner.current() ? goalsText(runner.current()!.goals) : "?";
+  console.log(`[${bot.username}] ${spec.name} while a job runs — cancelling job (${goals})`);
+  await runner.cancel(`superseded by ${spec.name}`);
+  const result = await run();
+  return spec.name === "stop"
+    ? result
+    : { ...result, message: `(your running job "achieve ${goals}" was cancelled because you started something else) ${result.message}` };
+}
+
 function wrapSpec(spec: SkillSpec): SkillSpec {
   return {
     ...spec,
-    run: async (bot, args) => {
-      if (spec.name === "say" || spec.name === "whisper") {
-        const result = await spec.run(bot, args);
-        if (result.ok) {
-          markReply(bot.username);
-          const target =
-            spec.name === "whisper"
-              ? (args as { player?: string } | undefined)?.player
-              : getCurrentConversationPartner(bot.username);
-          if (target) noteBotRepliedTo(bot.username, target);
-          const st = result.state as { sent?: string; duplicate?: boolean } | undefined;
-          const sent = st?.duplicate ? undefined : st?.sent;
-          if (sent) {
-            void recordConversation(bot.username, {
-              kind: "bot",
-              who: bot.username,
-              channel: spec.name === "whisper" ? "whisper" : "chat",
-              ...(spec.name === "whisper" && target ? { to: target } : {}),
-              text: sent,
-            });
-          }
-        }
-        return result;
-      }
-      if (GUARD_EXEMPT.has(spec.name)) return spec.run(bot, args);
-
-      const guard = guardFor(bot.username);
-      const key = `${spec.name}:${stableKey(args)}`;
-      const refusal = guard.refusal(spec.name, key);
-      if (refusal) {
-        console.log(`[${bot.username}] ✗ ${spec.name}: repeat-failure guard refused identical retry`);
-        recordEvent(bot.username, { kind: "guard_refusal", tool: spec.name, args: summarizeArgs(args) });
-        return { ok: false, message: refusal };
-      }
-      return guard.record(key, await spec.run(bot, args));
-    },
+    run: (bot, args) => withJobAutoCancel(spec, bot, () => runWrapped(spec, bot, args)),
   };
+}
+
+async function runWrapped(spec: SkillSpec, bot: Bot, args: unknown): Promise<SkillResult> {
+  if (spec.name === "say" || spec.name === "whisper") {
+    const result = await spec.run(bot, args);
+    if (result.ok) {
+      markReply(bot.username);
+      const target =
+        spec.name === "whisper"
+          ? (args as { player?: string } | undefined)?.player
+          : getCurrentConversationPartner(bot.username);
+      if (target) noteBotRepliedTo(bot.username, target);
+      const st = result.state as { sent?: string; duplicate?: boolean } | undefined;
+      const sent = st?.duplicate ? undefined : st?.sent;
+      if (sent) {
+        void recordConversation(bot.username, {
+          kind: "bot",
+          who: bot.username,
+          channel: spec.name === "whisper" ? "whisper" : "chat",
+          ...(spec.name === "whisper" && target ? { to: target } : {}),
+          text: sent,
+        });
+      }
+    }
+    return result;
+  }
+  if (GUARD_EXEMPT.has(spec.name)) return spec.run(bot, args);
+
+  const guard = guardFor(bot.username);
+  const key = `${spec.name}:${stableKey(args)}`;
+  const refusal = guard.refusal(spec.name, key);
+  if (refusal) {
+    console.log(`[${bot.username}] ✗ ${spec.name}: repeat-failure guard refused identical retry`);
+    recordEvent(bot.username, { kind: "guard_refusal", tool: spec.name, args: summarizeArgs(args) });
+    return { ok: false, message: refusal };
+  }
+  return guard.record(key, await spec.run(bot, args));
 }
 
 /** Fully-qualified allowed-tool names for an arbitrary spec subset. */

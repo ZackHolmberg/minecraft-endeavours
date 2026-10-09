@@ -25,6 +25,7 @@
 
 import type { Bot } from "mineflayer";
 import { z } from "zod";
+import { achieve, cancelJob } from "../jobs/tools.js";
 import { runSkill } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
@@ -588,6 +589,31 @@ export const SKILL_SPECS: SkillSpec[] = [
     // Executor needs this to drain a planner-authored queue (spikes/mlx-exec-spike.ts);
     // it sits outside the routing-spike curated-15, to be re-validated in Phase B.
     surfaces: EXECUTOR,
+  },
+  {
+    name: "achieve",
+    description:
+      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID. After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. Survival only.",
+    schema: {
+      goals: z
+        .array(
+          z.object({
+            item: z.string().min(1).describe("Item ID, e.g. 'iron_pickaxe', 'oak_planks', 'iron_ingot'"),
+            count: z.number().int().min(1).max(2304).describe("How many you should end up holding"),
+          }),
+        )
+        .min(1)
+        .max(8),
+    },
+    run: withParams("achieve", achieve),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "cancelJob",
+    description: "Cancel the running achieve job (if any). Use when the player changes their mind; a new achieve call also replaces the running job.",
+    schema: {},
+    run: noParams("cancelJob", cancelJob),
+    surfaces: CLAUDE_ONLY,
   },
 ];
 

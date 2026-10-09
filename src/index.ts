@@ -3,6 +3,8 @@ import { dirname } from "node:path";
 
 import { NpcAgent, registerAgent, unregisterAgent } from "./agent/npc-agent.js";
 import { loadConfig } from "./config.js";
+import { attachJobRunner } from "./jobs/wire.js";
+import { unregisterJobRunner } from "./jobs/registry.js";
 import {
   registerSupervisor,
   startBotSupervisor,
@@ -49,6 +51,9 @@ const supervisors: BotSupervisor[] = config.bots.map((botConfig) => {
       // world.json). Replacing in the registry triggers `stop()` on the
       // previous agent.
       registerAgent(botConfig.username, new NpcAgent({ bot, botConfig }));
+      void attachJobRunner(bot, botConfig.username, state).catch((err) => {
+        console.error(`[${botConfig.username}] job runner setup failed:`, err);
+      });
       attachBotEventHooks(bot, botConfig.username, allBotUsernames, state);
     },
   });
@@ -67,6 +72,7 @@ const shutdown = async (signal: string): Promise<void> => {
   console.log(`orchestrator: received ${signal}, disconnecting bots`);
   stopSnapshotWriter();
   await Promise.all(supervisors.map((s) => s.stop()));
+  await Promise.all(supervisors.map((s) => unregisterJobRunner(s.username)));
   await Promise.all(supervisors.map((s) => unregisterAgent(s.username)));
   // After the agents stop (they record their in-flight task_end), before exit.
   try {

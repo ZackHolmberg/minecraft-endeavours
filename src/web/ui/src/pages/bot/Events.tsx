@@ -17,6 +17,7 @@ const MAX = 80;
 function isNotable(e: TelemetryEvent): boolean {
   if (e.kind === "reflex") return e.reflex !== "look";
   if (e.kind === "skill") return !e.ok;
+  if (e.kind === "step") return !e.ok;
   if (e.kind === "chat_in" || e.kind === "chat_out") return false;
   return true;
 }
@@ -61,6 +62,14 @@ export function describe(e: TelemetryEvent): Described {
       return { icon: <IClock />, tone: "warn", title: `Event loop lag ${fmtMs(e.lagMs)}` };
     case "rate_limit":
       return { icon: <IAlert />, tone: "bad", title: `Rate limit: ${e.status}`, detail: e.resetsAt ? `resets ${fmtTime(e.resetsAt)}` : undefined };
+    case "job_start":
+      return { icon: <IBot />, tone: "info", title: `Job started: ${e.goals.map((g) => `${g.item} x${g.count}`).join(", ")}`, detail: `${e.steps} steps` };
+    case "job_end":
+      return { icon: e.status === "done" ? <ICheck /> : <IX />, tone: e.status === "done" ? "good" : e.status === "failed" ? "bad" : "", title: `Job ${e.status}`, detail: `${fmtMs(e.durationMs)} · ${e.steps} steps · ${e.replans} replans${e.failureKind ? ` · ${e.failureKind}` : ""}` };
+    case "step":
+      return { icon: <IZap />, tone: e.ok ? "" : "warn", title: `Step ${e.op} ${e.item}: ${e.ok ? "ok" : "failed"}`, detail: `${fmtMs(e.durationMs)}${e.failureKind ? ` · ${e.failureKind}` : ""}` };
+    case "recovery":
+      return { icon: <IAlert />, tone: "warn", title: `Recovery: ${e.rung}`, detail: e.detail };
     case "chat_in":
       return { icon: <IChat />, tone: "", title: `Chat from ${e.player}` };
     case "chat_out":

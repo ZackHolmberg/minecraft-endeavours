@@ -137,6 +137,41 @@ export type TelemetryEvent =
       inWorldMs: number | null;
     })
   | (TelemetryBase & { kind: "loop_lag"; lagMs: number })
+  // ── v2 jobs (src/jobs/): background goals run by the job runner ───────
+  | (TelemetryBase & {
+      kind: "job_start";
+      jobId: string;
+      goals: Array<{ item: string; count: number }>;
+      steps: number;
+    })
+  | (TelemetryBase & {
+      kind: "job_end";
+      jobId: string;
+      /** done | failed | cancelled | interrupted */
+      status: string;
+      durationMs: number;
+      steps: number;
+      replans: number;
+      /** FailureKind of the failure (status failed), else null. */
+      failureKind: string | null;
+    })
+  | (TelemetryBase & {
+      kind: "step";
+      jobId: string;
+      /** Step op: gather | craft | smelt | withdraw | place_station */
+      op: string;
+      item: string;
+      ok: boolean;
+      durationMs: number;
+      failureKind: string | null;
+    })
+  | (TelemetryBase & {
+      kind: "recovery";
+      jobId: string;
+      /** retry | replan | widen | explore | fail */
+      rung: string;
+      detail: string;
+    })
   | (TelemetryBase & {
       kind: "rate_limit";
       status: string;

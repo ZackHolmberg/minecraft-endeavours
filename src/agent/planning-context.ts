@@ -19,6 +19,8 @@ import {
   formatConversation,
   readRecentConversation,
 } from "../memory/conversation-log.js";
+import { jobContextLines } from "../jobs/describe.js";
+import { getJobRunner } from "../jobs/registry.js";
 import { getBotState } from "../state/index.js";
 import { observeSurroundings, type ObserveSurroundingsState } from "../skills/perception.js";
 
@@ -50,6 +52,12 @@ export async function buildAgentContext(bot: Bot): Promise<string> {
     readRecentConversation(bot.username),
   ]);
   const L = [AGENT_CONTEXT_HEADER, ...world];
+  const job = jobContextLines(getJobRunner(bot.username)?.current() ?? null);
+  if (job.length > 0) {
+    L.push("");
+    L.push("# Current job");
+    L.push(...job);
+  }
   L.push("");
   L.push("# Recent conversation (oldest first, from disk; includes the message you're answering)");
   const lines = formatConversation(convo, bot.username);

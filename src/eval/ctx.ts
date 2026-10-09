@@ -1,7 +1,7 @@
 /** ScenarioCtx implementation: wires RCON + Tester + telemetry for one scenario. */
 import type { Rcon } from "./rcon.js";
 import { parseItemEntry, parsePos, stripDataPrefix } from "./snbt.js";
-import { readEvents, taskState } from "./telemetry.js";
+import { jobState, readEvents, taskState } from "./telemetry.js";
 import type { Tester } from "./tester.js";
 import type { Box, ScenarioCtx, Vec3 } from "./types.js";
 
@@ -149,9 +149,12 @@ export class EvalContext implements ScenarioCtx {
     const quiet = opts.quietMs ?? 8000;
     const since = opts.since ?? this.lastSayAt ?? Date.now();
     while (!this.signal.aborted && !this.successFlag) {
-      const st = taskState(readEvents(this.eventsPath), since);
-      if (st.ends > 0 && !st.running) {
-        const last = Math.max(st.lastStartAt ?? 0, st.lastEndAt ?? 0);
+      const events = readEvents(this.eventsPath);
+      const st = taskState(events, since);
+      const job = jobState(events);
+      if (st.ends > 0 && !st.running && !job.running) {
+        // a job_end queues a follow-up Haiku task: the quiet window also runs from the job's end
+        const last = Math.max(st.lastStartAt ?? 0, st.lastEndAt ?? 0, job.lastAt);
         if (Date.now() - last >= quiet) return;
       }
       await sleep(1000);

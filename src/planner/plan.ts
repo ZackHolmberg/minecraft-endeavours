@@ -117,6 +117,8 @@ class Planner {
       for (const ing of Object.keys(r.ingredients)) {
         const c = this.cost(ing);
         s += c < INF ? c : 1000 + this.defaultIndex(ing);
+        // bamboo stands in for wood in sticks/planks, but it's a poor stand-in (hard to reach in jungles, 2 per stick): last resort
+        if ((ing === "bamboo" || ing === "bamboo_block") && !item.startsWith("bamboo")) s += 6;
       }
       return { r, s, i };
     });
@@ -126,17 +128,20 @@ class Planner {
 
   private chooseFuel(exclude: string): string {
     const ok = (f: string) => f !== exclude;
+    // A log burns 1.5 smelts but crafts into 4 planks that burn 1.5 each (6 smelts): fuel with planks.
+    const planksOf = (log: string) => WOOD_FAMILIES.find((w) => w.log === log)?.planks ?? log;
     for (const f of ["coal", "charcoal", "coal_block"]) if (ok(f) && (this.view.inventory[f] ?? 0) > 0) return f;
     if (ok("coal") && this.cost("coal") < INF) return "coal";
     // owned wood, then wood in view, else default log
     const woodFuels = (names: Iterable<string>) => [...names].filter((n) => ok(n) && isWoodFuel(n) && burnUnits(n) > 0);
     const ownedWood = woodFuels([...Object.keys(this.view.inventory), ...this.containerTotals.keys()]).filter((n) => this.owned(n) > 0);
-    ownedWood.sort((a, b) => Number(a.endsWith("_planks")) - Number(b.endsWith("_planks")) || this.defaultIndex(a) - this.defaultIndex(b));
-    if (ownedWood[0]) return ownedWood[0];
+    // planks first (a log is worth 4 planks as fuel); an owned log is crafted into planks and used as planks
+    ownedWood.sort((a, b) => Number(b.endsWith("_planks")) - Number(a.endsWith("_planks")) || this.defaultIndex(a) - this.defaultIndex(b));
+    if (ownedWood[0]) return ownedWood[0].endsWith("_log") || ownedWood[0].endsWith("_wood") ? planksOf(ownedWood[0]) : ownedWood[0];
     const logs = WOOD_FAMILIES.filter((w) => !w.nether && w.species !== "bamboo").map((w) => w.log);
-    const near = logs.filter((l) => ok(l) && this.cost(l) < INF).sort((a, b) => this.cost(a) - this.cost(b));
-    if (near[0]) return near[0];
-    return ok("oak_log") ? "oak_log" : "spruce_log";
+    const near = logs.filter((l) => ok(planksOf(l)) && this.cost(l) < INF).sort((a, b) => this.cost(a) - this.cost(b));
+    if (near[0]) return planksOf(near[0]);
+    return ok("oak_planks") ? "oak_planks" : "spruce_planks";
   }
 
   // ---------------------------------------------------------------- phase A

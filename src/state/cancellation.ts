@@ -17,10 +17,29 @@
  */
 export class CancellationFlag {
   private requested = false;
+  private readonly listeners = new Set<() => void>();
+
+  /**
+   * Observe every `request()` (stop skill, chat preempt, death, watchdog).
+   * The v2 job runner uses this: `runSkill` clears the flag at each skill
+   * start, so a job polling `isRequested()` between steps could miss a stop.
+   * Returns an unsubscribe function.
+   */
+  onRequest(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
 
   /** Called by stop skill / side-channel. Idempotent. */
   request(): void {
     this.requested = true;
+    for (const l of [...this.listeners]) {
+      try {
+        l();
+      } catch {
+        // observers must never break the stop path
+      }
+    }
   }
 
   /** Called at the start of a cancellable skill. Resets any prior request. */

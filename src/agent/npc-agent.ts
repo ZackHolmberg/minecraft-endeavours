@@ -19,6 +19,7 @@
  */
 
 import type { Bot } from "mineflayer";
+import { getJobRunner } from "../jobs/registry.js";
 import { recordConversation } from "../memory/conversation-log.js";
 import {
   isStopCommand,
@@ -98,12 +99,33 @@ export class NpcAgent {
    */
   private maybeInterrupt(event: ChatEvent): boolean {
     const { bot } = this.opts;
-    if (!(this.backend instanceof ClaudeBackend)) return false;
-    if (!this.backend.isBusy() || !isStopCommand(bot.username, event.message)) return false;
+    // v2: a running job is "in the middle of a task" even when no Haiku event is.
+    const job = getJobRunner(bot.username);
+    const stopsJob = job?.isRunning() === true && isStopCommand(bot.username, event.message);
+    if (stopsJob) {
+      console.log(`[${bot.username}] stop command from ${event.sender} — cancelling the running job`);
+      void job!.cancel(`${event.sender} said stop`);
+      void runSkill(bot, "stop", undefined, () => stop(bot));
+    }
+    if (!(this.backend instanceof ClaudeBackend)) return stopsJob;
+    if (!this.backend.isBusy() || !isStopCommand(bot.username, event.message)) return stopsJob;
     console.log(`[${bot.username}] stop command from ${event.sender} — halting and interrupting current event`);
     void runSkill(bot, "stop", undefined, () => stop(bot));
     void this.backend.interruptCurrentEvent();
     return true;
+  }
+
+  /**
+   * Queue a synthetic orchestrator event (a `[job finished]` / `[job failed]`
+   * line from the job runner) as a normal task, so the model decides what to
+   * tell the player. Dropped while rate-limited.
+   */
+  pushJobEvent(text: string): void {
+    if (this.backend.isRateLimited()) {
+      console.log(`[${this.opts.bot.username}] cooldown active; dropping job event`);
+      return;
+    }
+    this.backend.pushUserMessage(text);
   }
 
   isRateLimited(): boolean {

@@ -179,15 +179,40 @@ describe("stone and iron tiers", () => {
     expect(find(p, "craft", "crafting_table")).toHaveLength(1);
   });
 
-  it("iron_pickaxe without coal in view: wood fuel (logs), counted in the log gather", () => {
+  it("iron_pickaxe without coal in view: planks as fuel (1 log = 4 planks = 6 smelts), folded into the log gather", () => {
     const v = mkView();
     const p = expectReaches([g("iron_pickaxe")], v);
     const sm = find(p, "smelt")[0]!;
-    expect(sm.fuel).toBe("oak_log");
+    expect(sm.fuel).toBe("oak_planks");
     expect(sm.fuelCount).toBe(2); // 3 smelts / 1.5
     expect(find(p, "gather", "coal")).toHaveLength(0);
-    // 3 logs for planks (table 4 + 3+3+3 pickaxes... sticks) + 2 fuel
-    expect(find(p, "gather", "oak_log")[0]!.count).toBe(5);
+    // fuel planks come out of the same plank crafts as the tools: never more logs than raw-log fuel would need
+    const logs = find(p, "gather", "oak_log")[0]!.count;
+    expect(logs).toBeLessThanOrEqual(5);
+  });
+
+  it("bamboo in view does not replace logs for sticks / planks", () => {
+    const v = mkView({ near: { oak_log: 12, bamboo: 4, stone: 8 } });
+    const p = expectReaches([g("wooden_pickaxe")], v);
+    expect(find(p, "gather", "bamboo")).toHaveLength(0);
+    expect(find(p, "craft", "stick")).toHaveLength(1);
+  });
+
+  it("smelting 6 items on wood fuel costs 1 log (as planks), not 4 logs", () => {
+    const v = mkView({ inventory: { raw_iron: 6, furnace: 1 }, stations: { crafting_table: false, furnace: true } });
+    const p = expectReaches([g("iron_ingot", 6)], v);
+    const sm = find(p, "smelt")[0]!;
+    expect(sm).toMatchObject({ fuel: "oak_planks", fuelCount: 4 });
+    expect(find(p, "gather", "oak_log")[0]!.count).toBe(1);
+  });
+
+  it("owned logs are used as planks fuel, owned planks used directly", () => {
+    const withLogs = plan([g("iron_ingot", 3)], mkView({ inventory: { raw_iron: 3, oak_log: 2 }, stations: { crafting_table: false, furnace: true } }));
+    expect(find(withLogs, "smelt")[0]!.fuel).toBe("oak_planks");
+    expect(find(withLogs, "craft", "oak_planks")[0]!.crafts).toBe(1);
+    const withPlanks = plan([g("iron_ingot", 3)], mkView({ inventory: { raw_iron: 3, oak_planks: 2 }, stations: { crafting_table: false, furnace: true } }));
+    expect(find(withPlanks, "smelt")[0]!.fuel).toBe("oak_planks");
+    expect(find(withPlanks, "craft", "oak_planks")).toHaveLength(0);
   });
 
   it("iron_pickaxe with owned coal uses it", () => {

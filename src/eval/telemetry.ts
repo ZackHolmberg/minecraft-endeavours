@@ -54,6 +54,29 @@ export function taskState(events: readonly TelemetryEvent[], since = 0): TaskSta
   return { starts, ends, running: running || open.size > 0, lastStartAt, lastEndAt };
 }
 
+export interface JobState {
+  /** A job_start has no matching job_end yet. */
+  running: boolean;
+  /** Time of the latest job_start / job_end (0 if none). */
+  lastAt: number;
+}
+
+/** v2 jobs: a job runs in middleware after its Haiku task ended, so the bot is busy until job_end. v1 never emits job_*. */
+export function jobState(events: readonly TelemetryEvent[]): JobState {
+  const open = new Set<string>();
+  let lastAt = 0;
+  for (const e of events) {
+    if (e.kind === "job_start") {
+      open.add(e.jobId);
+      lastAt = Math.max(lastAt, e.at);
+    } else if (e.kind === "job_end") {
+      open.delete(e.jobId);
+      lastAt = Math.max(lastAt, e.at);
+    }
+  }
+  return { running: open.size > 0, lastAt };
+}
+
 type Metrics = Pick<
   ScenarioResult,
   | "tasks"
