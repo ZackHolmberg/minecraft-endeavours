@@ -64,7 +64,8 @@ export function readDotEnv(): Record<string, string> {
 }
 
 function intEnv(name: string, fallback: number): number {
-  const v = process.env[name];
+  // Process env wins; `.env` lets launchd-started panels pick up e.g. PANEL_PORT.
+  const v = process.env[name] ?? readDotEnv()[name];
   if (v === undefined || v === "") return fallback;
   const n = Number(v);
   if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error(`${name} must be a port number`);

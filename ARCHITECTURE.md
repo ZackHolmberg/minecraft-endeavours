@@ -480,7 +480,7 @@ A standalone, always-on host process for remote management. It runs separately f
 - **Lifecycle:**
   - `scripts/panelSetup.sh` sets the password and enrolls TOTP. With `--install-launchd` / `--uninstall-launchd` it manages a LaunchAgent, which starts the panel at login and restarts it if it crashes.
   - `scripts/panelStart.sh` / `panelStop.sh`. Pass `--dev` for a self-signed, loopback-only instance.
-- **Access:** router TCP 443 → Mac 8443 (`PANEL_PORT`). Only HTTPS is served, with no HTTP listener.
+- **Access:** router TCP 443 → Mac 443. The Rogers gateway only forwards same-port, so `PANEL_PORT=443` is set in `.env` (read by the panel even under launchd; default 8443). macOS lets unprivileged processes bind <1024. Only HTTPS is served, with no HTTP listener.
 - **TLS:** a Let's Encrypt certificate via ACME DNS-01 through the DuckDNS TXT API, using `DUCKDNS_TOKEN`. It is checked every 12h and renewed under 30 days, with a hot swap. The panel also updates the DuckDNS A record itself, because `stop.sh` stops the duckdns container.
 - **Auth:**
   - A single admin with a scrypt password and **mandatory TOTP**. TOTP codes can't be replayed.
