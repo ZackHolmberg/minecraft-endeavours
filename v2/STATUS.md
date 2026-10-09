@@ -13,7 +13,7 @@
 
 ## In flight (2026-10-09 ~17:30)
 - Eval chain (background shell): v1 re-run of `t1.eat`,`conv.followup_chest` into `v2/runs/v1-baseline`, then **v2 core run** `v2/runs/v2-s2b` (bot = live worktree @ `4e290f7`-equivalent src `ff27f8d`). Log: `v2/runs/v2-s2b.out` ends with CHAIN_DONE. **Don't edit `src/` until it finishes** (D11).
-- Slice 2b reviewer agent → `v2/reports/slice2b-review.md`.
+- Slice 2b review done (`b7bbdda`); fix agent works in worktree `../mcv2-dev` (branch `v2-fixes`, docker disabled there) → appends "## Fixes" to `v2/reports/slice2b-review.md`. Lead commits on `v2-fixes`, then `git merge --ff-only v2-fixes` into `v2` after the benchmark ends.
 - Frozen v1 bot checkout: `../minecraft-endeavours-v1base` (detached `c1587b0`). Don't edit it.
 If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + report files; whatever exists is the progress.
 
