@@ -56,12 +56,12 @@ Concrete applications shipped:
 Single Node.js process that spawns one NPC agent per configured bot account, supervises reconnects, and routes in-game chat events to the right NPC.
 
 ### NPC Agent
-Per-bot Claude Agent SDK loop on **Claude Haiku 4.5**. Event-driven — wakes on chat-to-bot. **Disk is the source of truth; the model keeps as little context as possible.** Two session modes (`session_mode` in `bots.yml`):
+Per-bot Claude Agent SDK loop on **Claude Haiku 5.5** (`claude-haiku-5-5`). Event-driven — wakes on chat-to-bot. **Disk is the source of truth; the model keeps as little context as possible.** Two session modes (`session_mode` in `bots.yml`):
 
 - **`per_task` (default)** — each routed player message gets a fresh `query()`, closed when its result arrives. The single user message is a deterministic **context block** (`buildAgentContext` in `src/agent/planning-context.ts`: position/status/inventory/nearby, known storage/utilities/waypoints, last death, persisted recent actions, task queue, and the last ~14 lines of `conversation.json`) followed by the chat line. The system prompt tells the model this block is ground truth and overrides anything it remembers. Messages arriving mid-task are queued and coalesced into the next fresh task. Follow-ups ("now put it in the chest") resolve from the on-disk conversation log, so restarts lose nothing.
 - **`persistent`** (rollback) — the original single long-lived streaming-input `query()`; still gets the context block per message.
 
-The system prompt interpolates only the username, so the system prompt + tool-definition prefix stays byte-stable and prompt-caches across sessions. Guardrails in `claude-backend.ts` / `skill-tools.ts`: 50-turn cap per task (then one "tell the player where things stand" follow-up), a **repeat-failure guard** (a third identical failing call is refused unrun; after 6 failures every failure carries a stop-and-report nudge), and explicit Haiku thinking (`budgetTokens: 2048`). See [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md).
+The system prompt interpolates only the username, so the system prompt + tool-definition prefix stays byte-stable and prompt-caches across sessions. Guardrails in `claude-backend.ts` / `skill-tools.ts`: 50-turn cap per task (then one "tell the player where things stand" follow-up), a **repeat-failure guard** (a third identical failing call is refused unrun; after 6 failures every failure carries a stop-and-report nudge), adaptive thinking at explicit `effort: "medium"` (Haiku 5.5 rejects a fixed `budgetTokens`), and refusal handling: Haiku 5.5's safety classifiers can decline a request and there is deliberately no fallback model, so the bot whispers the player a short "can't help with that" and the task outcome records the decline. See [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md).
 
 ### Skills
 A library of high-level capabilities exposed to Claude as tools. Each skill is a JS function that orchestrates mineflayer primitives and returns a structured result. Skills are unit-testable independently of Claude.
@@ -80,7 +80,7 @@ The orchestrator drives Claude through the **Claude Agent SDK** (`@anthropic-ai/
 - **The skill layer doesn't change.** If we ever swap to direct Anthropic API + pay-per-token, only the agent runtime layer changes; skills, orchestrator, and bot wiring are identical.
 
 ### Default model selection
-**Claude Haiku 4.5 for the main NPC loop, via the plain `claude` backend** — the standing decision (Oct 2026). Not the local model, not hybrid, not other tiers. Behavior problems are fixed with prompts, tool descriptions, and deterministic middleware, not by switching models. `model_hint` still accepts `sonnet` / `opus`, and the `local` / `hybrid` backends remain in the code but are unused.
+**Claude Haiku (currently Haiku 5.5, `claude-haiku-5-5`, released 2026-10-07) for the main NPC loop, via the plain `claude` backend** — the standing decision (Oct 2026); track new Haiku releases. Moving Haiku generations is not just an ID swap: check the migration guide for thinking/sampling changes, and keep `@anthropic-ai/claude-agent-sdk` current so its bundled CLI knows the model. Not the local model, not hybrid, not other tiers. Behavior problems are fixed with prompts, tool descriptions, and deterministic middleware, not by switching models. `model_hint` still accepts `sonnet` / `opus`, and the `local` / `hybrid` backends remain in the code but are unused.
 
 ### Orchestrator process model
 **Hybrid (Option C).** Host process for development, Docker Compose service for steady-state — same code, different launcher.
@@ -404,7 +404,7 @@ See [ROADMAP.md](ROADMAP.md) for technical sketches. Briefly: ambient overhearin
 | Server auth | Offline-mode + whitelist | No Mojang account per bot; whitelist gates impersonation |
 | Interaction routing | Name-mention + `/msg` + `@all` (ambient deferred) | Covers explicit tasking; ambient cut to fit Pro token budget |
 | Claude runtime | Claude Agent SDK + Pro subscription auth | No new billing; built-in agent loop; tradeoff is 5-hour rolling rate limits |
-| Default model | Sonnet 4.6 main / Haiku 4.5 background / Opus 4.7 opt-in | Cost/quality balance; reserved escalation for hard tasks |
+| Default model | Claude Haiku (5.5) for the main loop; other tiers unused | Owner decision (Oct 2026): Haiku only; fix behavior via prompts and middleware |
 | Orchestrator process | Hybrid: host `botStart.sh` (detached) for v0, compose service later | Fastest iteration now; clean deploy story later, same code |
 | Launcher scripts | Three lanes: server (`start.sh`/`stop.sh`), bot (`botStart.sh`/`botStop.sh`), viewers (`botLogs.sh`/`dashboard.sh`) | Each script does one thing; viewers can't accidentally start the server or the bot |
 | Dashboard ↔ orchestrator coupling | Out-of-process via `.bot-runtime/snapshot.json` (500ms dump) | Quitting the dashboard never disturbs the bot; future HTTP/WS API has the same shape |
@@ -467,3 +467,35 @@ Observe-only instrumentation; it never changes behavior and never throws into ga
   - The `local` and `hybrid` backends emit partial or no task events.
   - `nav: no_path` covers both a pathfinder "no path" and a path that ended early.
   - The report has its own synchronous JSONL reader (`src/report/read-events.ts`) alongside `readAllEvents`. Keep the two in sync if the layout changes.
+
+## Web control panel
+
+A standalone, always-on host process for remote management. It runs separately from the orchestrator, so it works when the server or the bot is down. **It is publicly exposed** over HTTPS at the DuckDNS hostname and includes a raw RCON console. That was a deliberate owner decision over Tailscale-only access, so the design is security-first.
+
+- **Code:**
+  - Contract: `src/web/shared/api.ts`.
+  - Server: `src/web/server/`, using Node `https` and `ws` with no framework.
+  - UI: `src/web/ui/`, Vite + Preact, built to the gitignored `src/web/ui/dist/`.
+  - Runtime data: `data/panel/`, mode 700. It holds `secrets.json`, `audit.jsonl`, `tls/`, `panel.pid` and `panel.log`.
+- **Lifecycle:**
+  - `scripts/panelSetup.sh` sets the password and enrolls TOTP. With `--install-launchd` / `--uninstall-launchd` it manages a LaunchAgent, which starts the panel at login and restarts it if it crashes.
+  - `scripts/panelStart.sh` / `panelStop.sh`. Pass `--dev` for a self-signed, loopback-only instance.
+- **Access:** router TCP 443 → Mac 8443 (`PANEL_PORT`). Only HTTPS is served, with no HTTP listener.
+- **TLS:** a Let's Encrypt certificate via ACME DNS-01 through the DuckDNS TXT API, using `DUCKDNS_TOKEN`. It is checked every 12h and renewed under 30 days, with a hot swap. The panel also updates the DuckDNS A record itself, because `stop.sh` stops the duckdns container.
+- **Auth:**
+  - A single admin with a scrypt password and **mandatory TOTP**. TOTP codes can't be replayed.
+  - Sessions are server-side, with 256-bit IDs, rotated on login. The cookie is `__Host-`, HttpOnly, Secure, SameSite=Strict. Idle timeout is 12h, with a 7-day absolute cap.
+  - CSRF: a per-session `X-CSRF-Token` plus Origin and Host allowlists, which also block DNS rebinding.
+  - Login lockout: per IP, exponential, from 1 min up to 24h. Plus a **global slowdown**, not a lockout: while ≥20 failures (any IP) sit in a 15-min window, IPs that have never logged in successfully share one attempt per 10s. IPs with a prior successful login (last 30 days, in memory) skip it, so a distributed attacker can't starve the owner. This replaced a hard global lockout (15 min → 6h) that let anyone lock the owner out.
+- **Command safety:**
+  - Actions are a fixed allowlist of 8 (server/bot start/stop/restart, save, backup), mapped to fixed script argv and spawned without a shell. Only one job per group runs at a time.
+  - The console runs `docker compose exec -T minecraft rcon-cli <cmd>` as a single argv. Commands are at most 256 chars, with no control chars and no leading `-`.
+- **Hardening:**
+  - Strict CSP: `default-src 'self'`, no inline script or style, `frame-ancestors 'none'`.
+  - 16KB body cap, request and connection limits, and WebSocket frame, connection and subscription caps.
+  - No stack traces or paths in responses. Static serving is realpath-confined.
+- **Audit:** every login attempt, action, console command and player change goes to `audit.jsonl` with the client IP. It is viewable in the UI.
+- **Known limits:**
+  - Rate-limit, lockout and replay state is in memory, so it resets on restart.
+  - It's a LaunchAgent, not a daemon, so it needs a logged-in user. Unattended reboot needs auto-login, which is incompatible with FileVault.
+  - The itzg `WHITELIST` env may re-apply the whitelist when the container restarts.
