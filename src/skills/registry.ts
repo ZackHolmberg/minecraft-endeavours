@@ -26,7 +26,7 @@
 import type { Bot } from "mineflayer";
 import { z } from "zod";
 import { achieve, cancelJob } from "../jobs/tools.js";
-import { runSkill } from "./harness.js";
+import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
   activateBlock,
@@ -96,16 +96,25 @@ export interface SkillSpec {
 function withParams<P>(
   name: string,
   fn: (bot: Bot, params: P) => Promise<SkillResult>,
+  opts?: RunSkillOptions,
 ): (bot: Bot, args: unknown) => Promise<SkillResult> {
-  return (bot, args) => runSkill(bot, name, args, (p) => fn(bot, p as P));
+  return (bot, args) => runSkill(bot, name, args, (p) => fn(bot, p as P), opts);
 }
 
 function noParams(
   name: string,
   fn: (bot: Bot) => Promise<SkillResult>,
+  opts?: RunSkillOptions,
 ): (bot: Bot, args: unknown) => Promise<SkillResult> {
-  return (bot) => runSkill(bot, name, undefined, () => fn(bot));
+  return (bot) => runSkill(bot, name, undefined, () => fn(bot), opts);
 }
+
+/**
+ * Read-only / conversational / job-control tools: they never clear the stop
+ * flag or overwrite the current-tool slot, so they are safe to call while a
+ * v2 job step runs (keep in sync with JOB_EXEMPT_TOOLS in jobs/tools.ts).
+ */
+const READ_ONLY: RunSkillOptions = { readOnly: true };
 
 // Reused schema fragments (moved verbatim from skill-tools.ts).
 const posSchema = z.object({ x: z.number(), y: z.number(), z: z.number() });
@@ -132,7 +141,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     schema: {
       radius: z.number().int().min(1).max(64).optional().describe("Search radius in blocks (default 16)"),
     },
-    run: withParams("observeSurroundings", observeSurroundings),
+    run: withParams("observeSurroundings", observeSurroundings, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -140,7 +149,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Detailed inventory: every item with counts, tool durability, and what's equipped in armor / off-hand slots. Item counts are already in the world snapshot on each message; call this when you need durability or equipment details, or fresh counts after a lot of crafting/mining.",
     schema: {},
-    run: noParams("checkInventory", checkInventory),
+    run: noParams("checkInventory", checkInventory, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -166,7 +175,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Say something in public chat — the ONLY way players hear you (besides whisper). Use it to reply to public-chat messages. Write like a friendly player: one short casual line, plain text, no markdown. Don't narrate each step of a task; ack, then report the result. Max 256 chars.",
     schema: { message: z.string().min(1) },
-    run: withParams("say", say),
+    run: withParams("say", say, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -174,7 +183,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Private message to one player. Use it to reply when a player whispered you (/msg). Same style as say: one short casual line. Fails if the player is offline.",
     schema: { player: z.string().min(1), message: z.string().min(1) },
-    run: withParams("whisper", whisper),
+    run: withParams("whisper", whisper, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -569,7 +578,7 @@ export const SKILL_SPECS: SkillSpec[] = [
       name: z.string().optional(),
       pos: posSchema.optional(),
     },
-    run: withParams("remember", remember),
+    run: withParams("remember", remember, READ_ONLY),
     surfaces: PLANNER_ONLY,
   },
   {
@@ -577,7 +586,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Set a plan of short, concrete steps with counts (e.g. ['mine 16 oak_log', 'craft wooden_pickaxe', 'mine 8 stone', 'give pickaxe to Alex']). Replaces any existing plan. The current and remaining steps show up in your world snapshot every message. Use for any job with 3+ steps.",
     schema: { tasks: z.array(z.string().min(1)).min(1) },
-    run: withParams("setTaskQueue", setTaskQueue),
+    run: withParams("setTaskQueue", setTaskQueue, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -585,7 +594,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Mark the current plan step done and move to the next. Call right after finishing each step. When it reports the queue is drained, tell the player you're done.",
     schema: {},
-    run: noParams("advanceTaskQueue", advanceTaskQueue),
+    run: noParams("advanceTaskQueue", advanceTaskQueue, READ_ONLY),
     // Executor needs this to drain a planner-authored queue (spikes/mlx-exec-spike.ts);
     // it sits outside the routing-spike curated-15, to be re-validated in Phase B.
     surfaces: EXECUTOR,
@@ -605,14 +614,14 @@ export const SKILL_SPECS: SkillSpec[] = [
         .min(1)
         .max(8),
     },
-    run: withParams("achieve", achieve),
+    run: withParams("achieve", achieve, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
   {
     name: "cancelJob",
     description: "Cancel the running achieve job (if any). Use when the player changes their mind; a new achieve call also replaces the running job.",
     schema: {},
-    run: noParams("cancelJob", cancelJob),
+    run: noParams("cancelJob", cancelJob, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
 ];

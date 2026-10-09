@@ -71,8 +71,10 @@ const shutdown = async (signal: string): Promise<void> => {
   shuttingDown = true;
   console.log(`orchestrator: received ${signal}, disconnecting bots`);
   stopSnapshotWriter();
-  await Promise.all(supervisors.map((s) => s.stop()));
+  // Runners first: a running job ends as `interrupted` (persisted, no event) before
+  // the bots disconnect, instead of failing steps on a dead connection.
   await Promise.all(supervisors.map((s) => unregisterJobRunner(s.username)));
+  await Promise.all(supervisors.map((s) => s.stop()));
   await Promise.all(supervisors.map((s) => unregisterAgent(s.username)));
   // After the agents stop (they record their in-flight task_end), before exit.
   try {

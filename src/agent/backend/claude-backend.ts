@@ -52,6 +52,7 @@
  * more quota per ARCHITECTURE.md "Resilience".
  */
 
+import { coalesceMessages } from "../coalesce.js";
 import {
   query,
   type Query,
@@ -817,10 +818,7 @@ export class ClaudeBackend implements AgentBackend {
         aborted = true;
         return;
       }
-      const body =
-        batch.length === 1
-          ? batch[0]!
-          : `${batch.length} messages came in while you were busy (oldest first) — handle them together, latest intent wins:\n\n${batch.join("\n\n")}`;
+      const body = coalesceMessages(batch);
       const active = this.openSession();
       this.eventLabels.push(labelFor(batch));
       this.queueTelemetryTask(batch, metas, ctxMs, context, injected);

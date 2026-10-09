@@ -155,7 +155,9 @@ export class EvalContext implements ScenarioCtx {
       if (st.ends > 0 && !st.running && !job.running) {
         // a job_end queues a follow-up Haiku task: the quiet window also runs from the job's end
         const last = Math.max(st.lastStartAt ?? 0, st.lastEndAt ?? 0, job.lastAt);
-        if (Date.now() - last >= quiet) return;
+        // no task started since the job ended: its follow-up may still be spinning up (cold SDK spawn), wait longer
+        const followUpPending = job.lastAt > (st.lastStartAt ?? 0);
+        if (Date.now() - last >= (followUpPending ? Math.max(quiet, 30_000) : quiet)) return;
       }
       await sleep(1000);
     }
@@ -238,8 +240,8 @@ export class EvalContext implements ScenarioCtx {
   async gameTime(): Promise<number> {
     return Number(/(\d+)/.exec(await this.rcon("time query gametime"))?.[1] ?? -1);
   }
-  eventCount(kind: string): number {
-    return readEvents(this.eventsPath).filter((e) => e.kind === kind).length;
+  eventCount(kind: string, where?: (e: Record<string, unknown>) => boolean): number {
+    return readEvents(this.eventsPath).filter((e) => e.kind === kind && (!where || where(e as unknown as Record<string, unknown>))).length;
   }
   get botChats(): readonly string[] {
     return this.t.chats.map((l) => l.text);

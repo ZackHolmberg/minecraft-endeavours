@@ -27,6 +27,7 @@ import {
 } from "./recovery.js";
 import type { FailureKind, Goal, PlanFn, Plan, Step, StepFailure, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
+import type { StopReason } from "../state/cancellation.js";
 import type { AchieveResult, Job, JobStatus, StepResult } from "./types.js";
 
 export interface StepRunContext {
@@ -68,6 +69,18 @@ export interface RunnerDeps {
 
 export const JOB_MAX_MS = 30 * 60_000;
 const CANCEL_WAIT_MS = 35_000;
+/** After a step's own timeout fires (cooperative stop), how long a skill that ignores it gets before being abandoned. */
+export const STEP_GRACE_MS = 20_000;
+
+/** Await `p`, but give up after `ms`; the timer never outlives the race. */
+async function waitUpTo(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([p, new Promise<void>((r) => (timer = setTimeout(r, ms)))]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export function stepTimeoutMs(s: Step): number {
   switch (s.op) {
@@ -97,6 +110,8 @@ export class JobRunner {
   private internalStop = 0;
   private chain: Promise<unknown> = Promise.resolve();
   private disposed = false;
+  /** Bumped by every external stop; `startInner` aborts if one landed while it was planning. */
+  private stopEpoch = 0;
   private readonly now: () => number;
 
   constructor(private readonly deps: RunnerDeps) {
@@ -131,7 +146,12 @@ export class JobRunner {
   private async startInner(goals: Goal[], requestedBy: string | null): Promise<AchieveResult> {
     if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
     if (this.isRunning()) await this.cancel("replaced by a new job");
+    const epoch = this.stopEpoch;
     const view = await this.deps.buildView(goals, SCAN_RADII[0]);
+    if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
+    if (this.stopEpoch !== epoch) {
+      return { ok: false, jobId: null, message: "not started: a stop request arrived while the job was being planned" };
+    }
     const plan = this.deps.plan(goals, view);
     if (plan.steps.length === 0) {
       if (plan.unresolved.length === 0) {
@@ -186,15 +206,33 @@ export class JobRunner {
       this.ctrl?.abort();
       this.stopInternal();
     }
-    if (loop) {
-      await Promise.race([loop, new Promise<void>((r) => setTimeout(r, CANCEL_WAIT_MS))]);
-    }
+    if (loop) await waitUpTo(loop, CANCEL_WAIT_MS);
   }
 
-  /** Subscribed to the bot's CancellationFlag: a stop / death / watchdog request while a job runs cancels it. */
-  notifyStop(): void {
-    if (this.internalStop > 0 || !this.isRunning()) return;
-    void this.cancel("stopped (player stop, death or abort)");
+  /**
+   * Subscribed to the bot's CancellationFlag. A player stop cancels the running
+   * job quietly (the stop path already answered the player). Death and the skill
+   * watchdog end it as `failed` (kind `died` / `timeout`) so the model is told
+   * and can inform the player; a silent end would drop their request.
+   */
+  notifyStop(reason: StopReason = "player"): void {
+    if (this.internalStop > 0) return;
+    this.stopEpoch += 1;
+    const job = this.job;
+    if (!job || job.status !== "running") return;
+    if (reason === "player") {
+      void this.cancel("stopped (player stop or abort)");
+      return;
+    }
+    const step = job.plan.steps[Math.min(job.stepIndex, job.plan.steps.length - 1)]!;
+    const failure: StepFailure =
+      reason === "death"
+        ? { kind: "died", step, detail: `the bot died during "${describeStep(step)}" (its items dropped where it died)`, attempts: 1 }
+        : { kind: "timeout", step, detail: `a skill hit the watchdog during "${describeStep(step)}" and the job was stopped`, attempts: 1 };
+    job.progress = `failed: ${failure.kind}`;
+    this.finish(job, "failed", failure);
+    this.ctrl?.abort();
+    this.stopInternal();
   }
 
   /** Shutdown / reconnect: end the running job as interrupted. */
@@ -211,7 +249,7 @@ export class JobRunner {
       this.finish(job, "interrupted", null);
       this.ctrl?.abort();
       this.stopInternal();
-      if (this.loop) await Promise.race([this.loop, new Promise<void>((r) => setTimeout(r, 5_000))]);
+      if (this.loop) await waitUpTo(this.loop, 5_000);
     }
   }
 
@@ -258,7 +296,8 @@ export class JobRunner {
     if (status === "failed" && failure) job.progress = `failed: ${failure.kind} — ${failure.detail}`;
     this.persist(job);
     this.recordEnd(job);
-    if (status === "done" || status === "failed") {
+    // A disposed runner (reconnect / shutdown) belongs to a dead bot or agent: no event.
+    if ((status === "done" || status === "failed") && !this.disposed) {
       try {
         this.deps.onEnd?.(job);
       } catch (err) {
@@ -324,8 +363,12 @@ export class JobRunner {
       switch (rung.rung) {
         case "cancel":
           if (job.status === "running") {
-            job.progress = `cancelled: ${failure.kind}`;
-            this.finish(job, "cancelled", null);
+            if (failure.kind === "died") {
+              this.finish(job, "failed", failure); // the model must hear about a death
+            } else {
+              job.progress = `cancelled: ${failure.kind}`;
+              this.finish(job, "cancelled", null);
+            }
           }
           return;
         case "fail":
@@ -343,6 +386,7 @@ export class JobRunner {
           break;
         case "replan": {
           const verdict = await this.replan(job, scanRadius, rung.detail);
+          if (verdict === "continue") for (const e of episodes.values()) e.baseline = null; // inventory changed: re-baseline lazily
           if (verdict === "done") {
             this.finish(job, "done", null);
             return;
@@ -415,14 +459,26 @@ export class JobRunner {
 
   private async runStep(job: Job, step: Step, ctx: StepRunContext): Promise<StepResult> {
     const t0 = this.now();
+    const limit = stepTimeoutMs(step);
     let timedOut = false;
+    let abandonTimer: NodeJS.Timeout | undefined;
+    // The runner owns step timeouts (job steps run without the skill watchdog):
+    // first a cooperative stop, then, if the skill ignores it, abandon the step.
     const timer = setTimeout(() => {
       timedOut = true;
       this.stopInternal();
-    }, stepTimeoutMs(step));
+      abandonTimer = setTimeout(() => {
+        this.stopInternal();
+        giveUp({ ok: false, failure: { kind: "timeout", step, detail: `${describeStep(step)} did not stop after its ${Math.round(limit / 1000)}s limit and was abandoned`, attempts: 1 } });
+      }, STEP_GRACE_MS);
+    }, limit);
+    let giveUp: (r: StepResult) => void = () => {};
+    const abandoned = new Promise<StepResult>((resolve) => {
+      giveUp = resolve;
+    });
     let res: StepResult;
     try {
-      res = await this.deps.execute(step, ctx);
+      res = await Promise.race([this.deps.execute(step, ctx), abandoned]);
     } catch (err) {
       res = {
         ok: false,
@@ -430,9 +486,10 @@ export class JobRunner {
       };
     } finally {
       clearTimeout(timer);
+      if (abandonTimer) clearTimeout(abandonTimer);
     }
     if (timedOut && !res.ok && res.failure.kind === "cancelled") {
-      res = { ok: false, failure: { ...res.failure, kind: "timeout", detail: `${describeStep(step)} timed out after ${Math.round(stepTimeoutMs(step) / 1000)}s` } };
+      res = { ok: false, failure: { ...res.failure, kind: "timeout", detail: `${describeStep(step)} timed out after ${Math.round(limit / 1000)}s` } };
     }
     this.deps.record({
       kind: "step",

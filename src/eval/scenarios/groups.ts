@@ -181,7 +181,7 @@ export const stairsNotPillar: Scenario = {
   run: (ctx) => ask(ctx, "steve, come up here"),
   async check(ctx) {
     const near = await playerNear(ctx, ctx.bot, ctx.tester, 4);
-    const pillars = ctx.eventCount("pillar");
+    const pillars = ctx.eventCount("pillar", (e) => e.purpose !== "escape");
     return allOf(near, { ok: pillars === 0, detail: `${pillars} pillar runs` });
   },
   dryWin: (ctx) => ctx.tp(ctx.bot, ctx.scratch.top),

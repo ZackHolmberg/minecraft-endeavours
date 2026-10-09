@@ -66,7 +66,9 @@ export function pickFiller(bot: Bot): Item | null {
  * Climb `height` blocks straight up by placing filler under the bot.
  * Honors the cancellation flag between levels (does not call begin()).
  */
-export async function pillarUpBy(bot: Bot, height: number): Promise<SkillResult> {
+export type PillarPurpose = "escape" | "requested";
+
+export async function pillarUpBy(bot: Bot, height: number, purpose: PillarPurpose): Promise<SkillResult> {
   const r = await pillarUpByInner(bot, height);
   try {
     const st = r.state as { placed?: number; attempts?: number } | undefined;
@@ -77,6 +79,7 @@ export async function pillarUpBy(bot: Bot, height: number): Promise<SkillResult>
       attempts: pillarAttempts.get(bot) ?? 0,
       ok: r.ok,
       reason: r.ok ? null : r.message.slice(0, 200),
+      purpose,
     });
   } catch {
     // observe-only

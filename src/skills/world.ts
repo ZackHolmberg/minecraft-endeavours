@@ -475,7 +475,7 @@ async function mineOneBlock(
     const feet = bot.entity.position.floored();
     const targetBelowFeet = block.position.x === feet.x && block.position.z === feet.z && block.position.y < feet.y;
     if (!bot.entity.onGround && !targetBelowFeet) {
-      const pillar = await pillarUpBy(bot, 1);
+      const pillar = await pillarUpBy(bot, 1, "escape");
       if (pillar.ok) {
         console.log(`[${bot.username}] pillared before dig: ${pillar.message}`);
       } else {
@@ -815,7 +815,7 @@ export async function pillarUp(bot: Bot, { height }: PillarUpParams): Promise<Sk
       // pillarUpBy reports the missing filler itself
     }
   }
-  return pillarUpBy(bot, height);
+  return pillarUpBy(bot, height, "requested");
 }
 
 /** True if the bot's hitbox (0.6 × 1.8) intersects the cell at `cell`. */

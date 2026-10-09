@@ -92,6 +92,11 @@ type Metrics = Pick<
   | "outcomes"
 > & { pillarEvents: number; deathEvents: number };
 
+/** D12: only pillaring that is not an escape counts (events without a purpose, i.e. v1, all count). */
+export function isPillarViolation(e: { purpose?: string }): boolean {
+  return e.purpose !== "escape";
+}
+
 export function collectMetrics(events: readonly TelemetryEvent[]): Metrics {
   const m: Metrics = {
     tasks: 0,
@@ -121,7 +126,7 @@ export function collectMetrics(events: readonly TelemetryEvent[]): Metrics {
       m.costUsd += e.costUsd ?? 0;
       const o: TaskOutcome = e.outcome;
       m.outcomes[o] = (m.outcomes[o] ?? 0) + 1;
-    } else if (e.kind === "pillar") m.pillarEvents++;
+    } else if (e.kind === "pillar" && isPillarViolation(e)) m.pillarEvents++;
     else if (e.kind === "death") m.deathEvents++;
   }
   const denom = m.inputTokens + m.cacheReadTokens + m.cacheCreateTokens;

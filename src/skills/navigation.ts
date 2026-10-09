@@ -102,7 +102,7 @@ async function tryEscape(
   if (pickFiller(bot)) {
     let climbed = 0;
     while (climbed < ESCAPE_MAX_PILLAR && isBoxedIn(bot) && !cancellation?.isRequested()) {
-      const p = await pillarUpBy(bot, 1);
+      const p = await pillarUpBy(bot, 1, "escape");
       if (!p.ok) break;
       climbed += 1;
     }

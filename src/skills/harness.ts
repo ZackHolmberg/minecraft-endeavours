@@ -59,6 +59,22 @@ const AIRBORNE_OK = new Set([
 ]);
 const WATCHDOG_EXEMPT = new Set(["followPlayer"]);
 
+export interface RunSkillOptions {
+  /**
+   * Read-only / conversational skill (`say`, `checkInventory`, ...): must not
+   * clear the stop flag or overwrite the current-tool slot, so it can run while
+   * a v2 job step is in flight without losing that step's stop or blanking
+   * its DOING entry. Also skips the reflex wait (it touches no inventory).
+   */
+  readOnly?: boolean;
+  /**
+   * Per-call watchdog override in ms; `null` disables it. Job steps use `null`:
+   * the job runner owns their timeouts (and reports them), so a silent 10-min
+   * watchdog stop must not end a long gather/smelt step as a "player stop".
+   */
+  watchdogMs?: number | null;
+}
+
 /**
  * Wrap a skill in a try/catch so unexpected exceptions become
  * `{ ok: false, message }` results instead of taking down the bot, and
@@ -74,21 +90,24 @@ export async function runSkill<P, R extends SkillResult>(
   name: string,
   params: P,
   fn: (params: P) => Promise<R>,
+  opts: RunSkillOptions = {},
 ): Promise<SkillResult> {
   const state = getBotState(bot.username);
+  const readOnly = opts.readOnly === true;
+  const watchdogMs = opts.watchdogMs === undefined ? SKILL_WATCHDOG_MS : opts.watchdogMs;
   // Don't let a skill's equip / window clicks interleave with an in-flight
   // reflex (auto-eat, armor, defensive swing). `stop` touches no inventory
   // and must not be delayed by a reflex.
-  if (name !== "stop") await awaitReflexIdle(bot.username);
+  if (name !== "stop" && !readOnly) await awaitReflexIdle(bot.username);
   // Every skill starts with a clean stop flag. Without this a "stop" that
   // ended one skill (or a death) stays latched and the next skill's
   // `navigate` aborts instantly as "cancelled". `stop` itself is exempt.
-  if (name !== "stop") state?.cancellation.begin();
+  if (name !== "stop" && !readOnly) state?.cancellation.begin();
   if (isFlying(bot) && !AIRBORNE_OK.has(name)) await land(bot);
   // A side-channel `stop` (NpcAgent.maybeInterrupt) runs while another skill
   // is still in flight. It must not overwrite / clear that skill's entry:
   // the per-task backend's waitForToolIdle and the reflexes key off it.
-  const trackTool = !(name === "stop" && state?.currentTool.current());
+  const trackTool = !readOnly && !(name === "stop" && state?.currentTool.current());
   const toolToken = trackTool ? state?.currentTool.begin(name) : undefined;
 
   let result: SkillResult;
@@ -97,7 +116,7 @@ export async function runSkill<P, R extends SkillResult>(
   const startedAt = Date.now();
   try {
     const run = fn(params);
-    if (WATCHDOG_EXEMPT.has(name)) {
+    if (WATCHDOG_EXEMPT.has(name) || watchdogMs === null) {
       result = await run;
     } else {
       const timedOut = new Promise<SkillResult>((resolve) => {
@@ -105,7 +124,7 @@ export async function runSkill<P, R extends SkillResult>(
           watchdogFired = true;
           // Ask the skill to wind down and halt movement; the original
           // promise is abandoned (it can't be force-cancelled).
-          state?.cancellation.request();
+          state?.cancellation.request("watchdog");
           (bot as Bot & { pathfinder?: { stop(): void } }).pathfinder?.stop();
           // The abandoned skill may be inside a digging-Movements scope; its
           // `finally` would otherwise restore (or fail to restore) it later,
@@ -115,8 +134,8 @@ export async function runSkill<P, R extends SkillResult>(
           } catch {
             // best-effort
           }
-          resolve({ ok: false, message: `${name} timed out after ${SKILL_WATCHDOG_MS / 60_000} min and was abandoned` });
-        }, SKILL_WATCHDOG_MS);
+          resolve({ ok: false, message: `${name} timed out after ${watchdogMs >= 60_000 ? `${Math.round(watchdogMs / 600) / 100} min` : `${Math.round(watchdogMs / 100) / 10}s`} and was abandoned` });
+        }, watchdogMs);
       });
       result = await Promise.race([run, timedOut]);
     }

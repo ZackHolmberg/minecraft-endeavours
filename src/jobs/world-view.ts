@@ -16,6 +16,17 @@ const STATION_RADIUS = 32;
 /** Nearest positions kept per block type (we only need count>0 and the nearest distance). */
 const PER_TYPE_COUNT = 8;
 const MAX_CONTAINER_DISTANCE = 200;
+/**
+ * `findBlocks` is synchronous and its cost grows steeply with radius (about 10x
+ * more loaded columns at r=160 than at r=48). So: every type is scanned only at
+ * the base radius; wider radii re-scan just the goal's own gather blocks that
+ * the base scan missed, in growing shells; and the loop yields to the event
+ * loop every few scans so keepalives / pathfinder / reflex ticks keep running.
+ */
+const BASE_SCAN_RADIUS = 48;
+const WIDE_SCAN_RADII = [96, 160] as const;
+const WIDE_PER_TYPE_COUNT = 2;
+const YIELD_EVERY = 3;
 
 /** Always-scanned resource families (matched against registry block names). */
 const BASE_RESOURCE = [
@@ -74,21 +85,35 @@ function dimensionOf(bot: Bot): WorldView["dimension"] {
 
 export async function buildWorldView(bot: Bot, goals: Goal[], radius: number = DEFAULT_SCAN_RADIUS): Promise<WorldView> {
   const mode = currentGameMode(bot);
-  const pos = bot.entity.position;
+  const pos = bot.entity.position.clone(); // stable across the yields below
   const position = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
   const inventory = inventoryTotals(bot.inventory.slots);
 
   const nearbyBlocks: WorldView["nearbyBlocks"] = {};
   const registryNames = Object.keys(bot.registry.blocksByName);
-  const wanted = relevantBlockNames(registryNames, goalGatherBlocks(goals, inventory, position));
-  for (const name of wanted) {
+  const goalBlocks = goalGatherBlocks(goals, inventory, position);
+  const wanted = relevantBlockNames(registryNames, goalBlocks);
+  let scans = 0;
+  const scan = async (name: string, r: number, count: number): Promise<void> => {
     const id = bot.registry.blocksByName[name]?.id;
-    if (id === undefined) continue;
-    const found = bot.findBlocks({ point: pos, matching: id, maxDistance: radius, count: PER_TYPE_COUNT });
-    if (found.length === 0) continue;
+    if (id === undefined) return;
+    if (scans++ % YIELD_EVERY === YIELD_EVERY - 1) await new Promise<void>((res) => setImmediate(res));
+    const found = bot.findBlocks({ point: pos, matching: id, maxDistance: r, count });
+    if (found.length === 0) return;
     let nearest = Infinity;
     for (const p of found) nearest = Math.min(nearest, p.distanceTo(pos));
     nearbyBlocks[name] = { count: found.length, nearest: Math.round(nearest * 10) / 10 };
+  };
+  const baseR = Math.min(radius, BASE_SCAN_RADIUS);
+  for (const name of wanted) await scan(name, baseR, PER_TYPE_COUNT);
+  // wide radii: only what the goal itself needs and the base scan did not find
+  const missing = new Set(goalBlocks.filter((b) => registryNames.includes(b) && !nearbyBlocks[b]));
+  for (const r of WIDE_SCAN_RADII) {
+    if (r > radius || missing.size === 0) continue;
+    for (const name of [...missing]) {
+      await scan(name, r, WIDE_PER_TYPE_COUNT);
+      if (nearbyBlocks[name]) missing.delete(name);
+    }
   }
 
   const near = (block: string): boolean => {
