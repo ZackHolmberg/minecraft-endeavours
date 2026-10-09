@@ -12,7 +12,7 @@ Spec for `src/eval/scenarios/*`. Contract: `src/eval/types.ts`; harness: [EVAL.m
 | t1.give_bread | plains | bot 6 bread; Tester inv cleared | "can you give me 3 bread?" | Tester ≥3 bread | 2m |
 | t1.mine_stone | hills | wooden_pickaxe | "mine 8 stone" | ≥8 cobblestone | 4m |
 | t1.craft_table | plains | 3 oak_log | "make a crafting table" | crafting_table in inv or placed ≤6 blocks | 2m |
-| t1.eat | plains | 4 bread; hunger effect until food ≤10 | "eat something" | foodLevel > post-setup level | 2m |
+| t1.eat | plains | hunger effect until food ≤10, then 4 bread (reflex eating counts) | "eat something" | foodLevel > post-setup level | 2m |
 | t1.inv_question | plains | 5 bread, 3 torch, iron_sword | "what's in your inventory?" | reply ≤45s mentions bread AND sword | 1m |
 | t1.follow | plains | — | "follow me", then Tester walks 24 blocks (tp 3 blocks every 1.5s) | bot ≤6 blocks from Tester 10s after last step | 2m |
 
@@ -47,7 +47,7 @@ Spec for `src/eval/scenarios/*`. Contract: `src/eval/types.ts`; harness: [EVAL.m
 ## Conversation / interruption / player-likeness / creative
 | id | site | setup | script | success | timeout |
 |---|---|---|---|---|---|
-| conv.followup_chest | forest | chest 5 away (protected) | "get me 5 logs" → waitForDone → "now put them in the chest" | chest ≥5 `*_log` | 8m |
+| conv.followup_chest | forest | chest 5 away (protected) | "chop 5 logs" → waitForDone → "now put them in the chest" ("get me" was ambiguous: v1 handed them over) | chest ≥5 `*_log` | 8m |
 | conv.two_part | forest | — | "grab 3 logs and then come back here" | ≥3 logs AND ≤4 from Tester | 5m |
 | conv.status_midtask | forest | — | "chop 10 logs" → after 20s "how's it going?" | reply to 2nd msg ≤20s AND ≥10 logs eventually | 7m |
 | int.stop | hills | wooden_pickaxe | "mine 64 stone" → after 20s "steve stop" → after 10s "come here" | cobblestone count frozen within 8s of stop AND ≤4 from Tester at end | 3m |

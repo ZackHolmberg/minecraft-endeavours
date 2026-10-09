@@ -20,7 +20,7 @@ export const followupChest: Scenario = {
     ctx.scratch.chest = await placeProtected(ctx, await groundAt(ctx, 0, 5), "chest[facing=north]", "chest");
   },
   async run(ctx) {
-    await ctx.say("steve, get me 5 logs");
+    await ctx.say("steve, chop 5 logs");
     await ctx.waitForDone();
     if (ctx.signal.aborted || ctx.succeeded) return;
     await ctx.say("steve, now put them in the chest");

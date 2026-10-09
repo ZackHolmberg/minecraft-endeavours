@@ -94,11 +94,14 @@ export const eat: Scenario = {
   timeoutMs: 2 * 60_000,
   site: "plains",
   async setup(ctx) {
-    await ctx.give(ctx.bot, "bread", 4);
+    // Drain first, then hand over bread: given earlier, the bot's auto-eat
+    // reflex (food <= 14) ate it all during the drain (v1 baseline). Eating
+    // right away by reflex is a pass: the bot ate when hungry.
     await ctx.rcon(`effect give ${ctx.bot} minecraft:hunger 90 100 true`);
     for (let i = 0; i < 90 && (await ctx.foodLevel(ctx.bot)) > 10; i++) await ctx.sleep(1000);
     await ctx.rcon(`effect clear ${ctx.bot} minecraft:hunger`);
     ctx.scratch.food0 = await ctx.foodLevel(ctx.bot);
+    await ctx.give(ctx.bot, "bread", 4);
   },
   run: (ctx) => ask(ctx, "steve, eat something"),
   async check(ctx) {
