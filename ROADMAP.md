@@ -13,6 +13,22 @@ Where the project is going. Items we've intentionally deferred from current work
 
 ## Backlog
 
+### Creative-mode + New world live tests
+
+**Creative:**
+1. Switch the bot to creative from the panel. The log should show the mode change and the next context should say `CREATIVE`.
+2. "Build me a small house": `getItems` then `placeBlocks`, with no gathering.
+3. Watch for phantom items (Paper silently rejecting creative slot writes) and for movement kicks during flight.
+4. "Come up here" from a roof.
+5. Switch back to survival mid-hover: it should fall, and the reflexes should resume.
+
+**New world:** do one supervised run from the panel with a known seed. Confirm:
+- the seed applied (the itzg image rewrites `server.properties` from env);
+- `backups/worlds/<ts>/` and `memory-archive/<ts>/` exist;
+- the bot restarted with empty memory.
+
+**Follow-ups:** add a `gamemode` telemetry event; add a creative line to the hybrid executor context.
+
 ### v0.5 live-test pass (Haiku + player-likeness)
 
 **Run `./scripts/botReport.sh --since run` after each play session.** Its flags answer most of the items below: cache hit, first-reply latency, the turn cap, stuck spots, and skill failure rates. The telemetry and dashboard pages are shipped (see ARCHITECTURE.md *Telemetry & insight*).

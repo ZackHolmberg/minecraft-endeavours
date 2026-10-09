@@ -488,7 +488,19 @@ A standalone, always-on host process for remote management. It runs separately f
   - CSRF: a per-session `X-CSRF-Token` plus Origin and Host allowlists, which also block DNS rebinding.
   - Login lockout: per IP, exponential, from 1 min up to 24h. Plus a **global slowdown**, not a lockout: while ≥20 failures (any IP) sit in a 15-min window, IPs that have never logged in successfully share one attempt per 10s. IPs with a prior successful login (last 30 days, in memory) skip it, so a distributed attacker can't starve the owner. This replaced a hard global lockout (15 min → 6h) that let anyone lock the owner out.
 - **Command safety:**
-  - Actions are a fixed allowlist of 8 (server/bot start/stop/restart, save, backup), mapped to fixed script argv and spawned without a shell. Only one job per group runs at a time.
+  - Actions are a fixed allowlist of 9 (server/bot start/stop/restart, save, backup, `world.new`), mapped to fixed script argv and spawned without a shell. Only one job per group runs at a time.
+  - **`world.new`** is the only action that takes input: an optional seed, plus `confirm: "NEW WORLD"`.
+    - **Validation:** the seed must match `/^-?[A-Za-z0-9_ ]{1,32}$/`. It reaches the server only as `LEVEL_SEED` in the `start.sh` child env, always set (`""` for random) so it overrides `.env`. `.env` is never written.
+    - **Steps:** backup → stop bot (restarted afterwards if it was running) → stop server → refuse if the MC port still answers → move `data/world*` to `backups/worlds/<ts>/` → move `data/orchestrator/memory/*` to `data/orchestrator/memory-archive/<ts>/` → start the server → wait until reachable.
+    - **Safety:**
+      - Moves, never deletes. The cross-device fallback copies and verifies before removing.
+      - Archive dirs are created non-recursively, so it never merges into an existing one.
+      - It stops at the first failure.
+      - **No automatic pruning**, so the panel can never destroy a world. An earlier version kept only the newest 3 archives; the security review showed that let a stolen session erase the original world by running `world.new` repeatedly. Old archives in `backups/worlds/` are deleted by hand on the host.
+      - It is exclusive across all groups, limited to 3 attempts per hour panel-wide (refused attempts are refunded), and audited with the seed.
+    - **Interruption:** a panel restart mid-job leaves things stopped but intact.
+  - **Game modes:** `GET /api/players` includes per-player `gameModes` (RCON `data get entity <name> playerGameType`, cached 15s). `POST /api/players/gamemode` runs `gamemode <mode> <name>`. The Bot page toggles the bot's own mode.
+  - `PANEL_REPO_ROOT` / `PANEL_MC_PORT` are honored only in `--dev` (for tests against a fake tree).
   - The console runs `docker compose exec -T minecraft rcon-cli <cmd>` as a single argv. Commands are at most 256 chars, with no control chars and no leading `-`.
 - **Hardening:**
   - Strict CSP: `default-src 'self'`, no inline script or style, `frame-ancestors 'none'`.
@@ -499,3 +511,15 @@ A standalone, always-on host process for remote management. It runs separately f
   - Rate-limit, lockout and replay state is in memory, so it resets on restart.
   - It's a LaunchAgent, not a daemon, so it needs a logged-in user. Unattended reboot needs auto-login, which is incompatible with FileVault.
   - The itzg `WHITELIST` env may re-apply the whitelist when the container restarts.
+
+## Creative mode
+
+The bot plays creative as well as survival. Mode is read live from `bot.game.gameMode`, through `src/skills/game-mode.ts`, every time; it is never cached. The owner switches it from the panel (Bot or Players page → Survival/Creative). On a `game` event the bot stops flying and logs the mode change to the actions log.
+
+- **Context:** the first line of every task's context block is `game mode: survival`, or `game mode: CREATIVE — take materials with getItems (never gather, craft or smelt); mined blocks drop nothing; no hunger, can't be hurt`. The system prompt has a short static "# Creative mode" section, and the mode itself comes only from the context block.
+- **Skills:** the new `getItems` skill, plus creative branches in mining, placing, crafting, giving, `goTo` and `pillarUp`, with gated reflexes. See SKILLS.md under `getItems`.
+- **Decisions:**
+  - `craft` gives the item in creative instead of failing, which saves Haiku a round-trip.
+  - `smelt` refuses, because there's no input→output table to look up.
+  - Flight is used only where reliable (body-clear straight lines). Pathfinder walking stays the default.
+- **Unverified live:** whether Paper accepts the unacknowledged creative slot writes (phantom items if not), and how Paper's movement checks treat our flight.

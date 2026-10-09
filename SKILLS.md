@@ -31,6 +31,7 @@ For higher-level design (catalogue, principles, push-work-down-the-stack), see [
 | `useItem`, `eat`, `fish`, `sleepIn` | ✅ Implemented in v0.3+ survival slice |
 | `mineBlocks`, `giveItemsTo`, `equipLoadout`, `craftMany`, `depositManyToChest`, `withdrawManyFromChest` | ✅ Implemented in v0.4 batch-variant slice (see [Batch variants](#batch-variants)) |
 | `pillarUp` | ✅ Implemented in v0.5 player-likeness pass |
+| `getItems` | ✅ Implemented in creative-mode pass (creative only) |
 | `findBlock`, `findEntity`, `lookAt`, `wait` | ⏳ Pending |
 
 The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
@@ -495,6 +496,34 @@ pillarUp(bot, { height: number /* 1..32 */ }): Promise<SkillResult>
 ```
 
 For genuinely stuck situations (a hole, a ledge, a tree top) — never as travel. Filler priority: cobblestone, dirt, netherrack, stone (no sand/gravel). Pre-checks an empty feet cell, solid full block below, and headroom. Per level: look straight down, hold jump, poll each physics tick until feet ≥ cell + 1.1, release jump, place on the block below, verify it appeared and the bot landed on it; ≤3 attempts per level. (The old version placed on a fixed 120ms timer — before feet clear the cell on tick 3 — so the server rejected it as obstructed, and jump stayed held, causing repeat hopping.) Cancellable; returns `state.placed` and final position. Implementation in `src/skills/pillar.ts`.
+
+---
+
+### `getItems` — creative-only: give yourself items
+
+```ts
+getItems(bot, { items: Array<{ name: string; count?: number }> }): Promise<SkillResult>
+```
+
+Creative mode only. In survival it refuses with a clear message. Fills the inventory through mineflayer's creative API (`bot.creative.setInventorySlot`), in `src/skills/creative.ts`.
+- **`count`:** "hold at least this many", so repeated calls are idempotent. The default is one stack.
+- **Slot order:** grows existing plain stacks first, then empty hotbar slots (36–44), then main inventory (9–35). Respects stack size, and never overwrites an occupied slot.
+- **Server confirmation:** on 1.21.3+ the server never confirms creative slot writes, and mineflayer's own rejection check is broken there. So writes use `waitTimeout = 0`, go strictly one slot at a time, and are spaced 60 ms apart.
+- **Full inventory:** returns `ok:false` with `state.missing`.
+
+**Creative behavior of other skills** (every branch checks the live `bot.game.gameMode` via `src/skills/game-mode.ts`, never a cached value):
+- `mineBlock(s)`: instant, no tool check, pillar or pickup sweep. Reports "cleared … drop nothing". Switches off a held sword/trident/mace, because a creative player can't break blocks with one. The structure guard still applies.
+- `placeBlock(s)`: supplies a missing block type from the creative inventory. Flies to a hover spot for high or out-of-reach targets (`src/skills/flight.ts`).
+- `craft` / `craftMany`: give the requested items directly. `smelt` refuses and points to `getItems`.
+- `goTo`: flies to a landing spot beside the target when it is 4+ blocks up, or when walking fails.
+- `giveItemsTo` tops up from the creative inventory first. `pillarUp` supplies cobblestone if no filler is held.
+- Reflexes: auto-eat, armor and defend are off; idle look stays on. Pathfinder max drop is 8 in creative, 3 in survival.
+
+**Flight:** `flight.ts` is a custom loop, not `bot.creative.flyTo`, which has no collision check, timeout or cancel.
+- It flies only along body-clear straight paths, trying up / across / down if the direct line is blocked.
+- It honors stop and has a timeout.
+- It manages gravity and the `abilities` packet itself.
+- `runSkill` lands a hovering bot before any skill except place, chat, observe, meta, `getItems` and `stop`.
 
 ---
 
