@@ -3,7 +3,7 @@
  *
  * The skill definitions (name / description / zod shape / dispatch) now live in
  * the neutral registry (`src/skills/registry.ts`). This module is the thin
- * Claude adapter over that registry: it filters to the `claude` surface (all 35
+ * Claude adapter over that registry: it filters to the `claude` surface (all 36
  * today, preserving the current behavior), builds the per-bot MCP server via
  * `toClaudeMcpServer`, and exposes the fully-qualified allowed-tool names.
  *
@@ -181,7 +181,7 @@ export function buildSkillsServerFor(
   return toClaudeMcpServer(MCP_SERVER_NAME, bot, specs.map(wrapSpec));
 }
 
-// Defaults: the full Claude surface (all 35), preserving today's behavior.
+// Defaults: the full Claude surface (all 36), preserving today's behavior.
 export const ALLOWED_TOOL_NAMES: readonly string[] = allowedToolNamesFor(CLAUDE_SPECS);
 
 export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {

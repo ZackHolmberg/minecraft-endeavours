@@ -6,6 +6,7 @@ import {
 import { clip, recordEvent, summarizeArgs } from "../observability/telemetry.js";
 import { getBotState } from "../state/index.js";
 import { awaitReflexIdle } from "./auto-behaviors.js";
+import { isFlying, land } from "./flight.js";
 import type { SkillResult } from "./types.js";
 
 /**
@@ -36,6 +37,25 @@ const MAX_RESULT_LOG_CHARS = 220;
  * the agent's turn forever. `followPlayer` is indefinite by design.
  */
 const SKILL_WATCHDOG_MS = 10 * 60 * 1000;
+
+/**
+ * Skills that may run while hovering in creative flight (a build in progress
+ * stays airborne between placeBlocks calls, like a creative builder). Every
+ * other skill lands first — pathfinder, combat and the rest assume gravity.
+ */
+const AIRBORNE_OK = new Set([
+  "placeBlock",
+  "placeBlocks",
+  "getItems",
+  "say",
+  "whisper",
+  "observeSurroundings",
+  "checkInventory",
+  "remember",
+  "setTaskQueue",
+  "advanceTaskQueue",
+  "stop",
+]);
 const WATCHDOG_EXEMPT = new Set(["followPlayer"]);
 
 /**
@@ -63,6 +83,7 @@ export async function runSkill<P, R extends SkillResult>(
   // ended one skill (or a death) stays latched and the next skill's
   // `navigate` aborts instantly as "cancelled". `stop` itself is exempt.
   if (name !== "stop") state?.cancellation.begin();
+  if (isFlying(bot) && !AIRBORNE_OK.has(name)) await land(bot);
   // A side-channel `stop` (NpcAgent.maybeInterrupt) runs while another skill
   // is still in flight. It must not overwrite / clear that skill's entry:
   // the per-task backend's waitForToolIdle and the reflexes key off it.

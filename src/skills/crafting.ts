@@ -7,6 +7,8 @@ import type { Recipe } from "prismarine-recipe";
 import { Vec3 } from "vec3";
 import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
+import { creativeGive } from "./creative.js";
+import { isCreative } from "./game-mode.js";
 import { resolveItem } from "./item-naming.js";
 import { placeFromInventoryNearby } from "./place-helper.js";
 import { navigate } from "./navigation.js";
@@ -139,6 +141,8 @@ export async function craftMany(
     resolved.push({ name: r.normalized, itemId: r.data.id, count });
   }
 
+  if (isCreative(bot)) return craftCreative(bot, resolved);
+
   let table: Block | null = null;
   let tableSource: TableSource | null = null;
   const crafted: Array<{ item: string; count: number }> = [];
@@ -212,6 +216,44 @@ export async function craftMany(
       ? `crafted ${summary}${tableNote}${extra}`
       : `crafted ${crafted.length} item types (${summary})${tableNote}${extra}`,
     state: { crafted, usedTable: table !== null },
+  };
+}
+
+/**
+ * Creative: crafting is pointless — a creative player takes the finished item
+ * from the menu. Rather than fail and cost Haiku a round-trip to switch to
+ * getItems, deliver the end result the player asked for (each `count` is
+ * ADDED to what's held, matching what a craft would have produced). The
+ * message names getItems so the model learns the right tool.
+ */
+async function craftCreative(
+  bot: Bot,
+  resolved: Array<{ name: string; itemId: number; count: number }>,
+): Promise<SkillResult> {
+  const got: Array<{ item: string; count: number }> = [];
+  for (let i = 0; i < resolved.length; i++) {
+    const r = resolved[i]!;
+    const have = bot.inventory.count(r.itemId, null);
+    try {
+      const res = await creativeGive(bot, r.itemId, have + r.count);
+      got.push({ item: r.name, count: res.added });
+      if (res.full) {
+        return {
+          ok: false,
+          message: `creative mode: inventory full after taking ${res.added} ${r.name} — drop or deposit something`,
+          state: { crafted: got, failedIndex: i, failedItem: r.name },
+        };
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `creative mode: couldn't take ${r.name}: ${message}`, state: { crafted: got, failedIndex: i } };
+    }
+  }
+  const summary = got.map((g) => `${g.count} ${g.item}`).join(", ");
+  return {
+    ok: true,
+    message: `creative mode, no crafting needed: took ${summary} from the creative inventory (use getItems for this next time)`,
+    state: { crafted: got, usedTable: false, creative: true },
   };
 }
 
@@ -418,6 +460,15 @@ export async function smelt(
   }
   const r = resolveItem(bot, input);
   if (!r.ok) return { ok: false, message: `input ${r.message}` };
+  if (isCreative(bot)) {
+    // No smelting recipe table to map input → output, and a creative player
+    // wouldn't wait on a furnace anyway: point at getItems with the result.
+    return {
+      ok: false,
+      message: `creative mode: no need to smelt — use getItems for the smelted result directly (e.g. raw_iron → iron_ingot, sand → glass, beef → cooked_beef)`,
+      state: { creative: true },
+    };
+  }
   const inputData = r.data;
   const inputName = r.normalized;
   const haveInput = bot.inventory.count(inputData.id, null);

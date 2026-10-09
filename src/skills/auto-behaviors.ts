@@ -10,6 +10,12 @@
  *    within reach and we're idle. No pathing — never fights the agent for
  *    control of movement.
  *
+ * Creative mode (read live on every tick): auto-eat, armor and the defensive
+ * swing are off — there's no hunger, armor does nothing for an invulnerable
+ * player, and mobs neither target nor hurt creative players, so swinging at
+ * passers-by would just look odd (`attack` still works when asked). The
+ * idle look stays on in every mode.
+ *
  * Every reflex runs only while no skill is in flight (or, for eating, while
  * only a movement skill is), never while a window is open, and holds the
  * per-bot reflex lock while it touches the inventory. `runSkill` waits on
@@ -24,6 +30,7 @@ import { recordEvent } from "../observability/telemetry.js";
 import { getCurrentConversationPartner } from "../orchestrator/chat-router.js";
 import type { BotState } from "../state/index.js";
 import { pickBestWeapon, swingCooldownMs } from "./combat.js";
+import { isCreative } from "./game-mode.js";
 import { pickBestFood } from "./survival.js";
 
 const IDLE_LOOK_RANGE = 6;
@@ -112,7 +119,7 @@ function noteLookTarget(bot: Bot, target: Entity): void {
 const lastEatAttempt = new WeakMap<Bot, number>();
 
 export function maybeAutoEat(bot: Bot, state: BotState): void {
-  if (!bot.entity || bot.health <= 0) return;
+  if (!bot.entity || bot.health <= 0 || isCreative(bot)) return;
   const hungry = bot.food <= AUTO_EAT_FOOD_AT || (bot.health < 14 && bot.food < 18);
   if (!hungry) return;
   const tool = state.currentTool.current();
@@ -164,7 +171,7 @@ function armorRank(name: string): number {
 }
 
 export function maybeEquipArmor(bot: Bot, state: BotState): void {
-  if (!bot.entity || isBusy(bot, state)) return;
+  if (!bot.entity || isBusy(bot, state) || isCreative(bot)) return;
   const upgrades: Item[] = [];
   for (const { slot, suffix } of ARMOR_SLOTS) {
     const worn = bot.inventory.slots[slot];
@@ -205,7 +212,7 @@ export function noteHurt(bot: Bot, attacker: Entity | undefined): void {
 
 export function defendTick(bot: Bot, state: BotState): void {
   const hurt = lastHurtBy.get(bot);
-  if (!hurt || Date.now() - hurt.at > DEFEND_WINDOW_MS) return;
+  if (!hurt || Date.now() - hurt.at > DEFEND_WINDOW_MS || isCreative(bot)) return;
   if (!bot.entity || bot.health <= 0 || bot.isSleeping || isBusy(bot, state)) return;
 
   // Prefer whoever hit us (if it's a hostile mob); else the nearest hostile.

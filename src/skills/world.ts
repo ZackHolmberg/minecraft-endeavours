@@ -9,8 +9,11 @@ import { pickUpNearby } from "./inventory.js";
 import { resolveBlock, resolveItem } from "./item-naming.js";
 import { navigate } from "./navigation.js";
 import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
-import { PILLAR_MAX_HEIGHT, pillarUpBy, waitForGrounded } from "./pillar.js";
+import { PILLAR_MAX_HEIGHT, pickFiller, pillarUpBy, waitForGrounded } from "./pillar.js";
 import { builtStructureReason } from "./structure-guard.js";
+import { creativeGive } from "./creative.js";
+import { findPlaceHoverSpot, flyTo, isFlying } from "./flight.js";
+import { isCreative } from "./game-mode.js";
 import { recordEvent } from "../observability/telemetry.js";
 import { getBotState } from "../state/index.js";
 import type { Coords, SkillResult } from "./types.js";
@@ -105,7 +108,20 @@ export interface MineBlocksParams {
  * `state.byType` so the agent can re-plan. Running out of candidates is
  * ok:true if anything landed.
  */
-export async function mineBlocks(
+export async function mineBlocks(bot: Bot, params: MineBlocksParams): Promise<SkillResult> {
+  // Creative: blocks break instantly and drop nothing, so this is clearing,
+  // not gathering. Reword the result so the agent never reports "gathered".
+  const creative = isCreative(bot);
+  const r = await mineBlocksInner(bot, params, creative);
+  if (!creative) return r;
+  return {
+    ...r,
+    message: `${r.message.replace(/\bmined\b/g, "cleared")} (creative mode: broken blocks drop nothing)`,
+    state: { ...(r.state ?? {}), drops: false },
+  };
+}
+
+async function mineBlocksInner(
   bot: Bot,
   {
     types,
@@ -113,6 +129,7 @@ export async function mineBlocks(
     maxDistance = SEARCH_RADIUS,
     allowStructures = false,
   }: MineBlocksParams,
+  creative: boolean,
 ): Promise<SkillResult> {
   if (!Array.isArray(types) || types.length === 0) {
     return { ok: false, message: "types must be a non-empty array" };
@@ -144,7 +161,8 @@ export async function mineBlocks(
       matching: r.data.id,
       maxDistance,
     });
-    if (sample) {
+    // Creative breaks anything instantly with any (non-weapon) hand.
+    if (sample && !creative) {
       const toolCheck = checkHarvestability(bot, sample);
       if (!toolCheck.ok) {
         skipped.push({ name: r.normalized, reason: toolCheck.message });
@@ -346,6 +364,8 @@ async function mineOneBlock(
   const moveResult = await pathToBlock(pBot, block);
   if (!moveResult.ok) return moveResult;
 
+  if (isCreative(bot)) return digCreative(bot, block, blockNameForMsg);
+
   // Avoid the vanilla 5× mid-air dig penalty (prismarine-block applies
   // /5 when !bot.entity.onGround). First wait briefly in case pathfinder
   // just landed. If still not grounded it's almost always because the bot
@@ -394,6 +414,42 @@ async function mineOneBlock(
   // missed drops for blocks like sand in the slice-3 smoke test.
   await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
   return { ok: true, message: `mined ${blockNameForMsg}` };
+}
+
+/** Creative players can't break blocks while holding these. */
+const CREATIVE_NO_BREAK_RE = /_sword$|^trident$|^mace$|^debug_stick$/;
+
+/**
+ * Creative dig: instant break (digTime is 0), no tool choice, no mid-air
+ * penalty, and no pickup sweep — nothing drops. The one trap: the server
+ * refuses creative breaks with a sword/trident/mace in hand, which would
+ * surface as a 30s dig timeout, so switch to a harmless hotbar slot first.
+ */
+async function digCreative(bot: Bot, block: Block, blockNameForMsg: string): Promise<SkillResult> {
+  if (bot.heldItem && CREATIVE_NO_BREAK_RE.test(bot.heldItem.name)) {
+    const slots = bot.inventory.slots;
+    const free = Array.from({ length: 9 }, (_, i) => i).find((i) => {
+      const it = slots[bot.inventory.hotbarStart + i];
+      return !it || !CREATIVE_NO_BREAK_RE.test(it.name);
+    });
+    try {
+      if (free !== undefined) bot.setQuickBarSlot(free);
+      else await bot.unequip("hand");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `can't break blocks holding ${bot.heldItem?.name} in creative and couldn't switch: ${message}` };
+    }
+  }
+  try {
+    await digWithTimeout(bot, block);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      message: `dig failed at ${fmt(block.position.x, block.position.y, block.position.z)}: ${message}`,
+    };
+  }
+  return { ok: true, message: `cleared ${blockNameForMsg}` };
 }
 
 export interface PlaceBlockParams {
@@ -494,7 +550,24 @@ async function placeSingleBlock(
   const itemData = r.data;
   const name = r.normalized;
 
-  const stack = bot.inventory.items().find((i) => i.type === itemData.id);
+  let stack = bot.inventory.items().find((i) => i.type === itemData.id);
+  let supplied = false;
+  if (!stack && isCreative(bot)) {
+    // Creative: grab a stack from the creative inventory, like a builder
+    // picking the block from the menu mid-build. (Creative placement never
+    // consumes the stack, so this only fires when the type is missing.)
+    try {
+      await creativeGive(bot, itemData.id, bot.registry.items[itemData.id]?.stackSize ?? 64);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `couldn't get ${name} from the creative inventory: ${message}` };
+    }
+    stack = bot.inventory.items().find((i) => i.type === itemData.id);
+    supplied = stack !== undefined;
+    if (!stack) {
+      return { ok: false, message: `no free inventory slot to take ${name} from the creative inventory — drop or deposit something` };
+    }
+  }
   if (!stack) {
     return { ok: false, message: `no ${name} in inventory to place` };
   }
@@ -543,7 +616,34 @@ async function placeSingleBlock(
   // shuffle it causes) between every block of a placeBlocks batch.
   const refPos = reference.block.position;
   const eye = bot.entity.position.offset(0, bot.entity.height ?? 1.62, 0);
-  if (eye.distanceTo(refPos.offset(0.5, 0.5, 0.5)) > PLACE_REACH) {
+  const outOfReach = eye.distanceTo(refPos.offset(0.5, 0.5, 0.5)) > PLACE_REACH;
+  if (isCreative(bot) && (outOfReach || overlapsBot(bot, target))) {
+    // Creative: fly to a hover spot when already airborne, when the spot is
+    // well above our feet (walls/roofs out of reach from the ground), or when
+    // we're standing in the target cell. Otherwise walk like in survival,
+    // with flight as the fallback if walking fails.
+    const high = refPos.y > Math.floor(bot.entity.position.y) + 2;
+    const preferFlight = isFlying(bot) || high || !outOfReach;
+    let nav: SkillResult | null = null;
+    if (!preferFlight) {
+      nav = await navigate(bot, new goals.GoalNear(refPos.x, refPos.y, refPos.z, 3), {
+        label: `a spot to place ${name} at ${fmt(target.x, target.y, target.z)}`,
+        target: refPos,
+      });
+    }
+    if (nav && !nav.ok && (nav.state as { cancelled?: boolean } | undefined)?.cancelled) return nav;
+    if (!nav?.ok) {
+      const spot = findPlaceHoverSpot(bot, target, refPos);
+      if (!spot) {
+        return nav ?? {
+          ok: false,
+          message: `no clear spot to fly to for placing ${name} at ${fmt(target.x, target.y, target.z)}`,
+        };
+      }
+      const flight = await flyTo(bot, spot, `a spot to place ${name} at ${fmt(target.x, target.y, target.z)}`);
+      if (!flight.ok) return flight;
+    }
+  } else if (outOfReach) {
     const nav = await navigate(bot, new goals.GoalNear(refPos.x, refPos.y, refPos.z, 3), {
       label: `a spot to place ${name} at ${fmt(target.x, target.y, target.z)}`,
       target: refPos,
@@ -583,7 +683,7 @@ async function placeSingleBlock(
 
   return {
     ok: true,
-    message: `placed ${name} at ${fmt(target.x, target.y, target.z)}`,
+    message: `placed ${name} at ${fmt(target.x, target.y, target.z)}${supplied ? ` (took ${name} from the creative inventory)` : ""}`,
     state: { position: { x: target.x, y: target.y, z: target.z }, against: reference.block.name },
   };
 }
@@ -606,6 +706,13 @@ export async function pillarUp(bot: Bot, { height }: PillarUpParams): Promise<Sk
   const pBot = bot as BotWithPathfinder;
   pBot.pathfinder?.setGoal(null); // pathfinder would fight the jump controls
   getBotState(bot.username)?.cancellation.begin();
+  if (isCreative(bot) && !pickFiller(bot)) {
+    try {
+      await creativeGive(bot, bot.registry.itemsByName.cobblestone!.id, height);
+    } catch {
+      // pillarUpBy reports the missing filler itself
+    }
+  }
   return pillarUpBy(bot, height);
 }
 

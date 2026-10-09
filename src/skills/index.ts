@@ -24,3 +24,4 @@ export {
 } from "./storage.js";
 export { eat, fish, sleepIn } from "./survival.js";
 export { remember, setTaskQueue, advanceTaskQueue } from "./meta.js";
+export { getItems } from "./creative.js";

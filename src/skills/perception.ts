@@ -4,6 +4,7 @@ import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 import { isUtilityBlockType, readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
+import { currentGameMode, type GameMode } from "./game-mode.js";
 import type { SkillResult } from "./types.js";
 
 const DEFAULT_RADIUS = 16;
@@ -22,6 +23,8 @@ export interface ObserveSurroundings extends SkillResult {
 }
 
 export interface ObserveSurroundingsState {
+  /** Live game mode — creative changes the rules (getItems, no drops, flight). */
+  gameMode: GameMode;
   position: { x: number; y: number; z: number };
   dimension: string;
   facing: string;
@@ -180,6 +183,7 @@ export async function observeSurroundings(
     ok: true,
     message: `${nearbyBlocks.length} block group(s), ${nearbyEntities.length} entit(ies) within ${radius} blocks`,
     state: {
+      gameMode: currentGameMode(bot),
       position: { x: round2(me.x), y: round2(me.y), z: round2(me.z) },
       dimension: bot.game.dimension,
       facing: yawToCardinal(bot.entity.yaw),

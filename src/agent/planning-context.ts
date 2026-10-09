@@ -75,6 +75,8 @@ async function worldLines(bot: Bot, actionHistory = false): Promise<string[]> {
   const { state: s } = await observeSurroundings(bot);
   const L: string[] = [];
 
+  // First line on purpose: the mode changes what every other line means.
+  L.push(gameModeLine(s.gameMode));
   L.push(
     `position: ${s.position.x} ${s.position.y} ${s.position.z} (${s.dimension}), facing ${s.facing}`,
   );
@@ -190,6 +192,13 @@ export async function buildExecutorContext(bot: Bot): Promise<string> {
     );
   }
   return L.join("\n");
+}
+
+function gameModeLine(mode: ObserveSurroundingsState["gameMode"]): string {
+  if (mode === "creative") {
+    return "game mode: CREATIVE — take materials with getItems (never gather, craft or smelt); mined blocks drop nothing; no hunger, can't be hurt";
+  }
+  return `game mode: ${mode}`;
 }
 
 function inventorySummary(bot: Bot): string {

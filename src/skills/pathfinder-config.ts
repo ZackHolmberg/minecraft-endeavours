@@ -27,8 +27,13 @@
 import type { Bot } from "mineflayer";
 import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 import { installDoorAssist, patchMovementsForDoors } from "./doors.js";
+import { isCreative } from "./game-mode.js";
 
 const { Movements } = pathfinderPkg;
+
+const SURVIVAL_MAX_DROP = 3;
+/** No fall damage in creative; players hop off ledges freely. */
+const CREATIVE_MAX_DROP = 8;
 
 export interface BotWithPathfinder extends Bot {
   pathfinder: Pathfinder;
@@ -38,6 +43,9 @@ export function ensureMovements(bot: BotWithPathfinder): void {
   if (!bot.pathfinder.movements || bot.pathfinder.movements.bot !== bot) {
     bot.pathfinder.setMovements(buildMovements(bot));
   }
+  // The Movements object is cached for the bot's lifetime but the game mode
+  // can change at runtime, so the mode-dependent knob is re-read every call.
+  bot.pathfinder.movements.maxDropDown = isCreative(bot) ? CREATIVE_MAX_DROP : SURVIVAL_MAX_DROP;
   installDoorAssist(bot);
 }
 
@@ -62,7 +70,7 @@ function buildMovements(bot: BotWithPathfinder): InstanceType<typeof Movements> 
   // Default 4 costs half a heart per drop (fall damage starts past 3).
   // Players hop down 3 freely; 4+ they look for another way. Water landings
   // are unaffected (infiniteLiquidDropdownDistance stays on).
-  m.maxDropDown = 3;
+  m.maxDropDown = SURVIVAL_MAX_DROP;
   // Default 1 makes a swim as cheap as a walk, so the planner happily routes
   // across lakes and through flooded caves (slow, drowning risk, and the
   // bot bobs along looking lost). 3 still swims when it's the only way.

@@ -208,7 +208,7 @@ export interface ClaudeBackendOptions {
   botConfig: BotConfig;
   /**
    * Overrides for composed use (the hybrid planner). When omitted, the backend
-   * reproduces the standalone Claude bot exactly: full system prompt, all 35
+   * reproduces the standalone Claude bot exactly: full system prompt, all 36
    * tools, and the bot's configured model tier.
    */
   systemPrompt?: string;

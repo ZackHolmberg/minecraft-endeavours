@@ -4,12 +4,16 @@ import pathfinderPkg from "mineflayer-pathfinder";
 const { goals } = pathfinderPkg;
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
+import { findStandSpotNear, flyTo, land } from "./flight.js";
+import { isCreative } from "./game-mode.js";
 import { resolveBlock } from "./item-naming.js";
 import { navigate } from "./navigation.js";
 import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import type { GoToTarget, SkillResult } from "./types.js";
 
 const DEFAULT_REACH = 1;
+/** Creative: targets at least this far above the feet are flown to first. */
+const CREATIVE_FLY_FIRST_DY = 4;
 const SEARCH_RADIUS_FOR_BLOCK = 64;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
 // 3 reads like a person tagging along; 2 has the bot stepping on heels and
@@ -36,19 +40,58 @@ export async function goTo(bot: Bot, { target, reach = DEFAULT_REACH }: GoToPara
   const { destination, label } = resolved;
   const goal = new goals.GoalNear(destination.x, destination.y, destination.z, reach);
 
+  // Creative: walking stays the default, but a target well above us ("come
+  // up here" from a roof) is reached by flying, and flight is the fallback
+  // when walking can't get there. Only along a verified-clear line.
+  const creative = isCreative(bot);
+  if (creative && destination.y - bot.entity.position.y >= CREATIVE_FLY_FIRST_DY) {
+    const flown = await flyToStand(bot, destination, reach, label);
+    if (flown.ok) return flown;
+  }
+
   // Quick reachability probe. getPathTo's first compute slice is ~40ms, so
   // this only catches small enclosed search spaces (sealed room, island) —
   // long trips come back "partial" and are judged by navigate's watchdog.
   const path = pBot.pathfinder.getPathTo(pBot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS);
   if (path.status === "noPath") {
-    return { ok: false, message: `no path to ${label} at ${fmt(destination)}` };
+    const fail = { ok: false, message: `no path to ${label} at ${fmt(destination)}` };
+    return creative ? flightFallback(bot, destination, reach, label, fail) : fail;
   }
 
   // No cancellation.begin() here: runSkill already resets the flag for a
   // top-level goTo, and goTo is also called *inside* pickUpNearby (and so
   // inside mineBlock / mineBlocks) — resetting here would wipe a stop meant
   // for the enclosing batch skill.
-  return navigate(bot, goal, { label: `${label} at ${fmt(destination)}`, target: destination });
+  const walked = await navigate(bot, goal, { label: `${label} at ${fmt(destination)}`, target: destination });
+  if (walked.ok || !creative || (walked.state as { cancelled?: boolean } | undefined)?.cancelled) return walked;
+  return flightFallback(bot, destination, reach, label, walked);
+}
+
+async function flightFallback(
+  bot: Bot,
+  destination: Vec3,
+  reach: number,
+  label: string,
+  walkFailure: SkillResult,
+): Promise<SkillResult> {
+  const flown = await flyToStand(bot, destination, reach, label);
+  if (flown.ok) return flown;
+  return { ...walkFailure, message: `${walkFailure.message} (couldn't fly there either: ${flown.message})` };
+}
+
+/** Fly to a standing spot near `destination` and land on it. */
+async function flyToStand(bot: Bot, destination: Vec3, reach: number, label: string): Promise<SkillResult> {
+  const spot = findStandSpotNear(bot, destination, reach);
+  if (!spot) return { ok: false, message: `no clear landing spot near ${label}` };
+  const flight = await flyTo(bot, spot, `${label} at ${fmt(destination)}`);
+  if (!flight.ok) return flight;
+  await land(bot);
+  const p = bot.entity.position;
+  return {
+    ok: true,
+    message: `flew to ${label} at ${fmt(destination)}`,
+    state: { position: { x: Math.round(p.x * 100) / 100, y: Math.round(p.y * 100) / 100, z: Math.round(p.z * 100) / 100 }, flew: true },
+  };
 }
 
 /**

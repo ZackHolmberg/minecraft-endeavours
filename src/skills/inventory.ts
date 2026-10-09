@@ -5,6 +5,8 @@ const { goals } = pathfinderPkg;
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
+import { creativeGive } from "./creative.js";
+import { isCreative } from "./game-mode.js";
 import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
 import { navigate } from "./navigation.js";
@@ -240,6 +242,18 @@ export async function giveItemsTo(
     if (!r.ok) return { ok: false, message: `items[${i}] ${r.message}` };
     if (entry.count !== undefined && entry.count < 1) {
       return { ok: false, message: `items[${i}] count must be >= 1, got ${entry.count}` };
+    }
+    const have = bot.inventory.count(r.data.id, null);
+    if (isCreative(bot) && (have === 0 || (entry.count !== undefined && have < entry.count))) {
+      // Creative: hand over what was asked even if we don't hold it yet —
+      // take it from the creative inventory first (default one stack).
+      const want = entry.count ?? (bot.registry.items[r.data.id]?.stackSize ?? 64);
+      try {
+        await creativeGive(bot, r.data.id, want);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, message: `items[${i}] couldn't take ${r.normalized} from the creative inventory: ${message}` };
+      }
     }
     if (bot.inventory.count(r.data.id, null) === 0) {
       return { ok: false, message: `items[${i}] no ${r.normalized} in inventory to give to ${player}` };

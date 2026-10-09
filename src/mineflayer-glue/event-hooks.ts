@@ -23,6 +23,8 @@ import {
   maybeEquipArmor,
   noteHurt,
 } from "../skills/auto-behaviors.js";
+import { isFlying, stopFlyingNow } from "../skills/flight.js";
+import { currentGameMode, type GameMode } from "../skills/game-mode.js";
 import type { BotState } from "../state/index.js";
 
 /**
@@ -198,6 +200,22 @@ export function attachBotEventHooks(
     if (collector !== bot.entity) return;
     // Let the inventory slot update land before inspecting it.
     setTimeout(() => maybeEquipArmor(bot, state), 500);
+  });
+
+  // Game-mode changes (RCON `gamemode …` from the web panel) and respawns.
+  // Skills read the mode live; this only (a) drops out of creative flight —
+  // gravity must come back on a mode switch or respawn, or the bot floats —
+  // and (b) logs the switch to the actions log so the per-task context shows
+  // when it happened.
+  let lastMode: GameMode | null = null;
+  bot.on("game", () => {
+    if (isFlying(bot)) stopFlyingNow(bot);
+    const mode = currentGameMode(bot);
+    if (lastMode !== null && mode !== lastMode) {
+      console.log(`${tag} game mode changed: ${lastMode} → ${mode}`);
+      state.actions.record(`game mode changed from ${lastMode} to ${mode}`);
+    }
+    lastMode = mode;
   });
 
   bot.on("entityHurt", (entity, source) => {

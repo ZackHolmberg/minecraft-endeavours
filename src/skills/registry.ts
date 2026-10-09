@@ -16,7 +16,7 @@
  *    `z.toJSONSchema(z.object(spec.schema), ...)`.
  *
  * Surface tags:
- *  - `claude`   — exposed to ClaudeBackend (all 35; preserves today's surface).
+ *  - `claude`   — exposed to ClaudeBackend (all 36; preserves today's surface).
  *  - `executor` — curated local-executor subset validated in spikes/mlx-tools-spike.ts.
  *  - `planner`  — planner toolset (talk or plan only) for the hybrid coordinator.
  * Only `claude` is consumed in Phase A; `executor`/`planner` are forward-looking
@@ -43,6 +43,7 @@ import {
   fish,
   flee,
   followPlayer,
+  getItems,
   giveItemsTo,
   giveItemTo,
   goTo,
@@ -67,7 +68,7 @@ import {
 } from "./index.js";
 
 export interface SkillSurfaces {
-  /** Exposed to ClaudeBackend. All 35 today — preserves current behavior. */
+  /** Exposed to ClaudeBackend. All 36 today — preserves current behavior. */
   claude: boolean;
   /** Curated local-executor subset (spikes/mlx-tools-spike.ts). */
   executor: boolean;
@@ -142,6 +143,24 @@ export const SKILL_SPECS: SkillSpec[] = [
     surfaces: EXEC_AND_PLAN,
   },
   {
+    name: "getItems",
+    description:
+      "CREATIVE MODE ONLY: instantly take items from the creative inventory — how you get building materials, tools, food, anything, in creative. Tops up to at least `count` of each (default one full stack; 64 for most blocks), hotbar first. One call for a whole build's palette, e.g. [{ name: 'oak_planks', count: 192 }, { name: 'glass_pane' }, { name: 'oak_door', count: 1 }]. Fails in survival — gather or craft there instead. If the inventory fills up, returns ok:false with state.missing.",
+    schema: {
+      items: z
+        .array(
+          z.object({
+            name: z.string().min(1).describe("Item ID, e.g. 'stone_bricks', 'oak_door'"),
+            count: z.number().int().min(1).max(2304).optional().describe("Total you want to hold (default one stack)"),
+          }),
+        )
+        .min(1)
+        .max(36),
+    },
+    run: withParams("getItems", getItems),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
     name: "say",
     description:
       "Say something in public chat — the ONLY way players hear you (besides whisper). Use it to reply to public-chat messages. Write like a friendly player: one short casual line, plain text, no markdown. Don't narrate each step of a task; ack, then report the result. Max 256 chars.",
@@ -190,7 +209,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "mineBlock",
     description:
-      "Gather `count` blocks of ONE natural block type (nearest first), picking up the drops. For logs it reaches high logs itself — don't climb. For cobblestone, mine 'stone'. Blocks that look player-built are left alone (reported in the result) — don't retry with allowStructures unless a player asked you to demolish that thing. For several ore types in one trip use mineBlocks.",
+      "Gather `count` blocks of ONE natural block type (nearest first), picking up the drops. For logs it reaches high logs itself — don't climb. For cobblestone, mine 'stone'. Blocks that look player-built are left alone (reported in the result) — don't retry with allowStructures unless a player asked you to demolish that thing. For several ore types in one trip use mineBlocks. In creative it only clears blocks (instant, no drops) — use getItems for materials.",
     schema: {
       type: z.string().min(1).describe("Block ID, e.g. 'oak_log', 'stone', 'iron_ore'"),
       count: z.number().int().min(1).max(64).optional(),
@@ -251,7 +270,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "placeBlocks",
     description:
-      "Place up to 64 blocks in one call — use it for any structure (floor, wall course, roof, staircase, path). Make sure you have enough of each block first. Order matters: list blocks so each one has something solid next to it (ground up). On the first failure returns ok:false with state.placed (how many landed) and state.failedIndex — fix the problem and continue from there; don't re-place what landed.",
+      "Place up to 64 blocks in one call — use it for any structure (floor, wall course, roof, staircase, path). Make sure you have enough of each block first. Order matters: list blocks so each one has something solid next to it (ground up). On the first failure returns ok:false with state.placed (how many landed) and state.failedIndex — fix the problem and continue from there; don't re-place what landed. In creative it takes missing blocks from the creative inventory and flies to spots out of reach.",
     schema: {
       blocks: z
         .array(
@@ -418,7 +437,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "craft",
     description:
-      "Craft ONE recipe. Ingredients must be in your inventory; it finds and walks to a crafting table itself (nearby or remembered) when the recipe needs one. `count` is the number of items wanted; rounded up to the recipe's batch size (e.g. planks come in 4s). If no crafting_table is within 32 blocks, places one from inventory or crafts one from 4 planks automatically. On failure the message says what's missing — gather it, then retry. For several recipes use craftMany.",
+      "Craft ONE recipe. Ingredients must be in your inventory; it finds and walks to a crafting table itself (nearby or remembered) when the recipe needs one. `count` is the number of items wanted; rounded up to the recipe's batch size (e.g. planks come in 4s). If no crafting_table is within 32 blocks, places one from inventory or crafts one from 4 planks automatically. On failure the message says what's missing — gather it, then retry. For several recipes use craftMany. In creative, use getItems instead.",
     schema: {
       item: z.string().min(1).describe("Item ID, e.g. 'oak_planks', 'iron_pickaxe'"),
       count: z.number().int().min(1).max(64).optional(),
