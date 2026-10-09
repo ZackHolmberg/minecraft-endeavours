@@ -8,10 +8,11 @@
 ## Done
 - Step 0: tag `v1` (= `b184e5e`, local only, not pushed), worktree + branch `v2`, isolated test server (boots, RCON ok), `Steve_v2` config, port-aware bot scripts. Commit `c1587b0`.
 - Research: `v2/reports/research-sota.md`. Top ideas: recipe-graph `achieve(item,n)` planner in middleware; per-step postconditions + typed failures; one LLM call per goal, re-enter only on events; deterministic recovery ladder; plan cache on disk; blueprint builder; pathfinder master pin (VERIFIED: npm 2.4.5 = 2023; master has Sep–Oct 2026 fixes incl. A* heap bug, corner cuts, water, goto-rejects-unreachable (semantics change!), door nodes, `createHuman` controller); item-name validation; tech-tree ladder eval.
+- Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
 ## In flight (2026-10-09)
-- Harness subagent → `src/eval/**` (contract `src/eval/types.ts` by lead), `v2/EVAL.md`, `v2/reports/eval-harness.md`, 4 smoke scenarios vs frozen v1.
+- Harness subagent (continued): implement rest of SCENARIOS.md + `--dry`/`--suite`, then run v1 core baseline → `v2/reports/baseline-v1.md`, runs in `v2/runs/v1-baseline-*`.
 - Frozen v1 bot checkout for baselines: worktree `../minecraft-endeavours-v1base` (detached `c1587b0`, node_modules symlinked to v2's). Don't edit it.
 If a session died mid-flight: check those report files; whatever exists is the progress. Re-brief from the report's "next" notes.
 
