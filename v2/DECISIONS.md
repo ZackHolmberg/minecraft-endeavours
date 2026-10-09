@@ -22,3 +22,13 @@ Bot process restarted with wiped memory per scenario; world restored from `v2/wo
 
 ## D7 — Harness rewrites "steve" → bot username in `ctx.say()` (2026-10-09)
 v1's router only aliases `_ai/_bot/_npc` suffixes, so "steve" doesn't route to `Steve_v2`. Rewriting keeps scenario text natural and equivalent to how live players address `Steve_AI`. v2 should support configurable aliases.
+
+## D8 — Shared subscription: the bot and the dev team draw from one 5-hour window (2026-10-09)
+The first baseline stalled when the dev agents exhausted the window (the bot's Haiku calls got `rate_limit rejected`). **Consequence:** the runner tags rate-limited scenarios `harnessError` (not bot failures) and `--wait-limit` sleeps through resets; keep ≤2 heavy agents running during benchmark runs.
+
+## D9 — Slice order (2026-10-09, from baseline smoke + `reports/v1-internals.md` + `reports/research-sota.md`)
+1. **Honest primitives:** apply the Movements config v1 thought it had (canDig=false, door patch, no 1×1 towers, liquidCost); gather counts inventory deltas, not digs; configurable aliases. Small; fixes player-likeness at the root.
+2. **Goal planner:** deterministic `achieve(item, n)` over the minecraft-data recipe graph + hand tables (smelting, fuel, tool tiers, ore heights), with per-step postconditions, typed failures and a recovery ladder; Haiku only at decision points; system prompt + tool surface shrink.
+3. **Pathfinder master pin** (`d773d15`), separately so the two changes aren't confounded; `createHuman` for open-ground walking behind a flag.
+4. Breadth: blueprint builder, farming, night survival, combat; then spatial world model, plan cache, background goals.
+Each slice: benchmark before/after, keep only measurable wins, independent review, commit.
