@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import yaml from "js-yaml";
+import { registerBotAliases } from "./orchestrator/chat-router.js";
 import type {
   AppConfig,
   BackendKind,
@@ -14,6 +15,7 @@ import type {
 const VALID_MODEL_HINTS: readonly ModelHint[] = ["sonnet", "haiku", "opus"];
 const VALID_BACKENDS: readonly BackendKind[] = ["claude", "local", "hybrid"];
 const USERNAME_RE = /^[A-Za-z0-9_]{3,16}$/;
+const ALIAS_RE = /^[A-Za-z0-9_]{2,16}$/;
 
 const DEFAULT_MODEL_HINT: ModelHint = "haiku";
 const DEFAULT_BACKEND: BackendKind = "claude";
@@ -50,6 +52,21 @@ export function loadConfig(botsYmlPath = "config/bots.yml"): AppConfig {
     }
     usernames.add(bot.username);
   }
+
+  // Aliases must be unambiguous: no alias may equal another bot's username or alias.
+  const owner = new Map<string, string>();
+  for (const bot of bots) owner.set(bot.username.toLowerCase(), bot.username);
+  for (const bot of bots) {
+    for (const alias of bot.aliases ?? []) {
+      const prior = owner.get(alias.toLowerCase());
+      if (prior !== undefined && prior !== bot.username) {
+        throw new Error(`${botsYmlPath}: alias "${alias}" of ${bot.username} collides with ${prior}`);
+      }
+      owner.set(alias.toLowerCase(), bot.username);
+    }
+  }
+  // The chat router matches names against usernames + these aliases.
+  for (const bot of bots) registerBotAliases(bot.username, bot.aliases ?? []);
 
   return {
     bots,
@@ -122,7 +139,26 @@ function parseBot(entry: unknown, index: number, path: string): BotConfig {
     session_mode = sessionModeRaw as SessionMode;
   }
 
+  // aliases is optional: extra names players can use ("steve" for Steve_v2).
+  let aliases: string[] | undefined;
+  if (obj.aliases !== undefined) {
+    if (!Array.isArray(obj.aliases)) {
+      throw new Error(`${path}: bots[${index}].aliases must be a list of names`);
+    }
+    const seen = new Set<string>();
+    aliases = [];
+    for (const a of obj.aliases) {
+      if (typeof a !== "string" || !ALIAS_RE.test(a)) {
+        throw new Error(`${path}: bots[${index}].aliases entries must be 2-16 chars of [A-Za-z0-9_], got ${JSON.stringify(a)}`);
+      }
+      if (seen.has(a.toLowerCase())) continue;
+      seen.add(a.toLowerCase());
+      aliases.push(a);
+    }
+  }
+
   const bot: BotConfig = { username, model_hint, backend, session_mode };
+  if (aliases && aliases.length > 0) bot.aliases = aliases;
   if (backend === "local") {
     bot.local = parseLocal(obj.local, index, path);
   }

@@ -68,10 +68,10 @@ smelt finds (or places) a furnace and picks fuel itself. Fuel should be coal or 
 - To get cobblestone, mine stone (it drops cobblestone). Never mine cobblestone, planks, bricks, glass, wool, or other crafted blocks — out in the world those are someone's build (rule 3).
 - If mineBlock/mineBlocks says it left blocks alone because they look player-built, pick other blocks. Only use allowStructures when a player asked you to demolish or remove that thing.
 - To collect several ore types in one trip, use mineBlocks with all of them.
-- Don't climb trees; mineBlock reaches the high logs itself.
+- mineBlock/mineBlocks count what actually lands in your inventory ("collected 10 oak_log (mined 11)") and keep going until you have the amount or nothing reachable is left — trust that number. They take what's within arm's reach from the ground (about 4 logs up a trunk) and skip the rest, so don't climb trees; for more logs, go to another tree. If the result says drops couldn't be picked up or the inventory is full, fix that (free slots, pickUpNearby) instead of re-mining.
 
 # Moving around
-- goTo and followPlayer find a path for you. Wooden doors and fence gates open automatically as you walk (iron doors and trapdoors don't). The pathfinder never digs through blocks.
+- goTo and followPlayer find a path for you. Wooden doors and fence gates open automatically as you walk (iron doors and trapdoors don't). The pathfinder never digs through blocks and never places any, so it won't bridge gaps, build stairs or tower up; "no path" means no walkable route.
 - If goTo can't reach a spot inside a building, find the door (look for *_door in nearby blocks) and goTo it, or ask the player to let you in. Never mine or place blocks to get in.
 - Going underground: first remember({ type: "mine_entrance" }) at the surface. Go down by stair-mining (mine forward and one step down, repeat), never straight down. To come back, goTo the mine entrance from known waypoints — your staircase is the path.
 - pillarUp is only for when it's genuinely needed: stuck in a hole or pit, reaching a ledge, or getting to a tree top mineBlock couldn't reach. Try goTo first; climb only as high as needed. Never use it to travel.

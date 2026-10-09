@@ -5,10 +5,10 @@ const { goals } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
-import { pickUpNearby } from "./inventory.js";
+import { inventoryCounts, inventoryGain, pickUpNearby, waitForDropNear } from "./inventory.js";
 import { resolveBlock, resolveItem } from "./item-naming.js";
 import { navigate } from "./navigation.js";
-import { ensureMovements, type BotWithPathfinder } from "./pathfinder-config.js";
+import { ensureMovements, withDiggingMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import { PILLAR_MAX_HEIGHT, pickFiller, pillarUpBy, waitForGrounded } from "./pillar.js";
 import { builtStructureReason } from "./structure-guard.js";
 import { creativeGive } from "./creative.js";
@@ -24,6 +24,12 @@ const SEARCH_RADIUS = 64;
 const MINE_BLOCKS_DEFAULT_MAX_COUNT = 32;
 const MINE_BLOCKS_MAX_COUNT_CAP = 128;
 const POST_DIG_PICKUP_RADIUS = 4;
+// End-of-run sweep for drops that were dug but not yet collected.
+const FINAL_SWEEP_RADIUS = 8;
+// Give up the batch after this many candidates we could not get at.
+const MAX_UNREACHABLE_SKIPS = 6;
+// ...or after this many consecutive digs that put nothing in the inventory.
+const MAX_FRUITLESS_DIGS = 3;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
 // How many nearest matches to pull per scan so a protected (player-built)
 // nearest block doesn't hide an unprotected one just behind it.
@@ -191,18 +197,49 @@ async function mineBlocksInner(
   const minedByType: Record<string, number> = {};
   for (const m of mineable) minedByType[m.name] = 0;
 
+  // Progress is measured in what actually lands in the inventory: the expected
+  // drop item(s) of each requested block (minecraft-data `drops`), by delta.
+  // Blocks with no tracked drop (creative, leaves, ...) fall back to counting
+  // digs, since there is nothing to verify.
+  const dropNames = new Set<string>();
+  const dropsByBlock = new Map<number, string[]>();
+  for (const m of mineable) {
+    const names = creative ? [] : expectedDropNames(bot, m.id);
+    dropsByBlock.set(m.id, names);
+    for (const n of names) dropNames.add(n);
+  }
   const formatByType = (): string =>
     mineable
       .map((m) => `${minedByType[m.name] ?? 0} ${m.name}`)
       .filter((s) => !s.startsWith("0 ") || mineable.length === 1)
       .join(", ");
+  const baseline = inventoryCounts(bot);
+  let untrackedDug = 0;
+  const collectedNow = (): number => {
+    const gained = inventoryGain(baseline, inventoryCounts(bot));
+    let n = untrackedDug;
+    for (const name of dropNames) n += gained[name] ?? 0;
+    return n;
+  };
+  const gainedText = (): string => {
+    const gained = inventoryGain(baseline, inventoryCounts(bot));
+    const parts = [...dropNames].filter((n) => (gained[n] ?? 0) > 0).map((n) => `${gained[n]} ${n}`);
+    if (untrackedDug > 0) parts.push(`${untrackedDug} ${mineable.length === 1 ? mineable[0]!.name : "other"}`);
+    return parts.join(", ");
+  };
 
+  // NB: no cancellation.begin() here. runSkill already cleared the flag when
+  // the skill started; clearing it again would erase a stop that landed
+  // during the preflight above.
   const cancellation = getBotState(bot.username)?.cancellation;
-  cancellation?.begin();
 
   let mined = 0;
   let lastTargetKey: string | null = null;
   let sameBlockRetries = 0;
+  // Blocks we couldn't reach/dig: skipped so one bad candidate doesn't end the batch.
+  const unreachable = new Map<string, string>();
+  let lastFailure = "";
+  let fruitlessStreak = 0;
   // Positions refused by the structure guard, reported so the agent knows
   // why "there's planks right there" didn't get mined.
   const protectedSeen = new Map<string, { name: string; reason: string }>();
@@ -212,37 +249,80 @@ async function mineBlocksInner(
     return ` — left ${protectedSeen.size} block(s) alone because they look player-built (e.g. ${first.reason} at (${pos})); don't break into buildings, use the door. Pass allowStructures:true only if a player explicitly asked you to demolish them`;
   };
 
-  while (mined < maxCount) {
+  /** Final pass: pick up anything dug but not yet collected, then build the result. */
+  const finish = async (
+    ok: boolean | null,
+    headline: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<SkillResult> => {
+    if (mined > 0 && !creative && !cancellation?.isRequested() && collectedNow() < mined) {
+      await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS });
+    }
+    const collected = collectedNow();
+    const target = types.length === 1 ? mineable[0]!.name : "blocks";
+    let summary: string;
+    if (creative) {
+      summary = types.length === 1 ? `mined ${mined} ${mineable[0]!.name}` : `mined ${mined} blocks (${formatByType()})`;
+    } else if (mined === 0) {
+      summary = "";
+    } else {
+      const g = gainedText();
+      const left = mined - collected;
+      summary = `collected ${g || `0 ${target}`}${left > 0 || collected !== mined ? ` (mined ${mined})` : ""}`;
+      if (collected < mined && collected < maxCount) {
+        summary += bot.inventory.emptySlotCount() === 0 ? "; inventory is full" : "; some drops could not be picked up";
+      }
+    }
+    const message = headline.replace("{summary}", summary);
+    return {
+      ok: ok ?? collected > 0,
+      message,
+      state: {
+        mined,
+        collected,
+        byType: minedByType,
+        gained: inventoryGain(baseline, inventoryCounts(bot)),
+        unreachable: unreachable.size,
+        position: posOf(bot),
+        ...extra,
+      },
+    };
+  };
+
+  while (collectedNow() < maxCount) {
     if (cancellation?.isRequested()) {
-      return {
-        ok: mined > 0,
-        message: `mining cancelled after ${mined} block(s)${mined > 0 ? ` (${formatByType()})` : ""}`,
-        state: { mined, byType: minedByType, cancelled: true, position: posOf(bot) },
-      };
+      return finish(mined > 0, `mining cancelled${mined > 0 ? ": {summary}" : ""}`, { cancelled: true });
     }
 
-    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen);
+    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, unreachable);
     if (!block) {
-      const summary = formatByType();
       const skippedNote = skipped.length > 0
         ? ` (skipped: ${skipped.map((s) => s.name).join(", ")})`
         : "";
+      const unreachNote = unreachable.size > 0
+        ? ` — ${unreachable.size} more could not be reached without climbing or digging${lastFailure ? ` (${lastFailure})` : ""}`
+        : "";
+      if (mined === 0 && unreachable.size > 0) {
+        return {
+          ok: false,
+          message: `could not reach any ${types.length === 1 ? mineable[0]!.name : "of those blocks"} (${unreachable.size} tried; ${lastFailure}). Walk somewhere with open access to them or pick another spot.${protectedNote()}`,
+          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, position: posOf(bot) },
+        };
+      }
       if (mined === 0) {
         return {
           ok: false,
           message: (types.length === 1
             ? `no ${protectedSeen.size > 0 ? "minable " : ""}${mineable[0]!.name} within ${maxDistance} blocks`
-            : `no mineable blocks within ${maxDistance} blocks${skippedNote}`) + protectedNote(),
-          state: { mined, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, position: posOf(bot) },
+            : `no mineable blocks within ${maxDistance} blocks${skippedNote}`) + unreachNote + protectedNote(),
+          state: { mined, collected: 0, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, unreachable: unreachable.size, position: posOf(bot) },
         };
       }
-      return {
-        ok: true,
-        message: (types.length === 1
-          ? `mined ${mined} ${mineable[0]!.name}; no more within ${maxDistance} blocks`
-          : `mined ${mined} blocks (${summary}); no more within ${maxDistance} blocks${skippedNote}`) + protectedNote(),
-        state: { mined, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, position: posOf(bot) },
-      };
+      return finish(
+        null,
+        `{summary}; no more within ${maxDistance} blocks${types.length === 1 ? "" : skippedNote}${unreachNote}${protectedNote()}`,
+        { skipped, protectedSkipped: protectedSeen.size },
+      );
     }
 
     // Repro guard for the "starts mining, never finishes" bug — see DIG_TIMEOUT_MS.
@@ -250,18 +330,11 @@ async function mineBlocksInner(
     if (targetKey === lastTargetKey) {
       sameBlockRetries += 1;
       if (sameBlockRetries >= SAME_BLOCK_RETRY_LIMIT) {
-        const summary = formatByType();
-        return {
-          ok: false,
-          message: types.length === 1
-            ? `mined ${mined} of ${maxCount} ${mineable[0]!.name}; stuck retargeting same block at ${fmt(block.position.x, block.position.y, block.position.z)} (server likely rejecting dig — wrong face, out of reach, or wrong tool)`
-            : `mined ${mined} blocks (${summary}); stuck retargeting same block at ${fmt(block.position.x, block.position.y, block.position.z)} (server likely rejecting dig — wrong face, out of reach, or wrong tool)`,
-          state: {
-            mined,
-            byType: minedByType,
-            stuckAt: { x: block.position.x, y: block.position.y, z: block.position.z },
-          },
-        };
+        return finish(
+          false,
+          `{summary}; stuck retargeting same block at ${fmt(block.position.x, block.position.y, block.position.z)} (server likely rejecting dig — wrong face, out of reach, or wrong tool)`,
+          { stuckAt: { x: block.position.x, y: block.position.y, z: block.position.z } },
+        );
       }
     } else {
       sameBlockRetries = 0;
@@ -269,34 +342,53 @@ async function mineBlocksInner(
     }
 
     const thisName = nameById.get(block.type) ?? block.name;
-    const oneResult = await mineOneBlock(pBot, block, thisName);
+    const before = collectedNow();
+    const oneResult = await mineOneBlock(pBot, block, thisName, allowStructures);
     if (!oneResult.ok) {
       if (cancellation?.isRequested()) continue; // loop top reports the cancel
-      const summary = formatByType();
-      return {
-        ok: false,
-        message: types.length === 1
-          ? `${oneResult.message} (mined ${mined} of ${maxCount} so far)`
-          : `${oneResult.message} (after ${mined} mined: ${summary})`,
-        state: { mined, byType: minedByType, position: posOf(bot) },
-      };
+      if ((oneResult.state as { unreachable?: boolean } | undefined)?.unreachable === true) {
+        // Couldn't get at THIS block (e.g. a log above reach) — try the next one.
+        unreachable.set(targetKey, oneResult.message);
+        lastFailure = oneResult.message;
+        if (unreachable.size >= MAX_UNREACHABLE_SKIPS) {
+          return finish(mined > 0, `{summary}${mined > 0 ? "; " : ""}gave up after ${unreachable.size} unreachable ${thisName} blocks (${oneResult.message})`);
+        }
+        continue;
+      }
+      return finish(false, `${oneResult.message}${mined > 0 ? " — {summary}" : ""}`);
     }
 
     minedByType[thisName] = (minedByType[thisName] ?? 0) + 1;
     mined += 1;
+    if (!(dropsByBlock.get(block.type)?.length)) untrackedDug += 1;
+
+    // Nothing landed in the inventory for this block: a few of those in a row
+    // means full inventory / wrong tool / drops nobody can reach. Stop.
+    if (collectedNow() <= before && (dropsByBlock.get(block.type)?.length ?? 0) > 0) {
+      fruitlessStreak += 1;
+      if (fruitlessStreak >= MAX_FRUITLESS_DIGS) {
+        return finish(false, `stopped after ${fruitlessStreak} blocks dropped nothing I could pick up — {summary}`);
+      }
+    } else {
+      fruitlessStreak = 0;
+    }
   }
 
-  const summary = formatByType();
-  const skippedNote = skipped.length > 0
-    ? ` (skipped: ${skipped.map((s) => `${s.name} — ${s.reason}`).join("; ")})`
-    : "";
-  return {
-    ok: true,
-    message: types.length === 1
-      ? `mined ${mined} ${mineable[0]!.name}`
-      : `mined ${mined} blocks (${summary})${skippedNote}`,
-    state: { mined, byType: minedByType, skipped, position: posOf(bot) },
-  };
+  return finish(true, `{summary}${skipped.length > 0 ? ` (skipped: ${skipped.map((s) => `${s.name} — ${s.reason}`).join("; ")})` : ""}`, { skipped });
+}
+
+/** Item names a block drops with a bare/ordinary tool, per minecraft-data. */
+function expectedDropNames(bot: Bot, blockId: number): string[] {
+  type DropEntry = number | { drop: number | { id: number } };
+  const b = bot.registry.blocks[blockId] as { drops?: DropEntry[] } | undefined;
+  const names: string[] = [];
+  for (const d of b?.drops ?? []) {
+    const raw = typeof d === "number" ? d : d.drop;
+    const id = typeof raw === "number" ? raw : raw.id;
+    const n = bot.registry.items[id]?.name;
+    if (n) names.push(n);
+  }
+  return names;
 }
 
 /**
@@ -310,16 +402,18 @@ function findMineCandidate(
   maxDistance: number,
   allowStructures: boolean,
   protectedSeen: Map<string, { name: string; reason: string }>,
+  skip: ReadonlyMap<string, unknown> = new Map(),
 ): Block | null {
-  if (allowStructures) {
-    return bot.findBlock({ point: bot.entity.position, matching: ids, maxDistance });
-  }
   const positions = bot.findBlocks({
     point: bot.entity.position,
     matching: ids,
     maxDistance,
-    count: CANDIDATE_SCAN_COUNT,
-  });
+    count: CANDIDATE_SCAN_COUNT + skip.size,
+  }).filter((p) => !skip.has(`${p.x},${p.y},${p.z}`));
+  if (allowStructures) {
+    const first = positions[0];
+    return first ? bot.blockAt(first) : null;
+  }
   // Telemetry: count positions newly refused by this scan (repeat scans re-see them).
   const seenBefore = protectedSeen.size;
   let firstNew: string | null = null;
@@ -358,11 +452,16 @@ async function mineOneBlock(
   pBot: BotWithPathfinder,
   block: Block,
   blockNameForMsg: string,
+  allowStructures = false,
 ): Promise<SkillResult> {
   const bot = pBot as Bot;
 
-  const moveResult = await pathToBlock(pBot, block);
-  if (!moveResult.ok) return moveResult;
+  const moveResult = await pathToBlock(pBot, block, allowStructures);
+  if (!moveResult.ok) {
+    // Flag per-block reachability failures (not a stop) so the batch can skip this block.
+    const cancelled = (moveResult.state as { cancelled?: boolean } | undefined)?.cancelled === true;
+    return cancelled ? moveResult : { ...moveResult, state: { ...(moveResult.state ?? {}), unreachable: true } };
+  }
 
   if (isCreative(bot)) return digCreative(bot, block, blockNameForMsg);
 
@@ -410,8 +509,10 @@ async function mineOneBlock(
     `[${bot.username}] dig OK ${blockNameForMsg} at ${digDiag.targetPos} in ${elapsed}ms | ${digDiag.summary}`,
   );
 
-  // Explicit pickup sweep — replaces the unreliable post-dig wait that
-  // missed drops for blocks like sand in the slice-3 smoke test.
+  // The drop entity spawns a few ticks AFTER bot.dig resolves; scanning right
+  // away sees nothing. Wait for it to appear, then collect. The caller counts
+  // success by inventory delta, so this result is advisory.
+  await waitForDropNear(bot, block.position.offset(0.5, 0.5, 0.5));
   await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
   return { ok: true, message: `mined ${blockNameForMsg}` };
 }
@@ -753,18 +854,29 @@ function describeRequiredTool(block: Block): string {
 }
 
 /**
- * Walk to where `block` is visible and in reach. Never digs (canDig=false in
- * pathfinder-config), so an enclosed target reports no-path rather than the
- * bot tunnelling through whatever is in the way.
+ * Walk to where `block` is visible and in reach. The default Movements never
+ * digs or places, so an enclosed or too-high target reports no-path rather
+ * than the bot tunnelling/towering on its own. For a natural target that has
+ * no walkable approach (ore under dirt, a stone shelf) we retry ONCE with a
+ * scoped digging Movements: it will only break non-player-built blocks (the
+ * structure guard, unless allowStructures) and never places; the no-dig policy
+ * is restored in `finally`. A high log still fails here (digging can't lift
+ * the bot) and the caller skips to the next candidate.
  */
-async function pathToBlock(bot: BotWithPathfinder, block: Block): Promise<SkillResult> {
+async function pathToBlock(bot: BotWithPathfinder, block: Block, allowStructures = false): Promise<SkillResult> {
   const { x, y, z } = block.position;
   const goal = new goals.GoalLookAtBlock(block.position, bot.world);
+  const opts = { label: `${block.name} at ${fmt(x, y, z)}`, target: block.position.offset(0.5, 0.5, 0.5) };
   const path = bot.pathfinder.getPathTo(bot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS);
-  if (path.status === "noPath") {
-    return { ok: false, message: `no path to ${block.name} at ${fmt(x, y, z)}` };
+  if (path.status !== "noPath") return navigate(bot, goal, opts);
+
+  const digPath = await withDiggingMovements(bot, { allowStructures }, async () =>
+    bot.pathfinder.getPathTo(bot.pathfinder.movements, goal, PATH_CHECK_TIMEOUT_MS),
+  );
+  if (digPath.status === "noPath") {
+    return { ok: false, message: `no path to ${block.name} at ${fmt(x, y, z)} (out of reach without climbing or breaking player-built blocks)` };
   }
-  return navigate(bot, goal, { label: `${block.name} at ${fmt(x, y, z)}`, target: block.position.offset(0.5, 0.5, 0.5) });
+  return withDiggingMovements(bot, { allowStructures }, () => navigate(bot, goal, opts));
 }
 
 /**

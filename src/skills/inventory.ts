@@ -37,14 +37,75 @@ export interface PickUpNearbyParams {
   maxDist?: number;
 }
 
+/** Item name -> total count across all inventory stacks. */
+export function inventoryCounts(bot: Bot): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const it of bot.inventory.items()) m.set(it.name, (m.get(it.name) ?? 0) + it.count);
+  return m;
+}
+
+/** Per-item positive gain of `after` over `before`. */
+export function inventoryGain(before: Map<string, number>, after: Map<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [name, n] of after) {
+    const d = n - (before.get(name) ?? 0);
+    if (d > 0) out[name] = d;
+  }
+  return out;
+}
+
+const DROP_SPAWN_WAIT_MS = 600;
+const DROP_RESCAN_MS = 120;
+const DROP_NEAR_RADIUS = 2.5;
+
+function hasItemEntityNear(bot: Bot, pos: Vec3, radius: number): boolean {
+  for (const id of Object.keys(bot.entities)) {
+    const e = bot.entities[id];
+    if (e && e.name === "item" && e.position.distanceTo(pos) <= radius) return true;
+  }
+  return false;
+}
+
+/**
+ * After breaking a block, the item entity arrives a few ticks later (server
+ * packet), so a scan immediately after `bot.dig` sees nothing. Resolves true
+ * as soon as an item entity is within ~2.5 blocks of `pos` (entitySpawn event,
+ * with a short re-scan fallback in case the spawn raced the listener), false
+ * after `timeoutMs`. Never throws.
+ */
+export function waitForDropNear(bot: Bot, pos: Vec3, timeoutMs = DROP_SPAWN_WAIT_MS): Promise<boolean> {
+  if (hasItemEntityNear(bot, pos, DROP_NEAR_RADIUS)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      bot.removeListener("entitySpawn", onSpawn);
+      resolve(v);
+    };
+    const onSpawn = (e: { name?: string; position: Vec3 }): void => {
+      if (e.name === "item" && e.position.distanceTo(pos) <= DROP_NEAR_RADIUS) finish(true);
+    };
+    const timer = setTimeout(() => finish(hasItemEntityNear(bot, pos, DROP_NEAR_RADIUS)), timeoutMs);
+    const poll = setInterval(() => {
+      if (hasItemEntityNear(bot, pos, DROP_NEAR_RADIUS)) finish(true);
+    }, DROP_RESCAN_MS);
+    bot.on("entitySpawn", onSpawn);
+  });
+}
+
 /**
  * Walk to every dropped item within `maxDist` and let natural ~1.5-block
  * auto-collect fire. Used both as a standalone skill ("pick up what I just
- * dropped") and internally by `mineBlock` to backstop the unreliable
- * post-dig auto-collect that the slice-3 smoke test surfaced.
+ * dropped") and internally by `mineBlock(s)` to collect drops.
  *
- * Snapshots the item list at entry so newly-spawned drops mid-sweep don't
- * loop forever; the skill returns and Claude can call it again if needed.
+ * "Collected" is the INVENTORY delta across the call (state.gained, by item
+ * name), not "the entity vanished" (another player or despawn also makes it
+ * vanish). Snapshots the item list at entry, then makes one more pass for
+ * drops that spawned mid-sweep; the skill returns and Claude can call it
+ * again if needed.
  */
 export async function pickUpNearby(
   bot: Bot,
@@ -56,43 +117,53 @@ export async function pickUpNearby(
 
   const targets = collectDroppedItemPositions(bot, maxDist);
   if (targets.length === 0) {
-    return { ok: true, message: `no dropped items within ${maxDist} blocks` };
+    return { ok: true, message: `no dropped items within ${maxDist} blocks`, state: { walked: 0, collected: 0, gained: {} } };
   }
 
-  let collected = 0;
+  const before = inventoryCounts(bot);
   const cancellation = getBotState(bot.username)?.cancellation;
-  for (const target of targets) {
-    // Honour a stop between drops (also when called inside mineBlock(s)).
-    if (cancellation?.isRequested()) break;
-    // Re-check that the item still exists — natural pickup may have already
-    // claimed it while we were walking to a previous one.
-    const stillThere = bot.entities[target.entityId];
-    if (!stillThere || stillThere.name !== "item") continue;
+  const visited = new Set<number>();
+  let walked = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    const batch = pass === 0 ? targets : collectDroppedItemPositions(bot, maxDist).filter((t) => !visited.has(t.entityId));
+    for (const target of batch) {
+      visited.add(target.entityId);
+      // Honour a stop between drops (also when called inside mineBlock(s)).
+      if (cancellation?.isRequested()) break;
+      // Re-check that the item still exists — natural pickup may have already
+      // claimed it while we were walking to a previous one.
+      const stillThere = bot.entities[target.entityId];
+      if (!stillThere || stillThere.name !== "item") continue;
 
-    const result = await goTo(bot, {
-      target: { kind: "coords", coords: { x: target.pos.x, y: target.pos.y, z: target.pos.z } },
-      reach: 1,
-    });
-    if (!result.ok) {
-      // Path failures on individual drops are tolerable — keep sweeping.
-      continue;
+      const result = await goTo(bot, {
+        target: { kind: "coords", coords: { x: target.pos.x, y: target.pos.y, z: target.pos.z } },
+        reach: 1,
+      });
+      if (!result.ok) {
+        // Path failures on individual drops are tolerable — keep sweeping.
+        continue;
+      }
+      walked += 1;
+      await sleep(POST_GOTO_PICKUP_WAIT_MS);
+      await sleep(PICKUP_PER_ITEM_WAIT_MS);
     }
-    await sleep(POST_GOTO_PICKUP_WAIT_MS);
-    if (!bot.entities[target.entityId]) collected += 1;
-    await sleep(PICKUP_PER_ITEM_WAIT_MS);
+    if (cancellation?.isRequested()) break;
   }
 
+  const gained = inventoryGain(before, inventoryCounts(bot));
+  const collected = Object.values(gained).reduce((a, b) => a + b, 0);
   if (collected === 0) {
     return {
       ok: false,
-      message: `walked to ${targets.length} dropped item(s) within ${maxDist} blocks but collected none`,
-      state: { walked: targets.length, collected: 0 },
+      message: `walked to ${walked} of ${targets.length} dropped item(s) within ${maxDist} blocks but collected none${bot.inventory.emptySlotCount() === 0 ? " (inventory is full)" : ""}`,
+      state: { walked: targets.length, collected: 0, gained },
     };
   }
+  const gainedText = Object.entries(gained).map(([n, c]) => `${c} ${n}`).join(", ");
   return {
     ok: true,
-    message: `picked up ${collected} dropped item stack(s) within ${maxDist} blocks`,
-    state: { walked: targets.length, collected },
+    message: `picked up ${gainedText} from the ground within ${maxDist} blocks`,
+    state: { walked: targets.length, collected, gained },
   };
 }
 

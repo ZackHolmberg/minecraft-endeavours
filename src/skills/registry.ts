@@ -179,7 +179,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "goTo",
     description:
-      "Walk to a target. Target is one of: { kind: 'coords', coords: { x, y, z } } | { kind: 'entity', entity: '<player or mob name>' } | { kind: 'block', block: '<block id>' }. Optional `reach` (default 1) is the stop distance. Wooden doors, fence gates and the like open automatically on the way (iron doors and trapdoors don't); it never digs through blocks. Gives up within ~20s if stuck or there's no path, returning state.position. If you can't reach a spot inside a building, goTo its door or ask the player — never mine or place blocks to get in.",
+      "Walk to a target. Target is one of: { kind: 'coords', coords: { x, y, z } } | { kind: 'entity', entity: '<player or mob name>' } | { kind: 'block', block: '<block id>' }. Optional `reach` (default 1) is the stop distance. Wooden doors, fence gates and the like open automatically on the way (iron doors and trapdoors don't). It never digs through blocks and never places any (no bridging, no stairs, no towering up): if the only way is over a gap, up a cliff or through a wall, you get a no-path error, returning state.position. Gives up within ~20s if stuck. If you can't reach a spot inside a building, goTo its door or ask the player — never mine or place blocks to get in.",
     schema: {
       target: goToTargetSchema,
       reach: z.number().int().min(0).max(16).optional(),
@@ -209,7 +209,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "mineBlock",
     description:
-      "Gather `count` blocks of ONE natural block type (nearest first), picking up the drops. For logs it reaches high logs itself — don't climb. For cobblestone, mine 'stone'. Blocks that look player-built are left alone (reported in the result) — don't retry with allowStructures unless a player asked you to demolish that thing. For several ore types in one trip use mineBlocks. In creative it only clears blocks (instant, no drops) — use getItems for materials.",
+      "Gather `count` blocks of ONE natural block type (nearest first) and pick up the drops. Success is counted by what actually lands in your inventory: it keeps going until you have `count` of the drop (or nothing reachable is left) and reports e.g. 'collected 10 oak_log (mined 11)'; use that number. It stands on the ground and takes only blocks within arm's reach (about 4 high), skipping unreachable ones (e.g. the top of a tall tree) and moving to the next; it may tunnel a short way through natural blocks to a buried target, never through player-built ones. For cobblestone, mine 'stone'. Blocks that look player-built are left alone (reported in the result) — don't retry with allowStructures unless a player asked you to demolish that thing. For several ore types in one trip use mineBlocks. In creative it only clears blocks (instant, no drops) — use getItems for materials.",
     schema: {
       type: z.string().min(1).describe("Block ID, e.g. 'oak_log', 'stone', 'iron_ore'"),
       count: z.number().int().min(1).max(64).optional(),
@@ -226,7 +226,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "mineBlocks",
     description:
-      "Mine several natural block types in one sweep, nearest first, until `maxCount` total or nothing is left in range — e.g. ['iron_ore', 'coal_ore', 'diamond_ore'] for 'mine any ores you find'. Types your tools can't harvest are skipped and reported in state.skipped (not fatal). Returns state.mined and state.byType. Like mineBlock, it leaves player-built blocks alone unless allowStructures is set (demolition requests only).",
+      "Mine several natural block types in one sweep, nearest first, until `maxCount` total is collected or nothing reachable is left in range — e.g. ['iron_ore', 'coal_ore', 'diamond_ore'] for 'mine any ores you find'. Types your tools can't harvest are skipped and reported in state.skipped (not fatal). Like mineBlock it counts what actually lands in your inventory (the drop, e.g. iron_ore gives raw_iron) until `maxCount` total, and returns state.collected, state.gained (by item), state.mined (blocks dug) and state.byType. It leaves player-built blocks alone unless allowStructures is set (demolition requests only).",
     schema: {
       types: z
         .array(z.string().min(1))
@@ -298,7 +298,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "pickUpNearby",
     description:
-      "Walk over and pick up dropped items within `maxDist` blocks (e.g. after a fight). mineBlock / mineBlocks already collect their drops, so you rarely need this after mining.",
+      "Walk over and pick up dropped items within `maxDist` blocks (e.g. after a fight). mineBlock / mineBlocks already collect their drops (and report what they collected), so you rarely need this after mining; it reports the items actually picked up.",
     schema: {
       maxDist: z.number().int().min(1).max(32).optional().describe("Search radius in blocks (default 8)"),
     },

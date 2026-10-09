@@ -8,7 +8,8 @@
  *  - `/msg <bot>` (mineflayer's `whisper` event) → that bot wakes.
  *  - `@all` → every bot wakes.
  *  - Name matching also accepts the "base" name with a trailing AI/Bot/NPC
- *    suffix stripped (`Steve_AI` answers to "steve") — players address NPCs
+ *    suffix stripped (`Steve_AI` answers to "steve") plus any `aliases:` from
+ *    config/bots.yml (`Steve_v2` answers to "steve") — players address NPCs
  *    the way they'd address a friend, not by their full username.
  *  - Conversation continuity: if a bot recently asked a player a question
  *    (~45s window) and the same player chats again, route to that bot even
@@ -129,15 +130,28 @@ function computeMatch(
   return null;
 }
 
+/** Configured aliases (config/bots.yml `aliases:`), by bot username. */
+const configuredAliases = new Map<string, string[]>();
+
+/** Set a bot's configured aliases (called by loadConfig). Replaces any previous set. */
+export function registerBotAliases(botUsername: string, aliases: readonly string[]): void {
+  configuredAliases.set(botUsername, [...aliases]);
+}
+
 /**
- * Names a player might use for this bot: the full username plus, when it
- * ends in an AI/Bot/NPC suffix, the base name (`Steve_AI` → `Steve`). The
- * base must be ≥3 chars so `AI_Bot`-style names don't collapse to noise.
+ * Names a player might use for this bot: the full username, the base name
+ * when it ends in an AI/Bot/NPC suffix (`Steve_AI` → `Steve`; the base must be
+ * ≥3 chars so `AI_Bot`-style names don't collapse to noise), and any aliases
+ * configured in bots.yml (`Steve_v2` + `aliases: [steve]`). Also used for the
+ * "another bot is named → not for me" check, so aliases apply there too.
  */
-function nameAliases(botUsername: string): string[] {
+export function nameAliases(botUsername: string): string[] {
   const aliases = [botUsername];
   const base = botUsername.replace(/[_-]?(?:ai|bot|npc)$/i, "");
   if (base !== botUsername && base.length >= 3) aliases.push(base);
+  for (const extra of configuredAliases.get(botUsername) ?? []) {
+    if (!aliases.some((a) => a.toLowerCase() === extra.toLowerCase())) aliases.push(extra);
+  }
   return aliases;
 }
 
@@ -229,4 +243,5 @@ export function resetChatRouter(): void {
   lastAddressed.clear();
   recentQuestions.clear();
   recentReplies.clear();
+  configuredAliases.clear();
 }

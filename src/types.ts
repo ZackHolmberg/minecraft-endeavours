@@ -32,6 +32,8 @@ export interface HybridConfig {
 
 export interface BotConfig {
   username: string;
+  /** Extra names players can use to address this bot ("steve" for Steve_v2). Validated in config.ts. */
+  aliases?: string[];
   /** Claude model tier for the claude backend. */
   model_hint: ModelHint;
   /** Which backend drives this bot. Defaults to `"claude"` (unchanged behavior). */
