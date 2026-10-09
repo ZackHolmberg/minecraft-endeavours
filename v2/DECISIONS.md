@@ -32,3 +32,6 @@ The first baseline stalled when the dev agents exhausted the window (the bot's H
 3. **Pathfinder master pin** (`d773d15`), separately so the two changes aren't confounded; `createHuman` for open-ground walking behind a flag.
 4. Breadth: blueprint builder, farming, night survival, combat; then spatial world model, plan cache, background goals.
 Each slice: benchmark before/after, keep only measurable wins, independent review, commit.
+
+## D10 — Goals run as background jobs; Haiku re-enters only on job end (2026-10-09)
+`achieve({goals})` plans deterministically (pure planner over minecraft-data + hand tables), starts a persisted job, and returns at once; the job executes with per-step postconditions, typed failures and a recovery ladder; `job_end` queues a synthetic event for a fresh Haiku decision. **Why:** v1 spends one Haiku turn per step and a 20-min goal can't live inside one tool call (10-min watchdog, session cost). Mid-job chat gets the job status in the context block. Design: [PLANNER.md](PLANNER.md); contracts `src/planner/types.ts`, `src/jobs/types.ts`. Eval treats a running job as busy (new `job_*` telemetry).
