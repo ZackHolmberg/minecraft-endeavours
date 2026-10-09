@@ -14,3 +14,9 @@ dist/
 
 # Claude Code
 CLAUDE.md
+
+# Secrets — never commit (DUCKDNS_TOKEN etc.)
+.env
+
+# Local Python virtualenv (MLX spikes)
+.venv/

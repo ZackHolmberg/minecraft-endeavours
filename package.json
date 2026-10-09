@@ -8,26 +8,42 @@
     "start": "tsx src/index.ts",
     "dashboard": "tsx src/dashboard/index.ts",
     "llm:start": "tsx src/local-model/start.ts",
-    "typecheck": "tsc --noEmit",
-    "report": "tsx src/report/index.ts"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/web/ui",
+    "report": "tsx src/report/index.ts",
+    "panel": "tsx src/web/server/index.ts",
+    "panel:setup": "tsx src/web/server/setup.ts",
+    "ui:build": "vite build --config src/web/ui/vite.config.ts",
+    "ui:dev": "vite --config src/web/ui/vite.config.ts",
+    "ui:mock": "tsx src/web/ui/mock/server.ts"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.148",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.293",
+    "acme-client": "^5.4.0",
     "blessed": "^0.1.81",
     "blessed-contrib": "^4.11.0",
     "js-yaml": "^4.1.0",
     "mineflayer": "^4.32.0",
     "mineflayer-pathfinder": "^2.4.5",
+    "qrcode": "^1.5.4",
+    "ws": "^8.22.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
     "@types/blessed": "^0.1.27",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.2",
+    "preact": "^11.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vite": "^8.3.3"
+  },
+  "overrides": {
+    "lodash": "^4.18.1"
   }
 }

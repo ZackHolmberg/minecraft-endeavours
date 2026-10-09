@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd LaunchAgent for the web control panel. Rendered + installed by
+  `./scripts/panelSetup.sh --install-launchd` (placeholders __REPO__, __PATH__
+  are substituted). The program is `panelStart.sh --launchd`, which rebuilds the
+  gitignored web UI if it's missing/stale and then execs the panel in the
+  foreground (so launchd still supervises the panel process itself). Runs as the logged-in user so the panel can reach Docker
+  Desktop and the bot can use the user's Claude credentials.
+
+  RunAtLoad  → starts at login (enable macOS automatic login for unattended reboots)
+  KeepAlive  → restarted whenever it exits (crash, kill); ThrottleInterval spaces restarts
+  AbandonProcessGroup → panel restarts never kill a bot / job it launched
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.minecraft-endeavours.panel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/scripts/panelStart.sh</string>
+    <string>--launchd</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>__REPO__/data/panel/panel.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/data/panel/panel.log</string>
+</dict>
+</plist>
