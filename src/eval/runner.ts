@@ -3,7 +3,7 @@
  * See v2/EVAL.md. Runs scenarios sequentially against the isolated test server,
  * one fresh bot process per scenario, and writes results.jsonl + summary.md.
  */
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { BotProcess, inspectBotDir, wipeBotState, type BotDirInfo } from "./bot-process.js";
 import { EvalContext } from "./ctx.js";
@@ -320,8 +320,66 @@ async function runScenario(h: Harness, sc: Scenario, repeat: number): Promise<Sc
   return result;
 }
 
+/**
+ * One eval at a time on the shared test server. Atomic mkdir lock in
+ * v2/runs/.eval-lock (pid inside); later invocations wait instead of
+ * colliding. Stale locks (dead pid, or no pid after 60s) are cleared.
+ */
+const LOCK_DIR = join(REPO_ROOT, "v2/runs/.eval-lock");
+async function acquireEvalLock(): Promise<void> {
+  mkdirSync(join(REPO_ROOT, "v2/runs"), { recursive: true });
+  const pidFile = join(LOCK_DIR, "pid");
+  let warned = false;
+  for (;;) {
+    try {
+      mkdirSync(LOCK_DIR);
+      writeFileSync(pidFile, String(process.pid));
+      break;
+    } catch {
+      let holder = NaN;
+      try {
+        holder = Number(readFileSync(pidFile, "utf8"));
+      } catch {
+        // pid not written yet, or a stale lock without one
+      }
+      if (Number.isFinite(holder) && holder > 0) {
+        let alive = true;
+        try {
+          process.kill(holder, 0);
+        } catch {
+          alive = false;
+        }
+        if (!alive) {
+          rmSync(LOCK_DIR, { recursive: true, force: true });
+          continue;
+        }
+      } else {
+        try {
+          if (Date.now() - statSync(LOCK_DIR).mtimeMs > 60_000) {
+            rmSync(LOCK_DIR, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          continue; // lock vanished between calls
+        }
+      }
+      if (!warned) console.log(`[eval] waiting for the test-server lock (held by pid ${holder})...`);
+      warned = true;
+      await sleep(15_000);
+    }
+  }
+  process.on("exit", () => {
+    try {
+      if (readFileSync(pidFile, "utf8") === String(process.pid)) rmSync(LOCK_DIR, { recursive: true, force: true });
+    } catch {
+      // already gone
+    }
+  });
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  await acquireEvalLock();
   const info = inspectBotDir(args.botDir);
   const env = testServerEnv();
   const sites = loadSites().sites;
