@@ -14,7 +14,7 @@
 ## In flight (2026-10-10 ~00:30)
 - Merged into `v2` @ `110e060`: R5/R6 (`c80abf4`: tree felling, drowning reflex; chop_logs 10/10) + slice 3 (`1d12eba`: blueprint builder + deliverTo; 5/5 build/farm/portal/give live). 193 tests.
 - **Milestone run** `v2/runs/v2-s3` (core, `--repeat 2`, bench `../mcv2-bench` @ `110e060`), log `v2/runs/v2-s3.out` ends CHAIN_DONE. ~2–3 h.
-- Review done (`3eb7727`: H1 leaf/log breaking under drops, H2 scaffolds left behind, M1–M8). Fix agent offline in `../mcv2-dev` (branch `v2-fixes` = v2 @ `3eb7727`) → "## Fixes" in `v2/reports/slice3-review.md`. These fixes are NOT in the milestone run; ship them before any live use.
+- Slice 3 review fixes merged (`c490b54` + `1b5e6b1`, 248 tests). NOT in the milestone run (bench @ `110e060`); re-verify live in the next run.
 - Queued after v2-s3: second v1 pass → `v2/runs/v1-baseline-r2`.
 - Eval busy check: `pgrep -f "[b]in/tsx src/eval/runner.ts"` (plain pattern matches waiting shells).
 If a session died mid-flight: check the run dir + reports; whatever exists is the progress.
