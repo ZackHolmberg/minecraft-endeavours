@@ -1,15 +1,15 @@
 # Milestone 1 — v2 vs v1 (2026-10-10)
 
-**v2 @ `110e060`** (frozen bench), core suite (30 scenarios) × 2 repeats → `v2/runs/v2-s3`. **v1** frozen (`c1587b0`) × 1 repeat → `v2/runs/v1-baseline` (2nd v1 repeat queued → `v2/runs/v1-baseline-r2`). Same harness, seed, pristine world, Haiku 5.5.
+**v2 @ `110e060`** (frozen bench), core suite (30 scenarios) × 2 repeats → `v2/runs/v2-s3`. **v1** frozen (`c1587b0`) × 2 repeats → `v2/runs/v1-baseline` + `v2/runs/v1-baseline-r2`. Same harness, seed, pristine world, Haiku 5.5.
 
-| | v1 | v2 | target |
+| | v1 (×2) | v2 (×2) | target |
 |---|---|---|---|
-| **Core success** | 12/30 (40%) | **48/60 (80%)** | ≥ 80% ✅ |
-| Tier 1 / 2 / 3 | 88% / 50% / 0% | **100% / 81% / 70%** | ≥95 ✅ / ≥85 ❌ / ≥60 ✅ |
-| conv / int / pl / cr | 0/3 · 0/2 · 1/2 · 0/2 | 1/6 · 3/4 · 4/4 · 4/4 | |
-| Player-build blocks broken | 4 | **0** | 0 ✅ |
+| **Core success** | 27/60 (45%) | **48/60 (80%)** | ≥ 80% ✅ |
+| Tier 1 / 2 / 3 | 88% / 44% / 10% | **100% / 81% / 70%** | ≥95 ✅ / ≥85 ❌ / ≥60 ✅ |
+| conv / int / pl / cr | 0/6 · 1/4 · 2/4 · 2/4 | 1/6 · 3/4 · 4/4 · 4/4 | |
+| Player-build blocks broken | 8 | **0** | 0 ✅ |
 | Pillar-to-travel | 0 | 0 | 0 ✅ |
-| Deaths | 1 | 5 (survive_night 3, coal 2) | 0 outside combat ❌ |
+| Deaths | 2 | 5 (survive_night 3, coal 2) | 0 outside combat ❌ |
 | Haiku turns per full pass | ~200 | **136** (−32%) | |
 | Iron pickaxe from empty | fail (21 turns) | **2/2, 5 turns, 130 s** | < 5 min, ≤ 6 turns ✅ |
 | Stone pickaxe | fail (20 turns) | 1/2, 5 turns | |
@@ -29,4 +29,4 @@
 - `t2.stone_pickaxe`, `t3.build_house` rep 2: "Digging aborted" mid-dig (reflex interference?); build site wandered outside the checked area.
 - `int.stop` rep 2 (.9).
 
-Caveats: v1 has one repeat (a second is running); single runs are noisy (v1 `cr.build_house` flipped PASS→FAIL between identical runs). Slice-3 review fixes (`c490b54`) landed after this run.
+Caveats: single runs are noisy (v1 `cr.build_house` flipped PASS→FAIL between identical runs). Slice-3 review fixes (`c490b54`) landed after this run.
