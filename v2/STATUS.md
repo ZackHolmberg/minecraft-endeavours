@@ -11,13 +11,15 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## In flight (2026-10-09 ~21:30)
-- R1–R4 committed `7125375` on `v2-fixes`, merged into `v2` (`3480223`). Frozen bench checkout `../mcv2-bench` @ `3480223` (docker disabled there).
-- Background: v1 re-run of the 4 confirm-policy scenarios → `v2/runs/v1-baseline` (appends); then targeted v2 re-test → `v2/runs/v2-r1` (8 scenarios).
-- Dev worktree `../mcv2-dev` (branch `v2-fixes`) idle; frozen v1 bot `../minecraft-endeavours-v1base`.
+## In flight (2026-10-09 ~22:30)
+- **R5/R6 agent** in `../mcv2-dev` (branch `v2-fixes`): bottom-up tree felling + short-tree preference (jungle drops), drowning/suffocation reflex + no digging under falling blocks → `v2/reports/regressions-2.md`. May run evals (from the v2 worktree, `--bot-dir ../mcv2-dev`, out `v2/runs/dev-r5`).
+- **Slice 3 builder agent** in `../mcv2-build` (branch `v2-build`, D14): blueprints (house/portal/farm) as jobs + `achieve` `deliverTo` → `v2/reports/slice3-build.md`. Live tests only when no eval is running.
+- Only one eval at a time on the test server (agents check `pgrep -f src/eval/runner.ts`).
+- Worktrees: `../mcv2-bench` frozen @ `3480223`; `../minecraft-endeavours-v1base` frozen v1.
+If a session died mid-flight: `git -C ../mcv2-dev status`, `git -C ../mcv2-build status`, typecheck there, read the reports; whatever exists is the progress.
 
 ## Next steps
-1. Read `v2/runs/v2-r1` results (targeted re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
+1. When R5/R6 + slice 3 land: commit on their branches, merge both into `v2`, new frozen bench, full core run with `--repeat 2` (noise, see v1 cr.build_house flip) → `v2-s3`. (Done: targeted re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
 2. Re-run v1 on `t3.build_house,cr.build_house,t3.wheat_farm,t3.portal` with the D13 confirm policy (fair baseline).
 3. Milestone check-in with the owner once v2 clearly beats v1.
 4. Next slices: builder (blueprints + scaffolding: houses, portal), farming, night survival/combat, creative give/deliver (`cr.give_torches`: fetched but never handed over), pathfinder master pin, prompt/tool-surface trim.
@@ -39,6 +41,7 @@
 | run | core | t1 | t2 | t3 | conv | int | pl | cr | turns | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
 | v1-baseline | 12/30 | 7/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 0/2 | ~230 | [report](reports/baseline-v1.md); t1.eat + 4 confirm-policy scenarios re-run (D13); cr.build_house flipped PASS→FAIL on re-run (plan only in thinking, never said) — single-repeat noise is real, use repeats for milestone numbers |
+| v2-r1 targeted (`3480223`, 8 regressed scenarios) | 6/8 | | | | | | | | | doors ✓ (0 broken), no_grief ✓, wooden/stone pickaxe ✓, not_stop ✓; chop_logs ✗ (jungle drops), coal ✗ (drowned/suffocated) |
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
