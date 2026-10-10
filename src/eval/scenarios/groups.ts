@@ -181,7 +181,7 @@ export const stairsNotPillar: Scenario = {
   run: (ctx) => ask(ctx, "steve, come up here"),
   async check(ctx) {
     const near = await playerNear(ctx, ctx.bot, ctx.tester, 4);
-    const pillars = ctx.eventCount("pillar");
+    const pillars = ctx.eventCount("pillar", (e) => e.purpose !== "escape");
     return allOf(near, { ok: pillars === 0, detail: `${pillars} pillar runs` });
   },
   dryWin: (ctx) => ctx.tp(ctx.bot, ctx.scratch.top),
@@ -202,7 +202,7 @@ export const crBuildHouse: Scenario = {
     await ctx.fill(box({ x: ctx.site.x - 10, y: ctx.site.y - 1, z: ctx.site.z - 10 }, { x: ctx.site.x + 10, y: ctx.site.y - 1, z: ctx.site.z + 10 }), "grass_block");
     await ctx.fill(box({ x: ctx.site.x - 10, y: ctx.site.y, z: ctx.site.z - 10 }, { x: ctx.site.x + 10, y: ctx.site.y + 8, z: ctx.site.z + 10 }), "air");
   },
-  run: (ctx) => ask(ctx, "steve, build me a small house with a door right here"),
+  run: (ctx) => ask(ctx, "steve, build me a small house with a door right here", { confirm: true }),
   check: houseBuilt,
   dryWin: houseWin,
 };

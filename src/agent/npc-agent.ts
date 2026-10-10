@@ -19,6 +19,7 @@
  */
 
 import type { Bot } from "mineflayer";
+import { eventLimiterFor, noteExternalChat } from "../jobs/ledger.js";
 import { getJobRunner } from "../jobs/registry.js";
 import { recordConversation } from "../memory/conversation-log.js";
 import {
@@ -74,6 +75,8 @@ export class NpcAgent {
   }
 
   pushChat(event: ChatEvent, decision: RouteMatch): void {
+    // A real player message resets the job-loop guards (failure ledger, synthetic-event cap).
+    noteExternalChat(this.opts.bot.username);
     if (this.backend.isRateLimited()) {
       console.log(
         `[${this.opts.bot.username}] cooldown active (~${this.backend.getCooldownRemainingMinutes()} min); dropping chat from ${event.sender}`,
@@ -118,11 +121,15 @@ export class NpcAgent {
   /**
    * Queue a synthetic orchestrator event (a `[job finished]` / `[job failed]`
    * line from the job runner) as a normal task, so the model decides what to
-   * tell the player. Dropped while rate-limited.
+   * tell the player. Dropped while rate-limited, or beyond 3 per 10 minutes (loop guard).
    */
   pushJobEvent(text: string): void {
     if (this.backend.isRateLimited()) {
       console.log(`[${this.opts.bot.username}] cooldown active; dropping job event`);
+      return;
+    }
+    if (!eventLimiterFor(this.opts.bot.username).allow()) {
+      console.warn(`[${this.opts.bot.username}] job event cap reached (3 per 10 min); dropping: ${text.slice(0, 120)}`);
       return;
     }
     this.backend.pushUserMessage(text);

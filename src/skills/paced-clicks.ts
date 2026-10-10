@@ -15,17 +15,35 @@ import type { Bot } from "mineflayer";
  */
 export const CLICK_PACE_MS = 120;
 
+type ClickFn = (...args: unknown[]) => Promise<unknown>;
+/** Per-bot patch state: overlapping calls share ONE wrapper (a naive save/restore leaks it when calls finish out of order). */
+const active = new WeakMap<Bot, { original: ClickFn; depth: number; paceMs: number }>();
+
 export async function withPacedClicks<T>(bot: Bot, fn: () => Promise<T>, paceMs: number = CLICK_PACE_MS): Promise<T> {
-  const holder = bot as unknown as { clickWindow: (...args: unknown[]) => Promise<unknown> };
-  const original = holder.clickWindow;
-  holder.clickWindow = async (...args: unknown[]) => {
-    const r = await original.apply(bot, args);
-    await new Promise((resolve) => setTimeout(resolve, paceMs));
-    return r;
-  };
+  const holder = bot as unknown as { clickWindow: ClickFn };
+  let st = active.get(bot);
+  if (st) {
+    st.depth += 1;
+    st.paceMs = Math.max(st.paceMs, paceMs);
+  } else {
+    const original = holder.clickWindow;
+    const fresh = { original, depth: 1, paceMs };
+    st = fresh;
+    active.set(bot, fresh);
+    holder.clickWindow = async (...args: unknown[]) => {
+      const r = await original.apply(bot, args);
+      await new Promise((resolve) => setTimeout(resolve, fresh.paceMs));
+      return r;
+    };
+  }
+  const state = st;
   try {
     return await fn();
   } finally {
-    holder.clickWindow = original;
+    state.depth -= 1;
+    if (state.depth === 0) {
+      holder.clickWindow = state.original;
+      active.delete(bot);
+    }
   }
 }

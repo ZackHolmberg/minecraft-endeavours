@@ -48,7 +48,7 @@ export const giveBread: Scenario = {
 - `ok`/`score`/`detail`: success latched if **any** poll or the final check passed; score = best seen. `timedOut`: timeout hit without success. `harnessError`: infra failure, not the bot's fault (check `logs/`).
 - `wallMs`: first `say()` → success detected (≤5s granularity) else end of run. `firstReplyMs`: first `say()` → first bot chat/whisper the Tester saw.
 - `tasks, turns, toolCalls, toolFailures, *Tokens, costUsd, outcomes`: sums over `task_end` events in that scenario's telemetry file. `cacheHitRate = cacheRead / (input + cacheRead + cacheCreate)`. summary's "tok in" = input + cacheRead + cacheCreate.
-- `violations`: `brokenProtected` (distinct protected positions changed), `pillarRuns` (`pillar` events, only if `!pillarAllowed`), `chatSpam` (bot chat lines beyond `maxBotChats`), `deaths` (`death` events).
+- `violations`: `brokenProtected` (distinct protected positions changed), `pillarRuns` (`pillar` events whose `purpose !== "escape"` (missing counts), only if `!pillarAllowed`; D12), `chatSpam` (bot chat lines beyond `maxBotChats`), `deaths` (`death` events).
 - Summary: per-scenario table + per-tier (success rate, mean score, median wall, total turns/tokens/cost) + overall. `compare` groups by id across repeats.
 
 ## Caveats

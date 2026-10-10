@@ -145,7 +145,7 @@ export interface ScenarioCtx {
   /** (eval-harness addition) `time query gametime` (monotonic ticks; use for elapsed-time checks). */
   gameTime(): Promise<number>;
   /** (eval-harness addition) Count of the bot's telemetry events of this kind so far, e.g. "death", "pillar". */
-  eventCount(kind: string): number;
+  eventCount(kind: string, where?: (e: Record<string, unknown>) => boolean): number;
   /** (eval-harness addition) Per-scenario-run scratch space shared by setup/run/check (module-level state is NOT per run). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   scratch: Record<string, any>;

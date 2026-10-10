@@ -259,7 +259,7 @@ export function attachBotEventHooks(
     console.warn(`${tag} died at (${position.x}, ${position.y}, ${position.z})`);
     // Abort whatever was running — a mid-path goal or attack loop after
     // respawn would walk the bot somewhere nonsensical.
-    state.cancellation.request();
+    state.cancellation.request("death");
     (bot as Bot & { pathfinder?: { stop(): void } }).pathfinder?.stop();
     deathFlush = setTimeout(flushDeath, DEATH_MESSAGE_WINDOW_MS);
   });

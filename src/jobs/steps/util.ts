@@ -28,9 +28,13 @@ export function cancelled(step: Step): StepResult {
   return fail(step, "cancelled", "job cancelled");
 }
 
-/** Run a skill function through `runSkill` (telemetry, cancellation reset, current-tool, action log). */
+/**
+ * Run a skill function through `runSkill` (telemetry, cancellation reset, current-tool, action log).
+ * No skill watchdog: the job runner owns step timeouts (and reports them), so a
+ * long gather/smelt step is never silently stopped by the 10-min watchdog.
+ */
 export function tracked<P>(bot: Bot, name: string, params: P, fn: (p: P) => Promise<SkillResult>): Promise<SkillResult> {
-  return runSkill(bot, name, params, fn);
+  return runSkill(bot, name, params, fn, { watchdogMs: null });
 }
 
 /**

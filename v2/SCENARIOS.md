@@ -61,3 +61,5 @@ Spec for `src/eval/scenarios/*`. Contract: `src/eval/types.ts`; harness: [EVAL.m
 - `placedBlocks(box)`: count of positions in box that changed air/replaceable → solid since setup ended (Tester `blockUpdate` tracking, like `protect`).
 - `foodLevel(player)`, `timeOfDay()` via RCON (`data get entity … foodLevel`, `time query daytime`).
 - Suite tags: `Scenario.suite?: "core" | "stretch"` (default core) and runner `--suite`.
+
+**Confirm policy:** `t3.build_house`, `cr.build_house`, `t3.wheat_farm`, `t3.portal` use `ask(…, { confirm: true })`: if the bot proposes a plan and waits (v1's owner-approved propose-and-confirm rule for big/permanent requests), the Tester answers "yes go ahead" (≤2×). Other scenarios never auto-confirm: a trailing question there means the bot gave up.

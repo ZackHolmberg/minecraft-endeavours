@@ -264,7 +264,8 @@ async function runScenario(h: Harness, sc: Scenario, repeat: number): Promise<Sc
 
   // Collect.
   const events = readEvents(bp.eventsPath);
-  const m = collectMetrics(events);
+  // Deaths/pillaring before the first say() happened during setup (harness), not the bot's doing.
+  const m = collectMetrics(events, ctx?.firstSayAt ?? undefined);
   const limited = events.find((e) => e.kind === "rate_limit" && e.status === "rejected");
   if (limited && limited.kind === "rate_limit")
     harnessError = `RATE_LIMITED resetsAt=${limited.resetsAt ?? 0} (Claude usage limit hit during this scenario)`;
@@ -331,9 +332,9 @@ async function main(): Promise<void> {
   if (!args.dry) {
     mkdirSync(join(out, "logs"), { recursive: true });
     mkdirSync(join(out, "telemetry"), { recursive: true });
-    writeFileSync(resultsPath, "");
+    // Never truncate: re-running scenarios into an existing run dir appends (loadResults: last line wins).
   }
-  if (!args.dry) writeFileSync(join(out, "meta.json"), JSON.stringify({ args, botDir: info.dir, botUsername: info.username, scenarios: selected.map((s) => s.id), startedAt: new Date().toISOString() }, null, 2));
+  if (!args.dry) writeFileSync(join(out, `meta-${stamp()}.json`), JSON.stringify({ args, botDir: info.dir, botUsername: info.username, scenarios: selected.map((s) => s.id), startedAt: new Date().toISOString() }, null, 2));
   if (!args.noReset && !hasPristine()) throw new Error("no pristine world snapshot; run scout + `npx tsx src/eval/world.ts snapshot` (or pass --no-reset)");
 
   const rcon = makeRcon(env);

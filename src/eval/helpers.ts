@@ -189,9 +189,24 @@ export function allOf(...rs: CheckResult[]): CheckResult {
 export const insideBox = async (ctx: ScenarioCtx, player: string, b: Box): Promise<boolean> => inBox(blockOf(await ctx.position(player)), b);
 
 /** The common scenario script: one request, then wait until the bot is done (or check passes). */
-export async function ask(ctx: ScenarioCtx, message: string): Promise<void> {
+/**
+ * Say `message` and wait until the bot is idle. If the bot ends by asking a
+ * question and the check hasn't passed, `confirm: true` answers like a real
+ * player: "yes, go ahead" (max twice). Opt-in, only for scenarios where the
+ * bot's propose-and-confirm policy for big/permanent requests applies (builds,
+ * farms); elsewhere a trailing question means the bot gave up, which counts.
+ * The extra turns count against the bot.
+ */
+export async function ask(ctx: ScenarioCtx, message: string, opts: { confirm?: boolean } = {}): Promise<void> {
   await ctx.say(message);
   await ctx.waitForDone();
+  if (!opts.confirm) return;
+  for (let i = 0; i < 2 && !ctx.succeeded && !ctx.signal.aborted; i++) {
+    const last = ctx.botChats[ctx.botChats.length - 1] ?? "";
+    if (!last.includes("?")) return;
+    await ctx.say("steve, yes go ahead");
+    await ctx.waitForDone();
+  }
 }
 
 /** Joined bot chat (for regex checks over everything the bot said). */

@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { plan as realPlan } from "../planner/plan.js";
 import type { FailureKind, Goal, Plan, Step, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
-import { JobRunner, type ExploreOutcome, type RunnerDeps, type StepRunContext } from "./runner.js";
+import { JobRunner, STEP_GRACE_MS, type ExploreOutcome, type RunnerDeps, type StepRunContext } from "./runner.js";
 import type { Job, StepResult } from "./types.js";
 
 const gatherStep = (item: string, count: number, extra: Partial<Extract<Step, { op: "gather" }>> = {}): Step => ({
@@ -37,13 +37,14 @@ function harness(opts: {
   script: (step: Step, n: number, ctx: StepRunContext) => StepResult | Promise<StepResult>;
   explore?: (step: Step) => ExploreOutcome | Promise<ExploreOutcome>;
   load?: Job | null;
+  buildView?: () => Promise<WorldView>;
 }): Harness {
   const h: Harness = { events: [], ended: [], saved: [], stops: 0, plans: [...opts.plans], calls: [], inv: {}, runner: null as never };
   let n = 0;
   const deps: RunnerDeps = {
     username: "bot",
     plan: () => (h.plans.length > 1 ? h.plans.shift()! : h.plans[0]!),
-    buildView: async () => VIEW,
+    buildView: opts.buildView ?? (async () => VIEW),
     execute: async (step, ctx) => {
       h.calls.push({ step, ctx });
       return opts.script(step, n++, ctx);
@@ -257,6 +258,82 @@ describe("JobRunner state machine", () => {
     expect(h.runner.current()!.id).toBe(r2.jobId);
     const ends = h.events.filter((e) => e.kind === "job_end") as Array<{ status: string }>;
     expect(ends.map((e) => e.status)).toEqual(["cancelled", "done"]);
+  });
+
+  it("death ends the job as failed/died and DOES notify the agent", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const h = harness({ plans: [mkPlan([gatherStep("oak_log", 3)])], script: async (s) => (await gate, failRes(s, "cancelled")) });
+    await h.runner.start([{ item: "oak_log", count: 3 }], "Alex");
+    await until(() => h.calls.length === 1);
+    h.runner.notifyStop("death");
+    expect(h.runner.current()!.status).toBe("failed");
+    expect(h.runner.current()!.failure!.kind).toBe("died");
+    expect(h.ended).toHaveLength(1);
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.ended).toHaveLength(1); // the aborted loop adds nothing
+    expect(h.events.filter((e) => e.kind === "job_end")).toMatchObject([{ status: "failed", failureKind: "died" }]);
+  });
+
+  it("a watchdog stop also notifies the agent (failed/timeout), never a silent cancel", async () => {
+    const h = harness({ plans: [mkPlan([gatherStep("oak_log", 3)])], script: () => new Promise<StepResult>(() => {}) });
+    await h.runner.start([{ item: "oak_log", count: 3 }], null);
+    await until(() => h.calls.length === 1);
+    h.runner.notifyStop("watchdog");
+    expect(h.runner.current()!.failure!.kind).toBe("timeout");
+    expect(h.ended).toHaveLength(1);
+  });
+
+  it("dispose (disconnect / shutdown) ends the job interrupted, persisted, with no agent event", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const h = harness({ plans: [mkPlan([gatherStep("oak_log", 3), craftStep("oak_planks", 4)])], script: async (s) => (await gate, failRes(s, "internal", "bot disconnected")) });
+    await h.runner.start([{ item: "oak_planks", count: 4 }], "Alex");
+    await until(() => h.calls.length === 1);
+    const d = h.runner.dispose();
+    release(); // the step now fails "internal" on the dead bot: must not turn into a failed job
+    await d;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.runner.current()!.status).toBe("interrupted");
+    expect(h.saved.at(-1)!.status).toBe("interrupted");
+    expect(h.ended).toHaveLength(0);
+    expect(h.calls).toHaveLength(1);
+    expect(h.events.filter((e) => e.kind === "job_end")).toMatchObject([{ status: "interrupted" }]);
+    expect((await h.runner.start([{ item: "x", count: 1 }], null)).ok).toBe(false);
+  });
+
+  it("a stop that lands while the job is being planned prevents it from starting", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const h = harness({ plans: [mkPlan([gatherStep("oak_log", 3)])], script: () => okRes(), buildView: async () => (await gate, VIEW) });
+    const p = h.runner.start([{ item: "oak_log", count: 3 }], null);
+    await new Promise((r) => setTimeout(r, 10));
+    h.runner.notifyStop(); // no job yet, but the player said stop
+    release();
+    const res = await p;
+    expect(res.ok).toBe(false);
+    expect(h.calls).toHaveLength(0);
+    expect(h.runner.isRunning()).toBe(false);
+  });
+
+  it("the runner owns step timeouts: a skill that ignores the stop is abandoned after the grace period", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({
+        plans: [mkPlan([craftStep("oak_planks", 4)]), mkPlan([craftStep("oak_planks", 4)])],
+        script: () => new Promise<StepResult>(() => {}), // hangs forever
+      });
+      await h.runner.start([{ item: "oak_planks", count: 4 }], null);
+      await vi.advanceTimersByTimeAsync(121_000); // craft limit 120s: cooperative stop
+      expect(h.stops).toBeGreaterThan(0);
+      expect(h.events.filter((e) => e.kind === "step")).toHaveLength(0); // still hanging
+      await vi.advanceTimersByTimeAsync(STEP_GRACE_MS + 1_000);
+      const step = h.events.find((e) => e.kind === "step") as { ok: boolean; failureKind: string };
+      expect(step).toMatchObject({ ok: false, failureKind: "timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("marks a leftover running job interrupted on boot (no agent event)", () => {

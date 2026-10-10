@@ -9,6 +9,7 @@ import { resolveItem } from "../skills/item-naming.js";
 import type { SkillResult } from "../skills/types.js";
 import { isCreative } from "../skills/game-mode.js";
 import { goalsText } from "./describe.js";
+import { ledgerFor } from "./ledger.js";
 import { getJobRunner } from "./registry.js";
 import type { AchieveResult } from "./types.js";
 
@@ -56,6 +57,11 @@ export async function achieve(bot: Bot, { goals }: AchieveParams): Promise<Skill
     return { ok: false, message: res.message, state: res };
   }
   const list: Goal[] = [...merged.entries()].map(([item, count]) => ({ item, count }));
+  const refusal = ledgerFor(bot.username).refusal(list);
+  if (refusal) {
+    console.log(`[${bot.username}] achieve refused by the failure ledger: ${goalsText(list)}`);
+    return { ok: false, message: refusal, state: { ok: false, jobId: null, message: refusal } satisfies AchieveResult };
+  }
   const res = await runner.start(list, getCurrentConversationPartner(bot.username) ?? null);
   return {
     ok: res.ok,

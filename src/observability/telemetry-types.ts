@@ -106,6 +106,8 @@ export type TelemetryEvent =
       attempts: number;
       ok: boolean;
       reason: string | null;
+      /** Why the bot pillared (D12): "escape" = out of a pit / water while mining or navigating; "requested" = the pillarUp skill. Absent on v1 events (counts as a violation in the eval). */
+      purpose?: "escape" | "requested";
     })
   | (TelemetryBase & {
       kind: "structure_skip"; // structure guard left player-built blocks alone

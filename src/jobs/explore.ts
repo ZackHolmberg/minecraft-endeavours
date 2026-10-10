@@ -20,6 +20,7 @@ import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 import { builtStructureReason } from "../skills/structure-guard.js";
 import { ensureMovements, type BotWithPathfinder } from "../skills/pathfinder-config.js";
+import { runSkill } from "../skills/harness.js";
 import { navigate } from "../skills/navigation.js";
 import type { ExploreFn, ExploreOutcome, GatherStep, StepRunContext } from "./runner.js";
 
@@ -39,6 +40,13 @@ const BRANCH_SEGMENT = 24;
 const BRANCH_SHIFT = 3;
 const BRANCH_MAX_CELLS = 140;
 const MIN_Y = -58;
+/** Never wander further than this (horizontally) from where the explore began. */
+export const MAX_FROM_START = 250;
+/** Walking back to the start after a failed search: hop length, max hops, time box. */
+const RETURN_HOP = 40;
+const RETURN_MAX_HOPS = 8;
+const RETURN_MAX_MS = 3 * 60_000;
+const RETURN_ARRIVED = 6;
 
 // ── pure helpers ────────────────────────────────────────────────────────────
 
@@ -73,6 +81,11 @@ export function isLiquidName(name: string | null): boolean {
 /** Natural blocks we are willing to dig through. */
 export function isDiggableName(name: string): boolean {
   return DIGGABLE_RE.test(name);
+}
+
+/** Horizontal (x/z) distance between two points. */
+export function horizontalDistance(a: { x: number; z: number }, b: { x: number; z: number }): number {
+  return Math.hypot(a.x - b.x, a.z - b.z);
 }
 
 export type NameAt = (x: number, y: number, z: number) => string | null;
@@ -153,19 +166,84 @@ export function createExplorer(bot: Bot): ExploreFn {
     if (ids.length === 0) return { found: false, detail: `no block ids for ${step.blocks.join(",")}` };
     const hint = step.searchHint ?? { kind: "surface" as const };
     const ex = new Explorer(bot, ids, ctx);
-    return hint.kind === "underground" ? ex.underground(hint.yRange) : ex.surface();
+    let outcome: ExploreOutcome | null = null;
+    // Through `runSkill` like every other skill: it holds the current-tool slot
+    // (so the idle-look / auto-eat / armor reflexes stay off mid-dig), records
+    // the skill telemetry, and waits for any in-flight reflex first. No 10-min
+    // watchdog: the explore carries its own time boxes.
+    await runSkill(
+      bot,
+      "explore",
+      { item: step.item, kind: hint.kind },
+      async () => {
+        const out = hint.kind === "underground" ? await ex.underground(hint.yRange) : await ex.surface();
+        outcome = out.found || ex.isAborted ? out : await ex.returnToStart(out, hint.kind === "underground");
+        return { ok: outcome.found, message: `explore ${hint.kind}: ${outcome.detail}` };
+      },
+      { watchdogMs: null },
+    );
+    return outcome ?? { found: false, detail: "explore crashed" };
   };
 }
 
 class Explorer {
+  private readonly start: Vec3;
+
   constructor(
     private readonly bot: Bot,
     private readonly ids: number[],
     private readonly ctx: StepRunContext,
-  ) {}
+  ) {
+    this.start = bot.entity.position.clone();
+  }
 
   private get aborted(): boolean {
     return this.ctx.signal.aborted;
+  }
+
+  get isAborted(): boolean {
+    return this.aborted;
+  }
+
+  private fromStart(p: { x: number; z: number } = this.bot.entity.position): number {
+    return horizontalDistance(p, this.start);
+  }
+
+  /**
+   * After a failed search: walk back toward where the explore began (bounded,
+   * cancellable), so the job doesn't strand the bot far from its base. Reports
+   * the end position either way.
+   */
+  async returnToStart(out: ExploreOutcome, underground: boolean): Promise<ExploreOutcome> {
+    const t0 = Date.now();
+    if (this.fromStart() > RETURN_ARRIVED) {
+      this.log(`giving up; walking back to the start (${Math.round(this.fromStart())} blocks)`);
+      for (let hop = 0; hop < RETURN_MAX_HOPS && Date.now() - t0 < RETURN_MAX_MS && !this.aborted; hop++) {
+        const here = this.bot.entity.position;
+        const d = this.fromStart();
+        if (d <= RETURN_ARRIVED) break;
+        let goal;
+        let target: Vec3;
+        if (underground) {
+          // tunnels are not straight: path to the start itself (the whole route is loaded and walkable)
+          goal = new goals.GoalNear(Math.floor(this.start.x), Math.floor(this.start.y), Math.floor(this.start.z), 3);
+          target = this.start;
+        } else {
+          const f = Math.min(RETURN_HOP, d) / d;
+          const tx = here.x + (this.start.x - here.x) * f;
+          const tz = here.z + (this.start.z - here.z) * f;
+          goal = new goals.GoalNearXZ(Math.round(tx), Math.round(tz), 3);
+          target = new Vec3(tx, here.y, tz);
+        }
+        const r = await navigate(this.bot, goal, { label: "explore return", target, escape: "none" });
+        if (!r.ok) break;
+        if (underground) break; // one direct path; success means we are back
+      }
+    }
+    const end = this.bot.entity.position;
+    const left = Math.round(this.fromStart());
+    const where = left <= RETURN_ARRIVED + 3 ? "walked back to the start" : `ended ${left} blocks from the start at (${Math.round(end.x)}, ${Math.round(end.y)}, ${Math.round(end.z)})`;
+    return { found: false, detail: `${out.detail}; ${where}` };
   }
 
   private nameAt: NameAt = (x, y, z) => this.bot.blockAt(new Vec3(x, y, z))?.name ?? null;
@@ -193,6 +271,7 @@ class Explorer {
         if (Date.now() - t0 > SURFACE_MAX_MS) return { found: false, detail: `surface search timed out after ${travelled} blocks` };
         const p = this.bot.entity.position;
         const hop = Math.min(SURFACE_HOP, leg.length - walked);
+        if (this.fromStart({ x: p.x + leg.dx * hop, z: p.z + leg.dz * hop }) > MAX_FROM_START) break; // too far out: turn
         const moved = await this.walkTo(p.x + leg.dx * hop, p.z + leg.dz * hop, `explore leg ${i + 1}`);
         if (!moved) break; // blocked: next leg turns
         travelled += hop;
@@ -306,6 +385,7 @@ class Explorer {
     preferred: { dx: number; dz: number },
     down: boolean,
   ): Promise<{ ok: true; dir: { dx: number; dz: number } } | { ok: false; reason: string }> {
+    if (this.fromStart() > MAX_FROM_START) return { ok: false, reason: `${MAX_FROM_START} blocks from the start` };
     const feet = this.bot.entity.position.floored();
     let firstReason = "";
     for (const d of directionOrder(preferred)) {
@@ -347,20 +427,27 @@ class Explorer {
       if (builtStructureReason(this.bot, b)) return "refused";
       if (!liquidSafe(this.nameAt, pos.x, pos.y, pos.z)) return "refused";
       await this.equipFor(b);
+      // The timer must not outlive the dig: a leaked timer would fire
+      // `stopDigging()` in the middle of a LATER dig (every cell is a dig).
+      let timer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([
           this.bot.dig(b),
-          new Promise<never>((_, rej) => setTimeout(() => {
-            try {
-              this.bot.stopDigging?.();
-            } catch {
-              /* best effort */
-            }
-            rej(new Error("dig timeout"));
-          }, DIG_TIMEOUT_MS)),
+          new Promise<never>((_, rej) => {
+            timer = setTimeout(() => {
+              try {
+                this.bot.stopDigging?.();
+              } catch {
+                /* best effort */
+              }
+              rej(new Error("dig timeout"));
+            }, DIG_TIMEOUT_MS);
+          }),
         ]);
       } catch {
         return "failed";
+      } finally {
+        if (timer) clearTimeout(timer);
       }
       await new Promise((r) => setTimeout(r, 250)); // gravel / sand above may fall into the cell
     }

@@ -12,6 +12,7 @@ import type { BotState } from "../state/index.js";
 import { loadJson, memoryFileFor, saveJsonAtomic } from "../state/persist.js";
 import { formatJobEvent } from "./describe.js";
 import { createExplorer } from "./explore.js";
+import { ledgerFor } from "./ledger.js";
 import { registerJobRunner, unregisterJobRunner } from "./registry.js";
 import { JobRunner } from "./runner.js";
 import { createStepExecutor } from "./steps/index.js";
@@ -72,12 +73,20 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     load: () => loadJson<Job>(path),
     save: (job) => saveJsonAtomic(path, job),
     onEnd: (job) => {
+      // Loop guard (H2): remember failures so `achieve` can refuse a goal that keeps failing.
+      if (job.status === "failed") ledgerFor(username).recordFailure(job.goals, job.failure?.kind ?? "internal");
+      else if (job.status === "done") ledgerFor(username).recordSuccess(job.goals);
       const text = formatJobEvent(job);
       if (text) getAgent(username)?.pushJobEvent(text);
     },
     onDispose: () => off(),
   });
-  off = state.cancellation.onRequest(() => runner.notifyStop());
+  off = state.cancellation.onRequest((reason) => runner.notifyStop(reason));
+  // The connection is gone: end the job as interrupted now (no failing steps on a
+  // dead bot, no [job failed] event to Haiku). The reconnect builds a fresh runner.
+  bot.once("end", () => {
+    void runner.dispose().catch((err) => console.warn(`[${username}] job runner dispose failed:`, err));
+  });
   await registerJobRunner(username, runner);
   return runner;
 }

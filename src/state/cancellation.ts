@@ -15,9 +15,11 @@
  * `ok: true, message: "cancelled"` (or similar). The flag auto-clears on
  * `begin()` so a fresh long-running skill never inherits a stale request.
  */
+export type StopReason = "player" | "death" | "watchdog";
+
 export class CancellationFlag {
   private requested = false;
-  private readonly listeners = new Set<() => void>();
+  private readonly listeners = new Set<(reason: StopReason) => void>();
 
   /**
    * Observe every `request()` (stop skill, chat preempt, death, watchdog).
@@ -25,17 +27,21 @@ export class CancellationFlag {
    * start, so a job polling `isRequested()` between steps could miss a stop.
    * Returns an unsubscribe function.
    */
-  onRequest(listener: () => void): () => void {
+  onRequest(listener: (reason: StopReason) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  /** Called by stop skill / side-channel. Idempotent. */
-  request(): void {
+  /**
+   * Called by stop skill / side-channel (reason "player", the default), death,
+   * and the skill watchdog. Idempotent. The reason only matters to observers
+   * (the job runner reports death / watchdog stops to the model).
+   */
+  request(reason: StopReason = "player"): void {
     this.requested = true;
     for (const l of [...this.listeners]) {
       try {
-        l();
+        l(reason);
       } catch {
         // observers must never break the stop path
       }

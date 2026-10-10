@@ -41,3 +41,6 @@ The eval launches the bot per scenario from `--bot-dir`; editing `src/` in that 
 
 ## D12 — Pillar violation = pillaring not for escape (2026-10-09)
 `pillar` telemetry gains optional `purpose: "escape" | "requested"`. Escaping a pit/water while mining or via `navigate` escape is player-like; a Haiku-requested `pillarUp` to reach somewhere is the "pillar to travel" violation unless the scenario allows it. Events without `purpose` (v1) all count — conservative for v1.
+
+## D13 — Keep propose-and-confirm for big builds; harness answers like a player (2026-10-09)
+v1's owner-approved vagueness policy (propose a plan for big/permanent/taste requests and wait for a yes) stays. In v2-s2b both house builds ended "sound good?" with nothing built. The Tester now replies "yes go ahead" only in scenarios where that policy applies (`confirm: true`); elsewhere a trailing question counts as giving up (autonomy matters). v1 is re-run on those 4 scenarios for a fair baseline.
