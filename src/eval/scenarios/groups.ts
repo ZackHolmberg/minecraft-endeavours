@@ -75,6 +75,50 @@ export const statusMidtask: Scenario = {
   },
 };
 
+export const chatWhileFollowing: Scenario = {
+  id: "conv.chat_while_following",
+  tier: 2,
+  category: "conversation",
+  title: "Answer chat while following, and keep following",
+  timeoutMs: 3 * 60_000,
+  site: "plains",
+  async setup() {},
+  async run(ctx) {
+    await ctx.say("steve, follow me");
+    await ctx.sleep(4000);
+    let p = await ctx.position(ctx.tester);
+    for (let i = 0; i < 7; i++) {
+      const x = Math.floor(p.x) + 3;
+      p = { x, y: await ctx.surface(x, Math.floor(p.z)), z: p.z };
+      await ctx.tp(ctx.tester, p);
+      if (i === 2) {
+        // not a question: a follow blocking the task session would leave this unanswered
+        await ctx.say("steve you're doing great");
+        ctx.scratch.reply = ctx.waitForBotChat(undefined, 15_000).then((r) => {
+          ctx.scratch.replied = r !== null;
+        });
+      }
+      if (i === 4) await ctx.say("this way");
+      await ctx.sleep(1500);
+    }
+    ctx.scratch.walkEndedAt = Date.now();
+    await ctx.scratch.reply;
+    await ctx.sleep(10_000);
+  },
+  async check(ctx) {
+    const end = ctx.scratch.walkEndedAt as number | undefined;
+    if (!end || Date.now() - end < 10_000 || ctx.scratch.replied === undefined) return { ok: false, detail: "waiting for the walk to finish + 10s" };
+    const replied = { ok: ctx.scratch.replied === true, detail: `replied to the praise within 15s: ${ctx.scratch.replied}` };
+    return allOf(replied, await playerNear(ctx, ctx.bot, ctx.tester, 6));
+  },
+  dryWin: async (ctx) => {
+    ctx.scratch.replied = true;
+    ctx.scratch.walkEndedAt = Date.now() - 11_000;
+    const p = await ctx.position(ctx.tester);
+    await ctx.tp(ctx.bot, { ...p, x: p.x - 2 });
+  },
+};
+
 // ── interruption ──────────────────────────────────────────────────────────────
 
 export const stop: Scenario = {
@@ -223,4 +267,4 @@ export const giveTorches: Scenario = {
   dryWin: (ctx) => ctx.give(ctx.tester, "torch", 64),
 };
 
-export const groups = [followupChest, twoPart, statusMidtask, stop, notStop, noGrief, stairsNotPillar, crBuildHouse, giveTorches];
+export const groups = [followupChest, twoPart, statusMidtask, chatWhileFollowing, stop, notStop, noGrief, stairsNotPillar, crBuildHouse, giveTorches];

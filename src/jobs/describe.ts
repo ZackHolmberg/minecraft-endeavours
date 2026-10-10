@@ -39,6 +39,7 @@ export function goalsText(goals: readonly Goal[]): string {
 
 /** Short name of what a job is doing: "achieve iron_pickaxe x1", "build house (...)", plus "→ deliver to X". */
 export function jobLabel(job: Job): string {
+  if (job.kind === "follow" && job.follow) return `follow ${job.follow.player}`;
   const base = job.kind === "build" && job.build ? `build ${job.build.blueprint}${job.build.summary ? ` (${job.build.summary})` : ""}` : `achieve ${goalsText(job.generic ?? job.goals)}`;
   return job.deliverTo ? `${base} → give to ${job.deliverTo}` : base;
 }
@@ -67,6 +68,19 @@ export function formatJobEvent(job: Job): string | null {
   const who = job.requestedBy ? ` (requested by ${job.requestedBy} — tell them)` : "";
   const goals = jobLabel(job);
   const dur = formatDuration((job.endedAt ?? Date.now()) - job.startedAt);
+  if (job.kind === "follow") {
+    const who2 = job.follow?.player ?? "the player";
+    if (job.status === "done") {
+      return `[job finished] stopped following ${who2} after ${dur} (time limit)${who}. Reply with one short line; they can ask you to follow again.`;
+    }
+    if (job.status === "failed" && job.failure) {
+      return (
+        `[job failed] following ${who2} ended after ${dur} — ${job.failure.detail}${who}. ` +
+        `Tell them in one short line what happened (don't claim you are still following). Offer to follow again once they're back in view; don't call followPlayer again right away unless they are visible.`
+      );
+    }
+    return null;
+  }
   if (job.status === "done") {
     if (job.kind === "build" && job.build) {
       const b = job.build;
@@ -97,6 +111,12 @@ const RECENT_END_MS = 2 * 60_000;
  */
 export function jobContextLines(job: Job | null, now = Date.now()): string[] {
   if (!job) return [];
+  if (job.status === "running" && job.kind === "follow" && job.follow) {
+    const L = [`following ${job.follow.player} (${formatDuration(now - job.startedAt)})`, `progress: ${job.progress}`];
+    if (job.requestedBy) L.push(`requested by: ${job.requestedBy}`);
+    L.push("it runs by itself and keeps going while you chat: answer with say/whisper and end your turn. Movement/mining/crafting tools you call cancel it. To stop following call cancelJob (or stop).");
+    return L;
+  }
   if (job.status === "running") {
     const total = job.plan.steps.length;
     const L = [
@@ -111,7 +131,7 @@ export function jobContextLines(job: Job | null, now = Date.now()): string[] {
   const ago = formatDuration(now - job.endedAt);
   const base = `last job (${ago} ago): ${jobLabel(job)} — ${job.status}`;
   if (job.status === "failed" && job.failure) {
-    return [`${base}: ${job.failure.kind} — ${job.failure.detail}${job.kind === "build" ? "" : `; remaining plan: ${remainingPlanText(job, 5)}`}`];
+    return [`${base}: ${job.failure.kind} — ${job.failure.detail}${job.kind !== "achieve" ? "" : `; remaining plan: ${remainingPlanText(job, 5)}`}`];
   }
   if (job.status === "done") return [`${base} in ${formatDuration(job.endedAt - job.startedAt)}`];
   return [`${base}${job.progress ? ` (${job.progress})` : ""}`];

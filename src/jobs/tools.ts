@@ -11,8 +11,10 @@ import { resolveItem } from "../skills/item-naming.js";
 import type { SkillResult } from "../skills/types.js";
 import { isOperatorItem } from "../skills/creative.js";
 import { isCreative } from "../skills/game-mode.js";
+import { followPlayer as followPlayerBlocking } from "../skills/movement.js";
+import { FOLLOW_DEFAULT_DIST, FOLLOW_MAX_DIST } from "./follow.js";
 import { holdsDoor, pickShelterWall } from "./night.js";
-import { goalsText } from "./describe.js";
+import { goalsText, jobLabel } from "./describe.js";
 import { findPlayer } from "./steps/deliver.js";
 import { inventoryTotals } from "./world-view.js";
 import { ledgerFor } from "./ledger.js";
@@ -202,10 +204,39 @@ export async function surviveNight(bot: Bot, { useBed }: SurviveNightParams = {}
   };
 }
 
+export interface FollowPlayerParams {
+  player: string;
+  dist?: number;
+}
+
+/**
+ * `followPlayer`: start the follow as a background job and return at once, so the Haiku session
+ * ends and the player's chat during the follow gets its own fresh task (the follow keeps running).
+ * Without a job runner (legacy backends) it falls back to the old blocking skill.
+ */
+export async function followPlayer(bot: Bot, { player, dist = FOLLOW_DEFAULT_DIST }: FollowPlayerParams): Promise<SkillResult> {
+  if (!player) return { ok: false, message: "player name required" };
+  if (dist < 1 || dist > FOLLOW_MAX_DIST) return { ok: false, message: `dist must be between 1 and ${FOLLOW_MAX_DIST}, got ${dist}` };
+  const runner = getJobRunner(bot.username);
+  if (!runner) return followPlayerBlocking(bot, { player, dist });
+  const who = findPlayer(bot, player);
+  if (!who) return { ok: false, message: `player "${player}" is not visible to the bot` };
+  if (who === bot.username) return { ok: false, message: "I can't follow myself" };
+  const requester = getCurrentConversationPartner(bot.username) ?? who;
+  const res = await runner.startFollow({ player: who, dist }, requester);
+  return {
+    ok: res.ok,
+    message: res.ok
+      ? `now following ${who} (~${dist} blocks) as a background job. It keeps running while you chat: reply briefly with say and end your turn. It ends when they say stop, you call cancelJob/stop, or you start a movement/mining tool; if they leave or I lose them for ~45s you get a [job failed] message.`
+      : res.message,
+    state: res,
+  };
+}
+
 export async function cancelJob(bot: Bot): Promise<SkillResult> {
   const runner = getJobRunner(bot.username);
   const job = runner?.current();
   if (!runner || !job || job.status !== "running") return { ok: true, message: "no job is running" };
   await runner.cancel("cancelJob");
-  return { ok: true, message: `cancelled the job (${goalsText(job.goals)})` };
+  return { ok: true, message: `cancelled the job (${job.kind === "achieve" ? goalsText(job.goals) : jobLabel(job)})` };
 }

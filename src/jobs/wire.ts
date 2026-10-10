@@ -19,6 +19,7 @@ import { registerJobRunner, unregisterJobRunner } from "./registry.js";
 import { JobRunner } from "./runner.js";
 import { createBuildDeps } from "./steps/build.js";
 import { createDeliver } from "./steps/deliver.js";
+import { createFollowDeps } from "./steps/follow.js";
 import { createNightDeps } from "./steps/night.js";
 import { createStepExecutor } from "./steps/index.js";
 import { itemCount, slotDump } from "./steps/util.js";
@@ -71,6 +72,7 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     position: () => ({ x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) }),
     build: createBuildDeps(bot),
     deliver: createDeliver(bot),
+    follow: createFollowDeps(bot),
     night: createNightDeps(bot),
     countItem: (item) => itemCount(bot, item),
     reserve: (items) => {
@@ -126,7 +128,9 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     },
     onEnd: (job) => {
       // Loop guard (H2): remember failures so `achieve` can refuse a goal that keeps failing.
-      if (job.kind === "build") {
+      if (job.kind === "follow") {
+        // not goal-keyed: a follow that ended is never a "this goal keeps failing" signal
+      } else if (job.kind === "build") {
         // builds are not goal-keyed: the build ledger (onBuildEnd) and the synthetic-event cap are their loop guards
       } else if (job.status === "failed") {
         // A player who walked away makes the hand-over fail even though the bot holds the items: not a goal failure.
