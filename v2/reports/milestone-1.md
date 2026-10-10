@@ -30,3 +30,6 @@
 - `int.stop` rep 2 (.9).
 
 Caveats: single runs are noisy (v1 `cr.build_house` flipped PASS→FAIL between identical runs). Slice-3 review fixes (`c490b54`) landed after this run.
+
+## Update — v2-s4 (`6d5af8b`, after slice 2c + slice-3 review fixes)
+**57/60 (95%)**: t1 16/16 · t2 16/16 · t3 8/10 · conv 5/6 · int 4/4 · pl 4/4 · cr 4/4; 0 player-build blocks broken, 0 pillar violations, 1 death; p50 first reply 2.2 s; 146 turns/pass. Since then (`61a70b8`): quick-shelter night survival (live 2/2, 0 deaths). Owner live test on the real server: "nearly flawless, lightning fast"; one stuck moment (fixed `46d6ba9`) and a missed message while following (follow-as-job in progress).

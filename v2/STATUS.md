@@ -3,7 +3,7 @@
 **Resume:** in `~/dev/minecraft-endeavours-v2` (branch `v2`), say "continue v2 per v2/STATUS.md". Never work in `~/dev/minecraft-endeavours` (live panel). Mission: [../V2_KICKOFF_PROMPT.md in the main checkout] — the most competent, comprehensive, efficient Haiku-brained Minecraft bot. Decisions: [DECISIONS.md](DECISIONS.md). Test server: [TEST_SERVER.md](TEST_SERVER.md).
 
 ## Phase
-**Milestone 1 reached (2026-10-10): v2 80% vs v1 45% on core (×2 each)** — awaiting owner check-in. Meanwhile slice 2c (conversation/autonomy + explore/night) in progress.
+**Milestone 1 reached (2026-10-10): v2 80% vs v1 45% on core (×2 each); v2-s4 now 95%** — awaiting owner check-in. Meanwhile slice 2c (conversation/autonomy + explore/night) in progress.
 
 ## Done
 - Step 0: tag `v1` (= `b184e5e`, local only, not pushed), worktree + branch `v2`, isolated test server (boots, RCON ok), `Steve_v2` config, port-aware bot scripts. Commit `c1587b0`.
@@ -44,7 +44,8 @@
 |---|---|---|---|---|---|---|---|---|---|---|
 | v1 ×2 (baseline + r2) | 27/60 (45%) | 14/16 | 7/16 | 1/10 | 0/6 | 1/4 | 2/4 | 2/4 | 198/pass | 8 broken, 2 deaths |
 | v1-baseline (rep 1) | 12/30 | 7/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 0/2 | ~230 | [report](reports/baseline-v1.md); t1.eat + 4 confirm-policy scenarios re-run (D13); cr.build_house flipped PASS→FAIL on re-run (plan only in thinking, never said) — single-repeat noise is real, use repeats for milestone numbers |
-| **v2-s3 (`110e060`, ×2)** | **48/60 (80%)** | 16/16 | 13/16 | 7/10 | 1/6 | 3/4 | 4/4 | 4/4 | 136/pass | [milestone-1](reports/milestone-1.md); 0 broken; deaths 5 |
+| **v2-s4 (`6d5af8b`, ×2)** | **57/60 (95%)** | 16/16 | 16/16 | 8/10 | 5/6 | 4/4 | 4/4 | 4/4 | 146/pass | 0 broken, 0 pillar, 1 death (survive_night r2, pre quick-shelter); p50 first reply 2.2s; fails: build_house r1 80/82 (server refused 1 placement, no retry), followup_chest r2 (chest >16 blocks away after chopping), survive_night r2 |
+| v2-s3 (`110e060`, ×2) | **48/60 (80%)** | 16/16 | 13/16 | 7/10 | 1/6 | 3/4 | 4/4 | 4/4 | 136/pass | [milestone-1](reports/milestone-1.md); 0 broken; deaths 5 |
 | v2-r1 targeted (`3480223`, 8 regressed scenarios) | 6/8 | | | | | | | | | doors ✓ (0 broken), no_grief ✓, wooden/stone pickaxe ✓, not_stop ✓; chop_logs ✗ (jungle drops), coal ✗ (drowned/suffocated) |
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
