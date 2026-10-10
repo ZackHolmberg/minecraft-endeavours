@@ -11,20 +11,19 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## LIVE TEST (owner request, 2026-10-10 17:05)
-- `Steve_v2` (v2 @ `46d6ba9`, restarted after live fixes) is running on the **real server** from worktree `../mcv2-live` (`.env` MC_PORT=25565, docker disabled there). Started live MC via main checkout `scripts/start.sh`; backup `backups/world_2026-10-10_17-05-14.tar.gz` (main checkout) taken first; `whitelist add Steve_v2` on live. Stop: `cd ../mcv2-live && ./scripts/botStop.sh`. Logs: `../mcv2-live/.bot-runtime/bot.log` (+ `data/orchestrator/telemetry/Steve_v2/` there). Panel doesn't show it. Afterwards: `./scripts/botReport.sh` in mcv2-live; consider `whitelist remove Steve_v2`.
-- Live findings so far: owner says "really good"; stuck once — after `achieve furnace` Haiku claimed "placed" and stopped, and un-named follow-ups were dropped (20s window). Fixed in `46d6ba9` (job-requester routing, 60s follow-up, job-end continues the announced step).
+## LIVE TEST (owner request, 2026-10-10) — session ended
+- `Steve_v2` ran on the real server from worktree `../mcv2-live` (`.env` MC_PORT=25565, docker disabled there); owner: "really impressive… nearly flawless, lightning fast". Owner stopped the live server afterwards; lead stopped the bot and moved `../mcv2-live` to `4147b21` (follow job + quick shelter + live fixes). Backup before the test: `backups/world_2026-10-10_17-05-14.tar.gz` (main checkout). `Steve_v2` is still on the live whitelist.
+- Next live session: start the live server (main checkout `scripts/start.sh`), then `cd ../mcv2-live && ./scripts/botStart.sh`; stop with `./scripts/botStop.sh`.
+- Live findings, all fixed: stuck after a job (claimed "placed", stopped; un-named follow-ups dropped) → `46d6ba9`; missed message while following → follow job `e12f41b`.
 
-## In flight (2026-10-10 ~16:00)
-- Merged into `v2` @ `6d5af8b`: slice-3 review fixes, 2c-A (`f183dde`: nearby containers, gather continuation, generic `#tag` goals, side replies, strictMcpConfig), 2c-B (`8463bb8`: explore-elsewhere recovery — coal live 2/3; shelter + survive_night job — still failing live), deliverTo prompt fix. 319 tests.
-- **Run `v2/runs/v2-s4`** (core ×2, bench `../mcv2-bench` @ `6d5af8b`), log ends CHAIN_DONE.
-- Worktrees `../mcv2-dev`, `../mcv2-build` synced to `6d5af8b`, idle.
+## In flight (2026-10-10 evening)
+- Nothing running. `v2` @ `4147b21` (361 tests). Worktrees idle: `../mcv2-dev` (v2-fixes), `../mcv2-build` (v2-build), `../mcv2-bench` (frozen @ `6d5af8b`), `../mcv2-live` (@ `4147b21`).
 
 ## Next steps
-1. Read `v2-s4` vs `v2-s3` and v1 ×2; update Benchmark scores + milestone report.
-2. survive_night: shelter is too slow (mobs arrive ~2 min after dusk, build ~2.5 min) → player-like quick shelter (dig 2-deep into ground/hillside and seal, seconds), start at dusk; verify hold phase live.
-3. Owner decisions pending (see Open questions): D16 hotfix on main, push, continue.
-4. Then: pathfinder master pin (D9 #3), prompt/tool-surface trim (prefix ~17–19k tokens/call), stretch suite (iron kit, diamonds), breadth (combat, trading, Nether).
+1. Full core run on `4147b21` (quick shelter + follow job + live fixes), incl. new `conv.chat_while_following` → `v2-s5`.
+2. Small fixes from v2-s4: build placement retry when the server refuses a block; remember seen chests beyond 16 blocks (followup_chest).
+3. Independent review of 2c-A/2c-B/quick shelter/follow job (not yet reviewed).
+4. Owner decisions pending (Open questions). Then: stretch suite (iron kit, diamonds), pathfinder master pin, prompt/tool-surface trim, breadth (combat, trading, Nether).
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
