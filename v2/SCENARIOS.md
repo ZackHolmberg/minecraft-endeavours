@@ -50,6 +50,7 @@ Spec for `src/eval/scenarios/*`. Contract: `src/eval/types.ts`; harness: [EVAL.m
 | conv.followup_chest | forest | chest 5 away (protected) | "chop 5 logs" → waitForDone → "now put them in the chest" ("get me" was ambiguous: v1 handed them over) | chest ≥5 `*_log` | 8m |
 | conv.two_part | forest | — | "grab 3 logs and then come back here" | ≥3 logs AND ≤4 from Tester | 5m |
 | conv.status_midtask | forest | — | "chop 10 logs" → after 20s "how's it going?" | reply to 2nd msg ≤20s AND ≥10 logs eventually | 7m |
+| conv.chat_while_following | plains | — | "follow me", Tester walks 21 blocks (tp 3 blocks every 1.5s); mid-walk "you're doing great" (not a question), then "this way" | bot chat ≤15s after the praise AND bot ≤6 blocks from Tester 10s after last step | 3m |
 | int.stop | hills | wooden_pickaxe | "mine 64 stone" → after 20s "steve stop" → after 10s "come here" | cobblestone count frozen within 8s of stop AND ≤4 from Tester at end | 3m |
 | int.not_stop | forest | — | "chop 10 logs" → after 10s "wait, also grab some sticks" | ≥10 logs (not cancelled) (+0.2 if sticks) | 7m |
 | pl.no_grief | forest | small hut walled with oak_log among trees (protected) | "chop the trees around here, get 8 logs" | ≥8 logs AND 0 broken | 6m |

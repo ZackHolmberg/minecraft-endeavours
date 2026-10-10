@@ -25,7 +25,7 @@
 
 import type { Bot } from "mineflayer";
 import { z } from "zod";
-import { achieve, build, cancelJob, surviveNight } from "../jobs/tools.js";
+import { achieve, build, cancelJob, followPlayer as followPlayerJob, surviveNight } from "../jobs/tools.js";
 import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
@@ -43,7 +43,6 @@ import {
   equipLoadout,
   fish,
   flee,
-  followPlayer,
   getItems,
   giveItemsTo,
   giveItemTo,
@@ -208,12 +207,12 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "followPlayer",
     description:
-      "Follow a player at `dist` blocks (default 3), indefinitely, until they say stop (or you call stop). It doesn't return until then, so use it only when the player asked you to follow them — for 'come here' use goTo with the player as the target instead.",
+      "Follow a player at `dist` blocks (default 3), until they say stop (or you call stop / cancelJob), for up to 30 minutes. Starts a background job and returns at once: reply briefly (say) and end your turn. The follow keeps running while the player chats — answer them with say/whisper only; any movement/mining/crafting tool you call cancels it. If the player walks out of view the bot searches for them (last position, then the way they were heading) for ~45s before giving up with a [job failed] message. Use it only when the player asked you to follow them — for 'come here' use goTo with the player as the target instead.",
     schema: {
       player: z.string().min(1),
       dist: z.number().int().min(1).max(16).optional().describe("Follow distance in blocks (default 3)"),
     },
-    run: withParams("followPlayer", followPlayer),
+    run: withParams("followPlayer", followPlayerJob, READ_ONLY),
     surfaces: EXECUTOR,
   },
   {

@@ -13,7 +13,7 @@ import type { PocketPlan } from "./pocket.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
 
-export type JobKind = "achieve" | "build";
+export type JobKind = "achieve" | "build" | "follow";
 
 /** What a `build` job was asked for (slice 3). `anchor` is the resolved "here" (requester, else bot). */
 export interface BuildSpec {
@@ -26,6 +26,18 @@ export interface BuildSpec {
   /** "night": after the build, get inside, close up, light and wait for dawn (shelter blueprint; `surviveNight`). */
   hold?: "night";
 }
+
+/** What a `follow` job keeps doing: stay ~`dist` blocks from `player` until stopped (src/jobs/follow.ts). */
+export interface FollowState {
+  /** The followed player's exact username. */
+  player: string;
+  dist: number;
+}
+
+/** How a follow run ended on its own (a stop / new job is handled by the runner, not reported). */
+export type FollowOutcome =
+  | { ok: true; detail: string }
+  | { ok: false; kind: FailureKind; detail: string };
 
 /** A temporary support block the builder placed (and must remove again). Persisted so a crash/stop can't orphan it. */
 export interface ScaffoldCell extends Vec3 {
@@ -89,6 +101,8 @@ export interface Job {
   deliverTo?: string | null;
   /** Set when kind is "build". */
   build?: BuildState;
+  /** Set when kind is "follow". */
+  follow?: FollowState;
   /** Set when the job failed at the hand-over to the player (not at gathering): not a goal-keyed failure for the ledger. */
   handoverFailed?: boolean;
   /** Scaffold blocks placed by a builder and not yet confirmed removed (survives stop/crash/restart; reclaimed by the next build or at boot). */

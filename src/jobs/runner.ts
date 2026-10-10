@@ -17,6 +17,7 @@
  */
 import type { Facing } from "../build/types.js";
 import { stepOutputItem, describeStep, goalsText, jobLabel } from "./describe.js";
+import { FOLLOW_MAX_MS } from "./follow.js";
 import { planReservations } from "./reserve.js";
 import { emptyExhausted, excludeFor, noteExhausted, type ExcludeFn } from "./exhausted.js";
 import { inNightWindow, shelterGeometry, type ShelterGeometry } from "./night.js";
@@ -35,7 +36,7 @@ import { isGoalTag } from "../planner/knowledge/tags.js";
 import type { FailureKind, Goal, PlanFn, Plan, Step, StepFailure, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import type { StopReason } from "../state/cancellation.js";
-import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, Job, JobStatus, JobStepFailure, ScaffoldCell, StepResult } from "./types.js";
+import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, FollowOutcome, FollowState, Job, JobStatus, JobStepFailure, ScaffoldCell, StepResult } from "./types.js";
 
 export interface StepRunContext {
   signal: AbortSignal;
@@ -113,6 +114,26 @@ export interface BuildHistory {
   partial: (spec: BuildSpec) => { origin: { x: number; y: number; z: number }; facing: Facing; params: Record<string, unknown>; placed: number; total: number } | null;
 }
 
+export interface FollowRunContext {
+  signal: AbortSignal;
+  jobId: string;
+  /** Epoch ms after which the follow ends on its own (the 30-minute cap). */
+  deadline: number;
+  /** Telemetry sink (`recovery` events for lost-sight / re-acquired). */
+  record: (e: TelemetryInput) => void;
+  /** Live progress line for the context block (persisted with the job). */
+  progress: (text: string) => void;
+}
+
+/** Bot-bound half of a follow job (src/jobs/steps/follow.ts); injected so the runner stays testable. */
+export interface FollowDeps {
+  /**
+   * Keep ~`dist` blocks from the player until `ctx.signal` aborts, the deadline passes, or it fails for good
+   * (player left, lost for ~45 s, can't reach). Resolves quietly on abort (the runner already ended the job).
+   */
+  run: (spec: FollowState, ctx: FollowRunContext) => Promise<FollowOutcome>;
+}
+
 /** Hand `goals` to player `to`; verifies the hand-over. */
 export type DeliverFn = (to: string, goals: Goal[], ctx: StepRunContext) => Promise<StepResult>;
 
@@ -128,6 +149,8 @@ export interface RunnerDeps {
   build?: BuildDeps;
   /** Slice 3: deliver-to-player. Absent ⇒ jobs with `deliverTo` fail at the hand-over. */
   deliver?: DeliverFn;
+  /** Follow job (live-test fix 2026-10-10): follow a player in the background. Absent => `startFollow` refuses. */
+  follow?: FollowDeps;
   /** Slice 2c-B: night survival (sleep / wait in the shelter). Absent ⇒ `surviveNight` refuses. */
   night?: NightDeps;
   /** Inventory count of an item (postcondition baselines). */
@@ -254,6 +277,39 @@ export class JobRunner {
     const run = this.chain.then(() => this.startBuildInner(spec, requestedBy));
     this.chain = run.catch(() => undefined);
     return run;
+  }
+
+  /** Start a follow job (replaces the running job). Returns at once; the follow runs until stopped, failed or the 30-min cap. */
+  startFollow(spec: FollowState, requestedBy: string | null): Promise<AchieveResult> {
+    const run = this.chain.then(() => this.startFollowInner(spec, requestedBy));
+    this.chain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async startFollowInner(spec: FollowState, requestedBy: string | null): Promise<AchieveResult> {
+    if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
+    if (!this.deps.follow) return { ok: false, jobId: null, message: "following isn't available right now" };
+    if (this.isRunning()) await this.cancel("replaced by a new job");
+    await this.settleReclaim();
+    if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
+    const now = this.now();
+    const summary = `follow ${spec.player} at ~${spec.dist} blocks`;
+    const job: Job = {
+      id: newJobId(now),
+      kind: "follow",
+      goals: [],
+      requestedBy,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      plan: { goals: [], steps: [], rawNeeds: {}, unresolved: [], summary: "" },
+      stepIndex: 0,
+      replans: 0,
+      progress: `following ${spec.player}`,
+      failure: null,
+      follow: { ...spec },
+    };
+    return this.launch(job, summary, {}, (j, c) => this.runFollowJob(j, c));
   }
 
   private async startInner(goals: Goal[], requestedBy: string | null, deliverTo: string | null): Promise<AchieveResult> {
@@ -471,7 +527,7 @@ export class JobRunner {
     this.job = job;
     this.persist(job);
     this.reservePlan(job.plan);
-    this.deps.record({ kind: "job_start", jobId: job.id, goals: job.kind === "build" ? [{ item: `build:${job.build!.blueprint}`, count: 1 }, ...job.goals] : job.goals, steps: job.plan.steps.length + (job.kind === "build" ? 1 : 0) });
+    this.deps.record({ kind: "job_start", jobId: job.id, goals: job.kind === "build" ? [{ item: `build:${job.build!.blueprint}`, count: 1 }, ...job.goals] : job.kind === "follow" ? [{ item: `follow:${job.follow!.player}`, count: 1 }] : job.goals, steps: job.plan.steps.length + (job.kind === "build" ? 1 : 0) });
     const ctrl = new AbortController();
     this.ctrl = ctrl;
     this.loop = body(job, ctrl).catch((err) => {
@@ -518,10 +574,11 @@ export class JobRunner {
       return;
     }
     const step = job.plan.steps[Math.min(job.stepIndex, job.plan.steps.length - 1)] ?? PHASE_STEP; // builds / night holds with no material steps have none
+    const what = job.kind === "follow" ? `following ${job.follow?.player ?? "the player"}` : describeStep(step);
     const failure: StepFailure =
       reason === "death"
-        ? { kind: "died", step, detail: `the bot died during "${describeStep(step)}" (its items dropped where it died)`, attempts: 1 }
-        : { kind: "timeout", step, detail: `a skill hit the watchdog during "${describeStep(step)}" and the job was stopped`, attempts: 1 };
+        ? { kind: "died", step, detail: `the bot died during "${what}" (its items dropped where it died)`, attempts: 1 }
+        : { kind: "timeout", step, detail: `a skill hit the watchdog during "${what}" and the job was stopped`, attempts: 1 };
     job.progress = `failed: ${failure.kind}`;
     this.finish(job, "failed", failure);
     this.ctrl?.abort();
@@ -921,6 +978,27 @@ export class JobRunner {
       this.finish(job, "failed", { ...res.failure, step: res.failure.step });
     }
     return false;
+  }
+
+  /** Follow job body: the bot-bound runner does the work; this maps how it ended onto the job status. */
+  private async runFollowJob(job: Job, ctrl: AbortController): Promise<void> {
+    const follow = this.deps.follow;
+    const spec = job.follow!;
+    if (!follow) {
+      this.finish(job, "failed", { kind: "internal", step: PHASE_STEP, detail: "following isn't available", attempts: 1 });
+      return;
+    }
+    const out = await follow.run(spec, {
+      signal: ctrl.signal,
+      jobId: job.id,
+      deadline: job.startedAt + FOLLOW_MAX_MS,
+      record: (e) => this.deps.record(e),
+      progress: (text) => this.setProgress(job, text),
+    });
+    // Stopped by the player, replaced, or interrupted: the job already ended quietly (no event).
+    if (job.status !== "running" || ctrl.signal.aborted) return;
+    if (out.ok) this.finish(job, "done", null);
+    else this.finish(job, "failed", { kind: out.kind, step: PHASE_STEP, detail: out.detail, attempts: 1 });
   }
 
   /** Build job body: materials via the normal plan loop, then the builder, retried a couple of times (it resumes). */
