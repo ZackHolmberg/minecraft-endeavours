@@ -170,14 +170,17 @@ export async function build(bot: Bot, { blueprint, params, at }: BuildParams): P
 export interface SurviveNightParams {
   /** false = never sleep in a bed, build a shelter even when a bed is at hand (default true: a bed at hand wins). */
   useBed?: boolean;
+  /** "hut" = skip digging in and build the 3x3 hut (default: dig a pocket into the ground / hillside, the quick player way). */
+  shelter?: "dig" | "hut";
 }
 
 /**
- * Start the night job: sleep if a bed is at hand, else build a minimal shelter next to the
- * requesting player (from dirt / cobblestone / planks, a door only if one is carried), get in,
- * close up and wait for dawn. Returns at once like `build`.
+ * Start the night job: sleep if a bed is at hand, else dig a 1x2 pocket into the ground or a hillside
+ * and seal it (seconds), else build a minimal hut next to the requesting player (from dirt /
+ * cobblestone / planks, a door only if one is carried); get in, close up and wait for dawn.
+ * Returns at once like `build`.
  */
-export async function surviveNight(bot: Bot, { useBed }: SurviveNightParams = {}): Promise<SkillResult> {
+export async function surviveNight(bot: Bot, { useBed, shelter }: SurviveNightParams = {}): Promise<SkillResult> {
   const runner = getJobRunner(bot.username);
   if (!runner) return { ok: false, message: "the job runner isn't available right now" };
   if (isCreative(bot)) return { ok: false, message: "creative mode: mobs can't hurt you, so there is nothing to survive. Just carry on." };
@@ -191,12 +194,12 @@ export async function surviveNight(bot: Bot, { useBed }: SurviveNightParams = {}
     if (p.entity.position.distanceTo(bot.entity.position) <= 48) avoid.push(floor(p.entity.position));
   }
   const inv = inventoryTotals(bot.inventory.slots);
-  const params: Record<string, unknown> = { wall: pickShelterWall(inv), door: holdsDoor(inv), ...(useBed === false ? { useBed: false } : {}) };
+  const params: Record<string, unknown> = { wall: pickShelterWall(inv), door: holdsDoor(inv), ...(useBed === false ? { useBed: false } : {}), ...(shelter === "hut" ? { shelter: "hut" } : {}) };
   const res = await runner.startBuild({ blueprint: "shelter", params, anchor, avoid, hold: "night" }, requester);
   return {
     ok: res.ok,
     message: res.ok
-      ? `night job started: ${res.message}. It runs in the background (building, then waiting inside until dawn); reply briefly and end your turn — you'll get a [job finished]/[job failed] message. Don't call movement/building tools while it runs (that cancels it).`
+      ? `night job started: ${res.message}. It runs in the background (digging in or building, then waiting inside until dawn); reply briefly and end your turn — you'll get a [job finished]/[job failed] message. Don't call movement/building tools while it runs (that cancels it).`
       : res.message,
     state: res,
   };

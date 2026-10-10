@@ -3,6 +3,7 @@ import type { Bot } from "mineflayer";
 import type { FailureKind, Goal, Plan, Step, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import { formatJobEvent, jobContextLines } from "./describe.js";
+import type { PocketPlan } from "./pocket.js";
 import { JobRunner, type BuildDeps, type BuildHistory, type BuildRunContext, type DeliverFn, type NightDeps, type RunnerDeps } from "./runner.js";
 import type { BuildOutcome, BuildPrep, BuildSpec, Job, StepResult } from "./types.js";
 
@@ -573,6 +574,80 @@ describe("survive the night job", () => {
     return { night, calls, geos };
   };
   const shelterPrep = (): BuildPrep => prepOk([], { params: { wall: "dirt", door: false }, summary: "5x5 dirt shelter at (3, 64, 3)", total: 57 });
+  const POCKET: PocketPlan = {
+    kind: "down",
+    stand: { x: 0, y: 64, z: 0 },
+    dig: [{ x: 0, y: 63, z: 0 }, { x: 0, y: 62, z: 0 }, { x: 0, y: 61, z: 0 }],
+    rest: { x: 0, y: 61, z: 0 },
+    seal: [{ x: 0, y: 63, z: 0 }],
+    cost: 3,
+    yields: 3,
+    summary: "dig down 3 at (0, 63, 0) and seal the top",
+  };
+  const withPocket = (n: NightDeps, plan: PocketPlan | null, dug: PocketPlan[] = []): NightDeps => ({
+    ...n,
+    planPocket: () => plan,
+    digInThrough: async (p) => {
+      dug.push(p);
+      return { ok: true, detail: "dug into the ground, sealed in, waited out the night and opened up at dawn" };
+    },
+  });
+
+  it("no bed: digs in (no builder, no materials), waits, ends done", async () => {
+    const dug: PocketPlan[] = [];
+    const n = mkNight();
+    const h = harness({ night: withPocket(n.night, POCKET, dug), prepare: shelterPrep });
+    const r = await h.runner.startBuild(NIGHT_SPEC, "Tester");
+    expect(r.ok).toBe(true);
+    expect(r.message).toMatch(/dig in for the night/);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.status).toBe("done");
+    expect(dug).toEqual([POCKET]);
+    expect(n.calls).toEqual([]);
+    expect(h.runs).toBe(0);
+    expect(h.prepares).toHaveLength(0);
+    expect(h.runner.current()!.build).toMatchObject({ holdMode: "pocket", phase: "holding" });
+    expect(formatJobEvent(h.ended[0]!)).toMatch(/^\[job finished\] survived the night/);
+  });
+
+  it("a bed still wins over digging in", async () => {
+    const dug: PocketPlan[] = [];
+    const n = mkNight({ bed: "white_bed at (1, 64, 1)" });
+    const h = harness({ night: withPocket(n.night, POCKET, dug) });
+    await h.runner.startBuild(NIGHT_SPEC, null);
+    await until(() => h.ended.length === 1);
+    expect(n.calls).toEqual(["sleep"]);
+    expect(dug).toHaveLength(0);
+  });
+
+  it("no safe pocket, or shelter:'hut': falls back to the hut", async () => {
+    const dug: PocketPlan[] = [];
+    const a = mkNight();
+    const ha = harness({ night: withPocket(a.night, null, dug), prepare: shelterPrep });
+    await ha.runner.startBuild(NIGHT_SPEC, null);
+    await until(() => ha.ended.length === 1);
+    expect(a.calls).toEqual(["hold"]);
+    const b = mkNight();
+    const hb = harness({ night: withPocket(b.night, POCKET, dug), prepare: shelterPrep });
+    await hb.runner.startBuild({ ...NIGHT_SPEC, params: { ...NIGHT_SPEC.params, shelter: "hut" } }, null);
+    await until(() => hb.ended.length === 1);
+    expect(b.calls).toEqual(["hold"]);
+    expect(dug).toHaveLength(0);
+  });
+
+  it("a dig-in that fails fails the job with the reason", async () => {
+    const n = mkNight();
+    const night: NightDeps = {
+      ...n.night,
+      planPocket: () => POCKET,
+      digInThrough: async () => ({ ok: false, failure: { kind: "unreachable", step: { op: "place_station", block: "crafting_table" }, detail: "couldn't dig in: x", attempts: 1 } }),
+    };
+    const h = harness({ night });
+    await h.runner.startBuild(NIGHT_SPEC, null);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.status).toBe("failed");
+    expect(h.runner.current()!.failure).toMatchObject({ kind: "unreachable" });
+  });
 
   it("no bed: builds the shelter, then holds inside it until dawn, then ends done with the night's account", async () => {
     const n = mkNight();

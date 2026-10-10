@@ -20,6 +20,7 @@ import { stepOutputItem, describeStep, goalsText, jobLabel } from "./describe.js
 import { planReservations } from "./reserve.js";
 import { emptyExhausted, excludeFor, noteExhausted, type ExcludeFn } from "./exhausted.js";
 import { inNightWindow, shelterGeometry, type ShelterGeometry } from "./night.js";
+import type { PocketPlan } from "./pocket.js";
 import {
   MAX_RELOCATIONS,
   MAX_REPLANS,
@@ -71,6 +72,10 @@ export interface NightDeps {
   sleepThrough: (ctx: StepRunContext) => Promise<StepResult>;
   /** From wherever the bot stands near the finished shelter: get in, close up, light it, wait for dawn, come out. */
   holdInShelter: (geo: ShelterGeometry, ctx: StepRunContext) => Promise<StepResult>;
+  /** Quick shelter: where a 1x2 pocket can be dug into the ground / a hillside near the bot (null = nowhere safe). Cheap world read. */
+  planPocket?: () => PocketPlan | null;
+  /** Dig the planned pocket from inside out, seal it, wait for dawn, open up and step out. */
+  digInThrough?: (plan: PocketPlan, ctx: StepRunContext) => Promise<StepResult>;
 }
 
 export interface BuildRunContext extends StepRunContext {
@@ -297,7 +302,8 @@ export class JobRunner {
     const builder = this.deps.build;
     if (!builder) return { ok: false, jobId: null, message: "building isn't available right now" };
     const refusal = this.deps.buildHistory?.refusal(spec) ?? null;
-    if (refusal) {
+    // The night job defers this check: a refused hut must not block digging in or sleeping.
+    if (refusal && spec.hold !== "night") {
       console.log(`[${this.deps.username}] build refused by the failure ledger: ${spec.blueprint}`);
       return { ok: false, jobId: null, message: refusal };
     }
@@ -312,6 +318,15 @@ export class JobRunner {
     if (spec.hold === "night" && spec.params.useBed !== false) {
       const bed = this.deps.night!.findBed();
       if (bed) return this.launchSleep(spec, bed, requestedBy);
+    }
+    // No bed: dig in. Seconds of work with natural blocks, versus minutes for the hut (mobs arrive ~2 min after dusk).
+    if (spec.hold === "night" && spec.params.shelter !== "hut") {
+      const pocket = this.deps.night!.planPocket?.() ?? null;
+      if (pocket) return this.launchPocket(spec, pocket, requestedBy);
+    }
+    if (refusal) {
+      console.log(`[${this.deps.username}] build refused by the failure ledger: ${spec.blueprint}`);
+      return { ok: false, jobId: null, message: refusal };
     }
     // An unfinished structure of this kind nearby: continue it at its stored origin, never start a second one beside it.
     const resume = this.deps.buildHistory?.partial(spec) ?? this.partialFromLastJob(spec);
@@ -383,6 +398,28 @@ export class JobRunner {
       progress: summary,
       failure: null,
       build: { ...spec, phase: "holding", origin: null, facing: null, summary, total: 0, placed: 0, holdMode: "sleep" },
+    };
+    return this.launch(job, summary, {}, (j, c) => this.runBuildJob(j, c));
+  }
+
+  /** No bed: dig a 1x2 pocket into the ground / a hillside, seal it and wait inside. No builder, no materials phase. */
+  private launchPocket(spec: BuildSpec, pocket: PocketPlan, requestedBy: string | null): AchieveResult {
+    const now = this.now();
+    const summary = `dig in for the night (${pocket.summary}), wait inside until morning`;
+    const job: Job = {
+      id: newJobId(now),
+      kind: "build",
+      goals: [],
+      requestedBy,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      plan: { goals: [], steps: [], rawNeeds: {}, unresolved: [], summary: "" },
+      stepIndex: 0,
+      replans: 0,
+      progress: summary,
+      failure: null,
+      build: { ...spec, phase: "holding", origin: null, facing: null, summary, total: 0, placed: 0, holdMode: "pocket", pocket },
     };
     return this.launch(job, summary, {}, (j, c) => this.runBuildJob(j, c));
   }
@@ -896,7 +933,7 @@ export class JobRunner {
     }
     const live = (): boolean => job.status === "running" && !ctrl.signal.aborted;
     const deadline = job.startedAt + JOB_MAX_MS;
-    if (state.holdMode === "sleep") {
+    if (state.holdMode === "sleep" || state.holdMode === "pocket") {
       await this.runNightHold(job, ctrl);
       return;
     }
@@ -1075,11 +1112,18 @@ export class JobRunner {
     const mode = state.holdMode ?? "shelter";
     state.phase = "holding";
     this.buildReserve = {}; // the shelter is done; whatever is left is free to use
-    this.setProgress(job, mode === "sleep" ? "sleeping until morning" : "inside the shelter, waiting for dawn");
+    this.setProgress(job, mode === "sleep" ? "sleeping until morning" : mode === "pocket" ? "digging in for the night" : "inside the shelter, waiting for dawn");
     const ctx: StepRunContext = { signal: ctrl.signal, radius: SCAN_RADII[0], baseline: 0, jobId: job.id };
     let exec: () => Promise<StepResult>;
     if (mode === "sleep") exec = () => night.sleepThrough(ctx);
-    else {
+    else if (mode === "pocket") {
+      const plan = state.pocket;
+      if (!plan || !night.digInThrough) {
+        this.finish(job, "failed", { kind: "internal", step: PHASE_STEP, detail: "dig-in plan missing", attempts: 1 });
+        return;
+      }
+      exec = () => night.digInThrough!(plan, ctx);
+    } else {
       if (!state.origin || !state.facing) {
         this.finish(job, "failed", { kind: "internal", step: PHASE_STEP, detail: "shelter position unknown", attempts: 1 });
         return;
