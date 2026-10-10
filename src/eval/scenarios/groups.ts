@@ -202,7 +202,7 @@ export const crBuildHouse: Scenario = {
     await ctx.fill(box({ x: ctx.site.x - 10, y: ctx.site.y - 1, z: ctx.site.z - 10 }, { x: ctx.site.x + 10, y: ctx.site.y - 1, z: ctx.site.z + 10 }), "grass_block");
     await ctx.fill(box({ x: ctx.site.x - 10, y: ctx.site.y, z: ctx.site.z - 10 }, { x: ctx.site.x + 10, y: ctx.site.y + 8, z: ctx.site.z + 10 }), "air");
   },
-  run: (ctx) => ask(ctx, "steve, build me a small house with a door right here"),
+  run: (ctx) => ask(ctx, "steve, build me a small house with a door right here", { confirm: true }),
   check: houseBuilt,
   dryWin: houseWin,
 };

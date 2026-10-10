@@ -79,7 +79,7 @@ export const buildHouse: Scenario = {
     await ctx.give(ctx.bot, "oak_door", 1);
     await ctx.give(ctx.bot, "glass", 4);
   },
-  run: (ctx) => ask(ctx, "steve, build a small house here"),
+  run: (ctx) => ask(ctx, "steve, build a small house here", { confirm: true }),
   check: houseBuilt,
   dryWin: houseWin,
 };
@@ -97,7 +97,7 @@ export const wheatFarm: Scenario = {
     await ctx.give(ctx.bot, "wheat_seeds", 16);
     await ctx.setBlock(ctx.at(0, -1, 3), "water");
   },
-  run: (ctx) => ask(ctx, "steve, set up a small wheat farm here"),
+  run: (ctx) => ask(ctx, "steve, set up a small wheat farm here", { confirm: true }),
   async check(ctx) {
     const n = await ctx.countBlocks(around(ctx.site, 10, -2, 3), "wheat");
     return { ok: n >= 9, score: Math.min(1, n / 9), detail: `${n}/9 wheat crops within 10 blocks` };
@@ -121,7 +121,7 @@ export const portal: Scenario = {
     await ctx.give(ctx.bot, "obsidian", 10);
     await ctx.give(ctx.bot, "flint_and_steel", 1);
   },
-  run: (ctx) => ask(ctx, "steve, build a nether portal here"),
+  run: (ctx) => ask(ctx, "steve, build a nether portal here", { confirm: true }),
   async check(ctx) {
     const n = await ctx.countBlocks(around(ctx.site, 12, -2, 8), "nether_portal");
     return { ok: n >= 1, detail: `${n} nether_portal blocks within 12` };

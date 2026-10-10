@@ -6,10 +6,16 @@ import type { ScenarioResult } from "./types.js";
 export function loadResults(runDir: string): ScenarioResult[] {
   const p = join(runDir, "results.jsonl");
   if (!existsSync(p)) throw new Error(`${p} not found`);
-  return readFileSync(p, "utf8")
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((l) => JSON.parse(l) as ScenarioResult);
+  // results.jsonl is append-only (re-runs add lines); the last line per (id, repeat) wins.
+  const byKey = new Map<string, ScenarioResult>();
+  for (const l of readFileSync(p, "utf8").split("\n")) {
+    if (!l.trim()) continue;
+    const r = JSON.parse(l) as ScenarioResult;
+    const key = `${r.id}#${r.repeat}`;
+    byKey.delete(key);
+    byKey.set(key, r);
+  }
+  return [...byKey.values()];
 }
 
 export const median = (xs: number[]): number | null => {
