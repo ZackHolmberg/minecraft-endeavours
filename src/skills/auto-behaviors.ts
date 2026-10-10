@@ -7,8 +7,15 @@
  *  - Auto-eat: eat when hungry, before health regen stops.
  *  - Armor: wear better armor pieces as soon as they're picked up.
  *  - Defensive swing: hit back at a hostile mob that just hurt us, if it's
- *    within reach and we're idle. No pathing — never fights the agent for
- *    control of movement.
+ *    within reach. No pathing — never fights the agent for control of
+ *    movement. It also fires while a job skill (mining, building, walking) is
+ *    in flight: standing still being hit because a dig is "busy" is how the
+ *    bot died in the night test. Skills that fight / eat / sleep themselves
+ *    are left alone, and so is `build` (the Builder owns the bot's hands and
+ *    fights between its actions: a reflex swapping to the sword mid-placement
+ *    made placements fail with "refused to place stone_sword").
+ *  - Weapon ready: at night, with a hostile mob within a few blocks and the
+ *    bot idle, put the best sword/axe in hand (before it gets hit).
  *  - Breath / suffocation (`survivalTick`): the one reflex that does NOT wait
  *    for the agent. Low oxygen (<= SURFACE_AT of 20), or a swim that the
  *    remaining air will not cover, interrupts whatever movement is running,
@@ -220,10 +227,56 @@ export function noteHurt(bot: Bot, attacker: Entity | undefined): void {
   lastHurtBy.set(bot, { attackerId: attacker?.id ?? null, at: Date.now() });
 }
 
+/** Skills that already handle a threat, eating or sleeping: the defensive swing leaves them alone. */
+const OWN_THREAT_HANDLING = new Set(["attack", "flee", "eat", "sleepIn", "fish", "build"]);
+
+/** Busy for the defensive swing: a window open, a reflex mid-flight, or a skill that fights / eats / sleeps itself. */
+export function defendBlocked(bot: Bot, state: BotState): boolean {
+  if (bot.currentWindow !== null || reflexLocks.has(bot.username) || bot.usingHeldItem) return true;
+  const tool = state.currentTool.current();
+  return tool !== null && OWN_THREAT_HANDLING.has(tool.name);
+}
+
+const ARM_RANGE = 6;
+const ARM_RETRY_MS = 3_000;
+const lastArm = new WeakMap<Bot, number>();
+
+/** Night = mobs spawn in the open (dusk ~12500 to dawn ~23500). */
+export function isDarkHours(timeOfDay: number | undefined | null): boolean {
+  return typeof timeOfDay === "number" && timeOfDay >= 12_500 && timeOfDay < 23_500;
+}
+
+/** Idle at night with a hostile mob within {@link ARM_RANGE}: hold the best weapon. */
+export function armTick(bot: Bot, state: BotState): void {
+  if (!bot.entity || bot.health <= 0 || bot.isSleeping || isCreative(bot)) return;
+  if (!isDarkHours((bot as { time?: { timeOfDay?: number } }).time?.timeOfDay)) return;
+  if (isBusy(bot, state)) return; // mid-dig / mid-walk: the swing reflex re-equips when it matters
+  const me = bot.entity.position;
+  let near = false;
+  for (const e of Object.values(bot.entities)) {
+    if (!e || e === bot.entity || !isHostile(e)) continue;
+    if (me.distanceTo(e.position) <= ARM_RANGE) {
+      near = true;
+      break;
+    }
+  }
+  if (!near) return;
+  const weapon = pickBestWeapon(bot);
+  if (!weapon || bot.heldItem?.type === weapon.type) return;
+  const now = Date.now();
+  if (now - (lastArm.get(bot) ?? 0) < ARM_RETRY_MS) return;
+  lastArm.set(bot, now);
+  void withReflexLock(bot.username, async () => {
+    await bot.equip(weapon, "hand");
+    recordEvent(bot.username, { kind: "reflex", reflex: "defend", detail: `readied ${weapon.name}` });
+  });
+}
+
 export function defendTick(bot: Bot, state: BotState): void {
+  armTick(bot, state);
   const hurt = lastHurtBy.get(bot);
   if (!hurt || Date.now() - hurt.at > DEFEND_WINDOW_MS || isCreative(bot)) return;
-  if (!bot.entity || bot.health <= 0 || bot.isSleeping || isBusy(bot, state)) return;
+  if (!bot.entity || bot.health <= 0 || bot.isSleeping || defendBlocked(bot, state)) return;
 
   // Prefer whoever hit us (if it's a hostile mob); else the nearest hostile.
   const me = bot.entity.position;

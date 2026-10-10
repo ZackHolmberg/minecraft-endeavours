@@ -100,7 +100,7 @@ export function findSite(grid: WorldGrid, req: SiteRequest): SiteChoice | SiteFa
   const height = req.height ?? fp.height;
   const R = req.radius ?? DEFAULT_RADIUS;
   const isFarm = req.kind === "farm";
-  const margin = req.kind === "house" ? 1 : req.kind === "portal" ? 2 : 0;
+  const margin = req.kind === "house" || req.kind === "shelter" ? 1 : req.kind === "portal" ? 2 : 0;
   const maxSlope = isFarm ? 0 : 1;
   const yTop = req.anchor.y + height + 6;
   const yBottom = req.anchor.y - 8;

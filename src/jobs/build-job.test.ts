@@ -3,7 +3,7 @@ import type { Bot } from "mineflayer";
 import type { FailureKind, Goal, Plan, Step, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import { formatJobEvent, jobContextLines } from "./describe.js";
-import { JobRunner, type BuildDeps, type BuildHistory, type BuildRunContext, type DeliverFn, type RunnerDeps } from "./runner.js";
+import { JobRunner, type BuildDeps, type BuildHistory, type BuildRunContext, type DeliverFn, type NightDeps, type RunnerDeps } from "./runner.js";
 import type { BuildOutcome, BuildPrep, BuildSpec, Job, StepResult } from "./types.js";
 
 const gather = (item: string, count: number): Step => ({ op: "gather", item, count, blocks: [item], tool: null });
@@ -47,6 +47,7 @@ function harness(o: {
   step?: () => StepResult;
   history?: BuildHistory;
   onBuildEnd?: (j: Job) => void;
+  night?: NightDeps;
 }): H {
   const h: H = { events: [], ended: [], prepares: [], reserved: [], ctxs: [], runs: 0, delivered: [], runner: null as never };
   const plans = [...(o.plans ?? [mkPlan([])])];
@@ -82,6 +83,7 @@ function harness(o: {
     onBuildEnd: o.onBuildEnd,
     build,
     deliver,
+    ...(o.night ? { night: o.night } : {}),
   };
   h.runner = new JobRunner(deps);
   return h;
@@ -546,5 +548,97 @@ describe("createDeliver (fake bot)", () => {
     const res = await createDeliver(bot as unknown as Bot)("Tester", [{ item: "torch", count: 64 }], ctx());
     expect(res).toMatchObject({ ok: true });
     expect(creative.getItems).toHaveBeenCalledWith(bot, { items: [{ name: "torch", count: 64 }] });
+  });
+});
+
+
+describe("survive the night job", () => {
+  const NIGHT_SPEC: BuildSpec = { blueprint: "shelter", params: { wall: "dirt", door: false }, anchor: { x: 0, y: 64, z: 0 }, avoid: [], hold: "night" };
+  const mkNight = (o: { time?: number | null; bed?: string | null; sleep?: () => Promise<StepResult>; hold?: (geo: unknown) => Promise<StepResult> } = {}) => {
+    const calls: string[] = [];
+    const geos: unknown[] = [];
+    const night: NightDeps = {
+      timeOfDay: () => (o.time === undefined ? 13_000 : o.time),
+      findBed: () => (o.bed === undefined ? null : o.bed),
+      sleepThrough: async () => {
+        calls.push("sleep");
+        return o.sleep ? o.sleep() : { ok: true, detail: "slept" };
+      },
+      holdInShelter: async (geo) => {
+        calls.push("hold");
+        geos.push(geo);
+        return o.hold ? o.hold(geo) : { ok: true, detail: "waited out the night in a plugged shelter" };
+      },
+    };
+    return { night, calls, geos };
+  };
+  const shelterPrep = (): BuildPrep => prepOk([], { params: { wall: "dirt", door: false }, summary: "5x5 dirt shelter at (3, 64, 3)", total: 57 });
+
+  it("no bed: builds the shelter, then holds inside it until dawn, then ends done with the night's account", async () => {
+    const n = mkNight();
+    const h = harness({ night: n.night, prepare: shelterPrep, run: () => ({ ok: true, placed: 55, total: 55, detail: "built" }) });
+    const r = await h.runner.startBuild(NIGHT_SPEC, "Tester");
+    expect(r.ok).toBe(true);
+    await until(() => h.ended.length === 1);
+    const job = h.runner.current()!;
+    expect(job.status).toBe("done");
+    expect(n.calls).toEqual(["hold"]);
+    expect(job.build).toMatchObject({ blueprint: "shelter", hold: "night", phase: "holding", holdDetail: expect.stringContaining("night") });
+    expect(h.events.filter((e) => e.kind === "step").map((e) => (e as { op: string }).op)).toEqual(["build", "hold"]);
+    expect(formatJobEvent(h.ended[0]!)).toMatch(/^\[job finished\] survived the night/);
+    // geometry handed to the executor comes from the stored site
+    expect(n.geos[0]).toMatchObject({ hasDoor: false, wall: "dirt" });
+  });
+
+  it("a bed at hand: sleeps, never builds", async () => {
+    const n = mkNight({ bed: "white_bed at (1, 64, 1)" });
+    const h = harness({ night: n.night });
+    const r = await h.runner.startBuild(NIGHT_SPEC, null);
+    expect(r.ok).toBe(true);
+    expect(r.message).toMatch(/sleep in white_bed/);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.status).toBe("done");
+    expect(n.calls).toEqual(["sleep"]);
+    expect(h.runs).toBe(0);
+    expect(h.prepares).toHaveLength(0);
+  });
+
+  it("useBed:false ignores the bed and builds", async () => {
+    const n = mkNight({ bed: "white_bed at (1, 64, 1)" });
+    const h = harness({ night: n.night, prepare: shelterPrep });
+    await h.runner.startBuild({ ...NIGHT_SPEC, params: { ...NIGHT_SPEC.params, useBed: false } }, null);
+    await until(() => h.ended.length === 1);
+    expect(n.calls).toEqual(["hold"]);
+    expect(h.runs).toBe(1);
+  });
+
+  it("refuses in daytime without touching anything", async () => {
+    const n = mkNight({ time: 5_000, bed: "white_bed at (1, 64, 1)" });
+    const h = harness({ night: n.night });
+    const r = await h.runner.startBuild(NIGHT_SPEC, null);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/daytime/);
+    expect(h.runner.isRunning()).toBe(false);
+  });
+
+  it("a shelter that cannot be entered fails the job with the reason (no silent pass)", async () => {
+    const n = mkNight({ hold: async () => ({ ok: false, failure: { kind: "unreachable", step: { op: "place_station", block: "crafting_table" }, detail: "couldn't shelter: couldn't get inside", attempts: 1 } }) });
+    const h = harness({ night: n.night, prepare: shelterPrep });
+    await h.runner.startBuild(NIGHT_SPEC, null);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.status).toBe("failed");
+    expect(h.runner.current()!.failure).toMatchObject({ kind: "unreachable" });
+  });
+
+  it("death while holding ends failed(died) even though the job has no plan steps", async () => {
+    let release: (r: StepResult) => void = () => {};
+    const n = mkNight({ bed: "white_bed at (1, 64, 1)", sleep: () => new Promise<StepResult>((r) => (release = r)) });
+    const h = harness({ night: n.night });
+    await h.runner.startBuild(NIGHT_SPEC, null);
+    await until(() => n.calls.length === 1);
+    h.runner.notifyStop("death");
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.failure!.kind).toBe("died");
+    release({ ok: false, failure: { kind: "died", step: { op: "place_station", block: "crafting_table" }, detail: "x", attempts: 1 } });
   });
 });

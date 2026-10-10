@@ -12,12 +12,13 @@ import type { BotState } from "../state/index.js";
 import { loadJson, memoryFileFor, saveJsonAtomic } from "../state/persist.js";
 import { clearReserved, reservedSnapshot, setReserved } from "../state/reservations.js";
 import { formatJobEvent } from "./describe.js";
-import { createExplorer } from "./explore.js";
+import { createExplorer, createRelocator } from "./explore.js";
 import { buildLedgerFor, ledgerFor } from "./ledger.js";
 import { registerJobRunner, unregisterJobRunner } from "./registry.js";
 import { JobRunner } from "./runner.js";
 import { createBuildDeps } from "./steps/build.js";
 import { createDeliver } from "./steps/deliver.js";
+import { createNightDeps } from "./steps/night.js";
 import { createStepExecutor } from "./steps/index.js";
 import { itemCount, slotDump } from "./steps/util.js";
 import type { Facing } from "../build/types.js";
@@ -55,17 +56,20 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     username,
     plan,
     // the ladder's first radius (64) is the gather default; the view scan itself starts at 48
-    buildView: async (goals, radius) => {
+    buildView: async (goals, radius, exclude) => {
       const t0 = Date.now();
-      const view = await buildWorldView(bot, goals, radius <= 64 ? DEFAULT_SCAN_RADIUS : radius);
+      const view = await buildWorldView(bot, goals, radius <= 64 ? DEFAULT_SCAN_RADIUS : radius, exclude);
       const near = Object.entries(view.nearbyBlocks).map(([k, v]) => `${k}:${v.nearest}`).join(",");
       console.log(`[${username}] job view (${Date.now() - t0}ms, r=${radius}): inv=${JSON.stringify(view.inventory)} near=${near} stations=${JSON.stringify(view.stations)} slots=[${slotDump(bot)}]`);
       return view;
     },
     execute: createStepExecutor(bot),
     explore: createExplorer(bot),
+    relocate: createRelocator(bot),
+    position: () => ({ x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) }),
     build: createBuildDeps(bot),
     deliver: createDeliver(bot),
+    night: createNightDeps(bot),
     countItem: (item) => itemCount(bot, item),
     reserve: (items) => {
       if (items) {

@@ -376,3 +376,33 @@ describe("blueprint registry", () => {
     expect(buildBlueprint("farm", { size: 3 }, "south").kind).toBe("farm");
   });
 });
+
+describe("shelter: site, prepare, materials", () => {
+  const anchor = { x: 0, y: 64, z: 0 };
+  const spec = (wall: string, door = false) => ({ blueprint: "shelter" as const, params: { wall, door }, anchor, avoid: [anchor] });
+  it("sited beside the requester on flat ground; 55 blocks + a 2-block plug when door-less", () => {
+    const r = prepare({ grid: flatWorld(), inv: { dirt: 80 }, creative: false, spec: spec("dirt"), existing: null, botPos: { x: 0, y: 64, z: 0 } });
+    if (!r.ok) throw new Error(r.detail);
+    expect(r.total).toBe(55);
+    expect(r.missing).toEqual([]);
+    expect(r.needs.consumed["dirt"]).toBe(55 + 2 + r.order.scaffolds);
+    // never on top of the requester
+    const o = r.origin;
+    expect(anchor.x >= o.x - 1 && anchor.x <= o.x + 5 && anchor.z >= o.z - 1 && anchor.z <= o.z + 5).toBe(false);
+    // the doorway stays free of blocks
+    const cells = new Set(r.remaining.map(cellKey));
+    for (const c of r.bp.clear) expect(cells.has(cellKey({ x: c.x + o.x, y: c.y + o.y, z: c.z + o.z }))).toBe(false);
+  });
+  it("a dirt shelter with no dirt: the executor digs it itself (no planner goal)", () => {
+    const r = prepare({ grid: flatWorld(), inv: { stone_sword: 1 }, creative: false, spec: spec("dirt"), existing: null, botPos: { x: 0, y: 64, z: 0 } });
+    if (!r.ok) throw new Error(r.detail);
+    expect(r.missing).toEqual([]);
+    expect(r.needs.selfSupply).toMatchObject({ item: "dirt" });
+    expect(r.needs.selfSupply!.count).toBeGreaterThanOrEqual(57);
+  });
+  it("a cobblestone shelter with none: planner goals for the stone", () => {
+    const r = prepare({ grid: flatWorld(), inv: { stone_pickaxe: 1 }, creative: false, spec: spec("cobblestone"), existing: null, botPos: { x: 0, y: 64, z: 0 } });
+    if (!r.ok) throw new Error(r.detail);
+    expect(r.missing.find((m) => m.item === "cobblestone")?.count ?? 0).toBeGreaterThanOrEqual(55);
+  });
+});

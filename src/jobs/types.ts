@@ -8,6 +8,7 @@
  */
 import type { Facing, BlueprintKind } from "../build/types.js";
 import type { FailureKind, Goal, Plan, Step, StepFailure, Vec3 } from "../planner/types.js";
+import type { Exhausted } from "./exhausted.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
 
@@ -21,6 +22,8 @@ export interface BuildSpec {
   anchor: Vec3;
   /** Player positions the footprint must not cover. */
   avoid: Vec3[];
+  /** "night": after the build, get inside, close up, light and wait for dawn (shelter blueprint; `surviveNight`). */
+  hold?: "night";
 }
 
 /** A temporary support block the builder placed (and must remove again). Persisted so a crash/stop can't orphan it. */
@@ -30,7 +33,7 @@ export interface ScaffoldCell extends Vec3 {
 
 /** Live state of a build job (persisted with the job). */
 export interface BuildState extends BuildSpec {
-  phase: "materials" | "building";
+  phase: "materials" | "building" | "holding";
   /** Chosen once at start; retries and resumes reuse them so a half-built house isn't mistaken for a player build. */
   origin: Vec3 | null;
   facing: Facing | null;
@@ -39,6 +42,10 @@ export interface BuildState extends BuildSpec {
   placed: number;
   /** True when this job continues an earlier failed/cancelled build at its stored origin (no re-siting). */
   resumed?: boolean;
+  /** hold === "night": sleep in a bed that was at hand instead of building a shelter. */
+  holdMode?: "sleep" | "shelter";
+  /** How the night went (set when the hold phase ends), for the job event. */
+  holdDetail?: string;
 }
 
 /** `prepare` result: the site, blueprint and materials gap, or why the build cannot start. */
@@ -91,6 +98,10 @@ export interface Job {
   progress: string;
   /** Set when status is failed. */
   failure: StepFailure | null;
+  /** Areas where gathers already failed (unreachable ores etc.): skipped by later gathers and scans, left by `relocate`. */
+  exhausted?: Exhausted;
+  /** Surface relocations done this job (bounded by `MAX_RELOCATIONS`). */
+  relocations?: number;
 }
 
 /** What `achieve` returns to Haiku (JSON-stringified into the tool result). */
@@ -103,8 +114,11 @@ export interface AchieveResult {
   unresolved?: Plan["unresolved"];
 }
 
+/** A step failure; gathers also report which block positions they gave up on ("x,y,z"). */
+export type JobStepFailure = StepFailure & { positions?: string[] };
+
 /** Outcome of executing one step. */
-export type StepResult = { ok: true; detail: string } | { ok: false; failure: StepFailure };
+export type StepResult = { ok: true; detail: string } | { ok: false; failure: JobStepFailure };
 
 /** Executes one step against the live bot. Implementations live in src/jobs/steps/. */
 export type StepExecutor = (step: Step, signal: AbortSignal) => Promise<StepResult>;

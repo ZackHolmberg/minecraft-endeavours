@@ -101,6 +101,8 @@ export interface MineBlocksParams {
   maxDistance?: number;
   /** Also mine blocks that look like part of a player-built structure. Only when a player asked for demolition. */
   allowStructures?: boolean;
+  /** Positions the caller already knows are unreachable (a job's exhausted area): never chosen as candidates. */
+  exclude?: (x: number, y: number, z: number) => boolean;
 }
 
 /**
@@ -150,6 +152,7 @@ async function mineBlocksInner(
     maxCount = MINE_BLOCKS_DEFAULT_MAX_COUNT,
     maxDistance = SEARCH_RADIUS,
     allowStructures = false,
+    exclude,
   }: MineBlocksParams,
   creative: boolean,
 ): Promise<SkillResult> {
@@ -310,6 +313,8 @@ async function mineBlocksInner(
         gained: inventoryGain(baseline, inventoryCounts(bot)),
         unreachable: unreachable.size,
         unreachableTypes,
+        /** "x,y,z" of every block this call gave up on (a job remembers them so the next gather skips them). */
+        unreachablePositions: [...unreachable.keys()],
         position: posOf(bot),
         ...extra,
       },
@@ -321,7 +326,7 @@ async function mineBlocksInner(
       return finish(mined > 0, `mining cancelled${mined > 0 ? ": {summary}" : ""}`, { cancelled: true });
     }
 
-    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, unreachable, fell);
+    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, unreachable, fell, exclude);
     // Done with a trunk (the next target is another tree, or none): sweep its drops before moving on.
     if (fell.lastTree && !creative && (!block || !fell.lastTree.has(posKey(block.position)))) {
       if (mined > 0 && collectedNow() < mined && !cancellation?.isRequested()) await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS }, { freeStuck: felling });
@@ -339,7 +344,7 @@ async function mineBlocksInner(
         return {
           ok: false,
           message: `could not reach any ${types.length === 1 ? mineable[0]!.name : "of those blocks"} (${unreachable.size} tried; ${lastFailure}). Walk somewhere with open access to them or pick another spot.${protectedNote()}${reachNote()}`,
-          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, unreachableTypes, position: posOf(bot) },
+          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, unreachableTypes, unreachablePositions: [...unreachable.keys()], position: posOf(bot) },
         };
       }
       if (mined === 0) {
@@ -438,13 +443,15 @@ function findMineCandidate(
   protectedSeen: Map<string, { name: string; reason: string }>,
   skip: ReadonlyMap<string, unknown> = new Map(),
   fell?: FellCtx,
+  exclude?: (x: number, y: number, z: number) => boolean,
 ): Block | null {
   const positions = bot.findBlocks({
     point: bot.entity.position,
     matching: ids,
     maxDistance,
-    count: CANDIDATE_SCAN_COUNT + skip.size,
-  }).filter((p) => !skip.has(`${p.x},${p.y},${p.z}`));
+    // an excluded area can hold many matches: look further down the nearest-first list
+    count: (exclude ? CANDIDATE_SCAN_COUNT * 4 : CANDIDATE_SCAN_COUNT) + skip.size,
+  }).filter((p) => !skip.has(`${p.x},${p.y},${p.z}`) && !exclude?.(p.x, p.y, p.z));
   // Tall trees fill the nearest-N with canopy logs; scan more when logs are wanted so a short tree beyond it is seen.
   if (fell && !allowStructures && ids.some((id) => isTreeLogName(bot.registry.blocks[id]?.name ?? ""))) {
     const more = bot.findBlocks({
@@ -452,7 +459,7 @@ function findMineCandidate(
       matching: ids,
       maxDistance,
       count: LOG_SCAN_COUNT + skip.size,
-    }).filter((p) => !skip.has(`${p.x},${p.y},${p.z}`));
+    }).filter((p) => !skip.has(`${p.x},${p.y},${p.z}`) && !exclude?.(p.x, p.y, p.z));
     if (more.length > positions.length) positions.splice(0, positions.length, ...more);
   }
   rankAvoidingPits(bot, positions);

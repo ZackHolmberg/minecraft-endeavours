@@ -28,6 +28,7 @@ import { getItems } from "../../skills/creative.js";
 import { flyTo, isFlying, land } from "../../skills/flight.js";
 import { isCreative } from "../../skills/game-mode.js";
 import { pickUpNearby } from "../../skills/inventory.js";
+import { fightNearbyHostiles } from "../../skills/melee-guard.js";
 import { activateBlock } from "../../skills/interaction.js";
 import { navigate } from "../../skills/navigation.js";
 import { ensureMovements, type BotWithPathfinder } from "../../skills/pathfinder-config.js";
@@ -386,7 +387,14 @@ class Builder {
     return this.outcome(false, "build_incomplete", `placed ${placed}/${total} blocks (missing: ${roles}); ${this.lastError}`.trim());
   }
 
+  /** Between actions: a mob on top of the bot gets fought first (the swing reflex stays out of the Builder, see auto-behaviors). */
+  private async guard(): Promise<void> {
+    if (this.creative || this.cleaning) return;
+    await fightNearbyHostiles(this.bot, () => this.stopped());
+  }
+
   private async perform(a: BuildAction): Promise<boolean> {
+    await this.guard();
     switch (a.op) {
       case "place":
         return this.placeCell(a.p);
@@ -621,16 +629,23 @@ class Builder {
 
   /** Dig natural ground (outside the site) until the inventory holds `want` of `item` (dirt). */
   private async acquire(item: string, want: number): Promise<boolean> {
-    for (let tries = 0; tries < 10 && (this.inv()[item] ?? 0) < want; tries++) {
+    const maxTries = Math.max(10, Math.ceil(want * 1.6)); // a dirt shelter needs ~60 blocks, a portal's scaffold 1-3
+    let failed = 0;
+    for (let tries = 0; tries < maxTries && (this.inv()[item] ?? 0) < want && failed < 8; tries++) {
       if (this.stopped()) return false;
       const c = this.pickDigCell();
       if (!c) {
         this.lastError = "no diggable ground near the site";
         break;
       }
+      await this.guard();
       const before = this.inv()[item] ?? 0;
-      if (!(await this.dig(c))) continue;
-      await this.collect(item, before);
+      if (!(await this.dig(c))) {
+        failed += 1;
+        continue;
+      }
+      if (!(await this.collect(item, before))) failed += 1;
+      else failed = 0;
     }
     return (this.inv()[item] ?? 0) >= want;
   }
@@ -646,6 +661,7 @@ class Builder {
           const c = { x: Math.floor(me.x) + dx, y: Math.floor(me.y) + dy - 1, z: Math.floor(me.z) + dz };
           const n = this.blockName(c);
           if (n !== "grass_block" && n !== "dirt") continue;
+          if (dx === 0 && dz === 0 && dy <= 0) continue; // never the block underfoot: digging it only digs the bot into a pit
           if (c.x >= this.origin.x - 3 && c.x < this.origin.x + this.dims.x + 3 && c.z >= this.origin.z - 3 && c.z < this.origin.z + this.dims.z + 3) continue;
           const above = this.blockName({ ...c, y: c.y + 1 });
           if (above === null || !(isAir(above) || isReplaceable(above))) continue;
@@ -654,7 +670,8 @@ class Builder {
             return q !== null && isCraftedBlockName(q);
           });
           if (crafted) continue;
-          const d = Math.hypot(c.x + 0.5 - me.x, c.z + 0.5 - me.z) + Math.abs(c.y - (Math.floor(me.y) - 1));
+          // fresh grass tops first: a second block down the same column deepens a pit instead of spreading the digging
+          const d = Math.hypot(c.x + 0.5 - me.x, c.z + 0.5 - me.z) + Math.abs(c.y - (Math.floor(me.y) - 1)) + (n === "dirt" ? 6 : 0);
           if (!best || d < best.d) best = { c, d };
         }
       }

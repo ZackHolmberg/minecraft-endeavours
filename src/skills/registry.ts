@@ -25,7 +25,7 @@
 
 import type { Bot } from "mineflayer";
 import { z } from "zod";
-import { achieve, build, cancelJob } from "../jobs/tools.js";
+import { achieve, build, cancelJob, surviveNight } from "../jobs/tools.js";
 import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
@@ -640,6 +640,16 @@ export const SKILL_SPECS: SkillSpec[] = [
       at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = beside the requesting player (default)"),
     },
     run: withParams("build", build, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "surviveNight",
+    description:
+      "Survive the night safely (call it at dusk, or when asked to 'survive the night', 'it's getting dark', 'stay safe tonight'). Background job: sleeps in a bed if one is within reach, otherwise builds a minimal 3x3 hut next to the player from dirt / cobblestone / planks, gets inside, closes the door (or plugs the doorway), lights a torch if it has one and waits there until dawn, defending itself if hit. Never just stand around outside at night. useBed:false builds the hut even when a bed is near (use it if sleeping failed). After it starts, reply briefly and end your turn — you get '[job finished]' at dawn or '[job failed]'. Don't call movement/building tools while it runs (that cancels it). Not for creative mode.",
+    schema: {
+      useBed: z.boolean().optional().describe("false = build a shelter even if a bed is at hand"),
+    },
+    run: withParams("surviveNight", surviveNight, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
   {

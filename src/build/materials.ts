@@ -11,6 +11,8 @@ export const SCAFFOLD_ITEMS = ["dirt", "cobblestone", "netherrack", "cobbled_dee
 const HOES = ["netherite_hoe", "diamond_hoe", "iron_hoe", "stone_hoe", "golden_hoe", "wooden_hoe"];
 /** Seeds a "small" farm should have in hand before starting (the rest of the plot is planted as seeds allow). */
 export const FARM_SEEDS_TARGET = 9;
+/** Blocks that close a door-less shelter's doorway from inside. */
+export const SHELTER_PLUG = 2;
 
 export interface NeedsOptions {
   creative: boolean;
@@ -77,6 +79,11 @@ export function computeNeeds(bp: Blueprint, inv: Record<string, number>, opts: N
     }
     consumed[item] = (consumed[item] ?? 0) + 1;
   }
+  // a door-less shelter is closed behind the bot with two wall blocks (the doorway is 2 high)
+  if (bp.kind === "shelter" && !bp.placements.some((p) => p.role === "door")) {
+    const wall = typeof bp.params.wall === "string" ? bp.params.wall : bp.placements.find((p) => p.role === "wall")?.block;
+    if (wall) consumed[wall] = (consumed[wall] ?? 0) + SHELTER_PLUG;
+  }
   // optional blocks (glass): only as many as the bot holds; creative has them all
   for (const [item, n] of Object.entries({ ...consumed })) {
     const p = bp.placements.find((q) => q.block === item && q.optional);
@@ -98,6 +105,11 @@ export function computeNeeds(bp: Blueprint, inv: Record<string, number>, opts: N
   for (const [item, n] of Object.entries(consumed)) {
     const short = n - (inv[item] ?? 0);
     if (short <= 0) continue;
+    // A dirt shelter's walls are dug by the executor too (planner gathers lose their drops on grass; `acquire` collects reliably)
+    if (bp.kind === "shelter" && item === "dirt" && !opts.creative) {
+      selfSupply = { item, count: short };
+      continue;
+    }
     if (item === scaffoldItem && item === "dirt" && !opts.creative) {
       const self = Math.min(short, scaff);
       selfSupply = { item, count: self };

@@ -166,7 +166,7 @@ async function runPortal(opts: { ctxOver?: Partial<BuildRunContext>; setup?: (ab
   return { deps, prep, ctx: c, saved, abort };
 }
 
-async function runKind(blueprint: "house" | "portal" | "farm", params: Record<string, unknown>, inv: Record<string, number>, creative = false, extra: Record<string, string> = {}, loseDrops = 0) {
+async function runKind(blueprint: "house" | "portal" | "farm" | "shelter", params: Record<string, unknown>, inv: Record<string, number>, creative = false, extra: Record<string, string> = {}, loseDrops = 0) {
   sim = { world: new Map(Object.entries(extra)), inv: { ...inv }, pos: new Vec3(0.5, 64, 0.5), creative, log: [], box: null, loseDrops };
   const { createBuildDeps } = await import("./build.js");
   const bot = fakeBot();
@@ -197,6 +197,39 @@ describe("Builder simulation", () => {
     expect(ys).toEqual([...ys].sort((a, b) => a - b));
     // the door gap stayed open until the door
     expect(prep.ok && records.some((r) => (r as { op?: string }).op === "layer")).toBe(true);
+  });
+
+  it("survival shelter (dirt, door-less): 55 blocks land, the doorway stays open for the bot to walk in, 2 dirt kept for the plug", async () => {
+    const { prep, out } = await runKind("shelter", { wall: "dirt", door: false }, { dirt: 70 });
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out, JSON.stringify(out)).toMatchObject({ ok: true, placed: 55, total: 55 });
+    const o = (prep as { origin: { x: number; y: number; z: number } }).origin;
+    const keys = [...sim.world.entries()].filter(([, n]) => n === "dirt").map(([c]) => c);
+    // roof is complete (25 cells) and the ring has exactly the 2-cell doorway missing
+    let roof = 0;
+    for (let x = 0; x < 5; x++) for (let z = 0; z < 5; z++) if (sim.world.get(k(o.x + x, o.y + 2, o.z + z)) === "dirt") roof++;
+    expect(roof).toBe(25);
+    let ringLow = 0;
+    for (let x = 0; x < 5; x++) for (let z = 0; z < 5; z++) if ((x === 0 || x === 4 || z === 0 || z === 4) && sim.world.get(k(o.x + x, o.y, o.z + z)) === "dirt") ringLow++;
+    expect(ringLow).toBe(15);
+    expect(keys.length).toBeGreaterThanOrEqual(55);
+    expect(sim.inv["dirt"]).toBeGreaterThanOrEqual(70 - 55 - 3); // plug blocks (and any scaffold reuse) are still in the inventory
+  });
+
+  it("dirt shelter with an empty inventory: digs ~58 dirt from the ground around, spread over many columns, then builds", async () => {
+    const { prep, out } = await runKind("shelter", { wall: "dirt", door: false }, {});
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out, JSON.stringify(out)).toMatchObject({ ok: true, placed: 55, total: 55 });
+    const digs = sim.log.filter((l) => l.op === "dig");
+    expect(digs.length).toBeGreaterThanOrEqual(57);
+    // no column dug deeper than 2 blocks (spread out, not one pit)
+    const perCol = new Map<string, number>();
+    for (const d of digs) {
+      const [x, , z] = d.at.split(",");
+      perCol.set(`${x},${z}`, (perCol.get(`${x},${z}`) ?? 0) + 1);
+    }
+    expect(Math.max(...perCol.values())).toBeLessThanOrEqual(2);
+    expect(sim.inv["dirt"]).toBeGreaterThanOrEqual(2); // the plug blocks are left over
   });
 
   it("survival portal: 10 obsidian, scaffolds placed and all removed again, lit", async () => {
