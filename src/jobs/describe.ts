@@ -70,6 +70,7 @@ export function formatJobEvent(job: Job): string | null {
   if (job.status === "done") {
     if (job.kind === "build" && job.build) {
       const b = job.build;
+      if (b.hold === "night") return `[job finished] survived the night — ${b.holdDetail || b.summary} (${dur})${who}. Reply with one short line (it's morning).`;
       return `[job finished] ${goals} — done in ${dur}, ${b.placed}/${b.total} blocks placed${who}. Reply with one short line saying it's built (and where, if useful).`;
     }
     if (job.deliverTo) return `[job finished] ${goals} — handed over in ${dur}${who}. Reply with one short line (they have it now).`;

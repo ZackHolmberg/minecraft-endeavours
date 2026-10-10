@@ -18,11 +18,12 @@ import type { Bot } from "mineflayer";
 import pathfinderPkg from "mineflayer-pathfinder";
 import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
+import { touchesLiquid } from "./exhausted.js";
 import { builtStructureReason } from "../skills/structure-guard.js";
 import { ensureMovements, type BotWithPathfinder } from "../skills/pathfinder-config.js";
 import { runSkill } from "../skills/harness.js";
 import { navigate } from "../skills/navigation.js";
-import type { ExploreFn, ExploreOutcome, GatherStep, StepRunContext } from "./runner.js";
+import type { ExploreFn, ExploreOutcome, GatherStep, RelocateFn, RelocateOutcome, StepRunContext } from "./runner.js";
 
 const { goals } = pathfinderPkg;
 
@@ -47,6 +48,14 @@ const RETURN_HOP = 40;
 const RETURN_MAX_HOPS = 8;
 const RETURN_MAX_MS = 3 * 60_000;
 const RETURN_ARRIVED = 6;
+/** Relocation (the explore-elsewhere rung): how far to go, how long it may take. */
+export const RELOCATE_MIN_DIST = 48;
+const RELOCATE_DISTANCES = [56, 72, 90] as const;
+const RELOCATE_BEARINGS = 16;
+const RELOCATE_SAMPLE_STEP = 8;
+const RELOCATE_MAX_MS = 4 * 60_000;
+const RELOCATE_MAX_TRIES = 4;
+const RELOCATE_FOUND_RADIUS = 32;
 
 // ── pure helpers ────────────────────────────────────────────────────────────
 
@@ -156,6 +165,135 @@ export function directionOrder(preferred: { dx: number; dz: number }): Array<{ d
   ];
 }
 
+// ── relocation (pure) ───────────────────────────────────────────────────────
+
+/** What the top of a column looks like. `null` from a {@link SurfaceFn} = chunk not loaded. */
+export interface SurfaceProbe {
+  y: number;
+  /** Water on top (a lake, a river): the bot would have to swim. */
+  wet: boolean;
+  /** Lava, magma, cactus, fire... */
+  hazard: boolean;
+}
+export type SurfaceFn = (x: number, z: number) => SurfaceProbe | null;
+
+export interface RelocationCandidate {
+  x: number;
+  z: number;
+  dist: number;
+  /** Bearing in radians (0 = +x, pi/2 = +z). */
+  bearing: number;
+  wetFraction: number;
+  score: number;
+}
+
+export interface RankOptions {
+  distances?: readonly number[];
+  bearings?: number;
+  /** Never plan a destination further than this (horizontally) from `origin` (default: `start`). */
+  maxFromOrigin?: number;
+  origin?: { x: number; z: number };
+  /** Surface ore that stands dry and exposed (see `Explorer.dryOres`): each cluster becomes a destination with a bonus. */
+  ores?: ReadonlyArray<{ x: number; z: number }>;
+}
+
+/** Score bonus of a destination that is next to dry, exposed ore. */
+export const ORE_BONUS = 40;
+const ORE_MIN_DIST = 40;
+
+/**
+ * Candidate destinations for "go somewhere else on dry land": a fan of bearings
+ * x distances from `start`. A candidate is dropped when its column is water,
+ * hazardous or unloaded, when any sample on the way is unloaded or hazardous,
+ * when it falls inside an exhausted region or beyond `maxFromOrigin`. The rest are
+ * scored: less water on the way is better, then directions pointing away from the
+ * exhausted areas, then a mild preference for ~64 blocks and for level ground.
+ * Best first. Pure over `surface`.
+ */
+export function rankRelocations(
+  surface: SurfaceFn,
+  start: { x: number; z: number },
+  regions: ReadonlyArray<{ x: number; z: number; r: number }>,
+  opts: RankOptions = {},
+): RelocationCandidate[] {
+  const distances = opts.distances ?? RELOCATE_DISTANCES;
+  const nb = opts.bearings ?? RELOCATE_BEARINGS;
+  const origin = opts.origin ?? start;
+  const maxFrom = opts.maxFromOrigin ?? MAX_FROM_START;
+  const here = surface(Math.round(start.x), Math.round(start.z));
+  const y0 = here?.y ?? 64;
+  // unit vector pointing away from the nearest exhausted centre
+  let awayX = 0;
+  let awayZ = 0;
+  let nearest = Infinity;
+  for (const g of regions) {
+    const d = Math.hypot(start.x - g.x, start.z - g.z);
+    if (d < nearest) {
+      nearest = d;
+      awayX = d > 0 ? (start.x - g.x) / d : 0;
+      awayZ = d > 0 ? (start.z - g.z) / d : 0;
+    }
+  }
+  const out: RelocationCandidate[] = [];
+  // fan of bearings x distances, plus one destination per cluster of dry exposed ore
+  const targets: Array<{ ux: number; uz: number; dist: number; dx: number; dz: number; bearing: number; bonus: number }> = [];
+  for (let b = 0; b < nb; b++) {
+    const bearing = (b * 2 * Math.PI) / nb;
+    const ux = Math.cos(bearing);
+    const uz = Math.sin(bearing);
+    for (const dist of distances) targets.push({ ux, uz, dist, dx: Math.round(start.x + ux * dist), dz: Math.round(start.z + uz * dist), bearing, bonus: 0 });
+  }
+  const seenCell = new Set<string>();
+  for (const o of opts.ores ?? []) {
+    const cell = `${Math.floor(o.x / 12)},${Math.floor(o.z / 12)}`;
+    if (seenCell.has(cell)) continue;
+    seenCell.add(cell);
+    const dist = Math.hypot(o.x - start.x, o.z - start.z);
+    if (dist < ORE_MIN_DIST) continue;
+    const ux = (o.x - start.x) / dist;
+    const uz = (o.z - start.z) / dist;
+    // stand a couple of blocks short of the ore, on the start's side
+    targets.push({ ux, uz, dist: Math.max(RELOCATE_SAMPLE_STEP, dist - 2), dx: Math.round(o.x - ux * 2), dz: Math.round(o.z - uz * 2), bearing: Math.atan2(uz, ux), bonus: ORE_BONUS });
+  }
+  for (const { ux, uz, dist, dx, dz, bearing, bonus } of targets) {
+    {
+      if (Math.hypot(dx - origin.x, dz - origin.z) > maxFrom) continue;
+      if (regions.some((g) => Math.hypot(dx - g.x, dz - g.z) <= g.r + 8)) continue;
+      let wet = 0;
+      let n = 0;
+      let bad = false;
+      let last: SurfaceProbe | null = null;
+      for (let t = RELOCATE_SAMPLE_STEP; t <= dist; t += RELOCATE_SAMPLE_STEP) {
+        const p = surface(Math.round(start.x + ux * t), Math.round(start.z + uz * t));
+        if (!p || p.hazard) {
+          bad = true;
+          break;
+        }
+        n += 1;
+        if (p.wet) wet += 1;
+        last = p;
+      }
+      const end = surface(dx, dz);
+      if (bad || !end || end.wet || end.hazard || !last) continue;
+      const wetFraction = n > 0 ? wet / n : 0;
+      const away = ux * awayX + uz * awayZ;
+      const score = 100 - wetFraction * 120 + away * 15 - Math.abs(dist - 64) * 0.2 - Math.abs(end.y - y0) * 0.3 + bonus;
+      out.push({ x: dx, z: dz, dist, bearing, wetFraction, score });
+    }
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
+/** Best few candidates that point in clearly different directions (a blocked bearing should not retry its neighbour). */
+export function distinctCandidates(c: readonly RelocationCandidate[], n: number, minAngle = Math.PI / 4): RelocationCandidate[] {
+  const out: RelocationCandidate[] = [];
+  for (const cand of c) {
+    if (out.every((o) => Math.abs(Math.atan2(Math.sin(o.bearing - cand.bearing), Math.cos(o.bearing - cand.bearing))) >= minAngle)) out.push(cand);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
 // ── bot-bound implementation ────────────────────────────────────────────────
 
 export function createExplorer(bot: Bot): ExploreFn {
@@ -183,6 +321,26 @@ export function createExplorer(bot: Bot): ExploreFn {
       { watchdogMs: null },
     );
     return outcome ?? { found: false, detail: "explore crashed" };
+  };
+}
+
+export function createRelocator(bot: Bot): RelocateFn {
+  return async (step: GatherStep, ctx: StepRunContext, regions): Promise<RelocateOutcome> => {
+    ensureMovements(bot as BotWithPathfinder);
+    const ids = step.blocks.map((b) => bot.registry.blocksByName[b]?.id).filter((i): i is number => i !== undefined);
+    const ex = new Explorer(bot, ids, ctx);
+    let outcome: RelocateOutcome = { moved: false, detail: "relocate did not run" };
+    await runSkill(
+      bot,
+      "explore",
+      { item: step.item, kind: "relocate" },
+      async () => {
+        outcome = await ex.relocate(regions);
+        return { ok: outcome.moved, message: `explore relocate: ${outcome.detail}` };
+      },
+      { watchdogMs: null },
+    );
+    return outcome;
   };
 }
 
@@ -253,8 +411,85 @@ class Explorer {
     return !!b && b.boundingBox === "empty" && !isLiquidName(b.name);
   };
 
+  /** A target block within `radius` that the job has not already found unreachable. */
   private targetNear(radius: number): boolean {
-    return this.bot.findBlock({ point: this.bot.entity.position, matching: this.ids, maxDistance: radius }) !== null;
+    const ex = this.ctx.exclude;
+    if (!ex) return this.bot.findBlock({ point: this.bot.entity.position, matching: this.ids, maxDistance: radius }) !== null;
+    return this.bot.findBlocks({ point: this.bot.entity.position, matching: this.ids, maxDistance: radius, count: 64 }).some((p) => !ex(p.x, p.y, p.z));
+  }
+
+  /** An ore block standing dry and exposed at the surface: air beside it, no water / lava touching it, top of its column within 4 blocks. */
+  private dryExposed(p: Vec3): boolean {
+    if (touchesLiquid(this.nameAt, p.x, p.y, p.z)) return false;
+    let air = false;
+    for (const [dx, dy, dz] of NEIGH) if (this.airLike(p.x + dx, p.y + dy, p.z + dz)) air = true;
+    if (!air) return false;
+    const top = this.surfaceAt(p.x, p.z);
+    return !!top && !top.wet && top.y - p.y <= 4;
+  }
+
+  /** Dry exposed target blocks the job has not written off, within `radius` of the bot. */
+  private dryOres(radius: number): Vec3[] {
+    const ex = this.ctx.exclude;
+    return this.bot
+      .findBlocks({ point: this.bot.entity.position, matching: this.ids, maxDistance: radius, count: 400 })
+      .filter((p) => !ex?.(p.x, p.y, p.z) && this.dryExposed(p));
+  }
+
+  /** Top of the column at (x,z), from the loaded chunks. */
+  private surfaceAt: SurfaceFn = (x, z) => {
+    const y0 = Math.floor(this.bot.entity.position.y);
+    for (let y = Math.min(y0 + 40, 318); y >= Math.max(y0 - 48, -60); y--) {
+      const b = this.bot.blockAt(new Vec3(x, y, z));
+      if (!b) return null;
+      if (b.name === "air" || b.name === "cave_air" || b.name === "void_air") continue;
+      if (isLiquidName(b.name)) return { y, wet: b.name === "water" || b.name === "flowing_water", hazard: b.name === "lava" || b.name === "flowing_lava" };
+      if (b.boundingBox === "empty") continue; // grass, flowers, snow layers, torches
+      return { y, wet: false, hazard: DANGER_FLOOR_RE.test(b.name) && !/water/.test(b.name) };
+    }
+    return null;
+  };
+
+  // ── relocate (explore elsewhere) ──
+  /**
+   * Leave an exhausted area: walk >= RELOCATE_MIN_DIST blocks over dry surface (pathfinder swims only at a
+   * steep cost) toward the best-ranked destination, falling back to the next distinct bearing when a leg is
+   * blocked, and stop early once a target block the job has not written off is in range. No return trip:
+   * the point is to gather over there.
+   */
+  async relocate(regions: ReadonlyArray<{ x: number; z: number; r: number }>): Promise<RelocateOutcome> {
+    const t0 = Date.now();
+    const start = this.start.clone();
+    const ores = this.dryOres(128);
+    const ranked = rankRelocations(this.surfaceAt, start, regions, { origin: start, ores });
+    const picks = distinctCandidates(ranked, RELOCATE_MAX_TRIES);
+    if (picks.length === 0) return { moved: false, detail: "no dry land to relocate to within range (water / unloaded chunks all around)" };
+    let note = "";
+    for (const c of picks) {
+      this.log(`relocating toward (${c.x}, ${c.z}) ${Math.round(c.dist)} blocks out, ${Math.round(c.wetFraction * 100)}% water on the way${c.score > 100 + ORE_BONUS - 30 ? ", dry ore there" : ""} (${ores.length} dry ore blocks in range)`);
+      while (!this.aborted && Date.now() - t0 < RELOCATE_MAX_MS) {
+        const p = this.bot.entity.position;
+        const left = horizontalDistance(p, c);
+        if (left <= 6) break;
+        const f = Math.min(SURFACE_HOP, left) / left;
+        const moved = await this.walkTo(p.x + (c.x - p.x) * f, p.z + (c.z - p.z) * f, "explore relocate");
+        if (!moved) {
+          note = `blocked at ${Math.round(this.fromStart())} blocks`;
+          break;
+        }
+        if (this.fromStart() >= RELOCATE_MIN_DIST && this.dryOres(RELOCATE_FOUND_RADIUS).length > 0) {
+          return { moved: true, detail: `dry target block in range ${Math.round(this.fromStart())} blocks from the old area` };
+        }
+      }
+      if (this.aborted) return { moved: this.fromStart() >= 16, detail: "cancelled" };
+      if (this.fromStart() >= RELOCATE_MIN_DIST) break;
+    }
+    const d = Math.round(this.fromStart());
+    const end = this.bot.entity.position;
+    return {
+      moved: d >= 32,
+      detail: `${d >= RELOCATE_MIN_DIST ? "relocated" : "only got"} ${d} blocks from the old area to (${Math.round(end.x)}, ${Math.round(end.y)}, ${Math.round(end.z)})${note ? `; ${note}` : ""}`,
+    };
   }
 
   private log(msg: string): void {

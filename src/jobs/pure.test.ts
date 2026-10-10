@@ -11,10 +11,10 @@ import { inventoryTotals, relevantBlockNames } from "./world-view.js";
 
 describe("auto-cancel policy", () => {
   it("exempts reads, talk, notes and job control", () => {
-    for (const t of ["say", "whisper", "observeSurroundings", "checkInventory", "remember", "setTaskQueue", "advanceTaskQueue", "achieve", "build", "cancelJob"]) {
+    for (const t of ["say", "whisper", "observeSurroundings", "checkInventory", "remember", "setTaskQueue", "advanceTaskQueue", "achieve", "build", "surviveNight", "cancelJob"]) {
       expect(shouldCancelJobFor(t, true)).toBe(false);
     }
-    expect([...JOB_EXEMPT_TOOLS]).toHaveLength(10);
+    expect([...JOB_EXEMPT_TOOLS]).toHaveLength(11);
   });
   it("cancels for movement / mining / crafting / building tools, only while a job runs", () => {
     for (const t of ["goTo", "mineBlock", "mineBlocks", "craft", "craftMany", "smelt", "placeBlocks", "followPlayer", "attack", "stop", "withdrawFromChest", "pillarUp"]) {

@@ -11,6 +11,7 @@ import { resolveItem } from "../skills/item-naming.js";
 import type { SkillResult } from "../skills/types.js";
 import { isOperatorItem } from "../skills/creative.js";
 import { isCreative } from "../skills/game-mode.js";
+import { holdsDoor, pickShelterWall } from "./night.js";
 import { goalsText } from "./describe.js";
 import { findPlayer } from "./steps/deliver.js";
 import { inventoryTotals } from "./world-view.js";
@@ -29,6 +30,7 @@ export const JOB_EXEMPT_TOOLS: ReadonlySet<string> = new Set([
   "advanceTaskQueue",
   "achieve",
   "build",
+  "surviveNight",
   "cancelJob",
 ]);
 
@@ -160,6 +162,41 @@ export async function build(bot: Bot, { blueprint, params, at }: BuildParams): P
     ok: res.ok,
     message: res.ok
       ? `build started: ${res.message}. It runs in the background; reply briefly and end your turn — you'll get a [job finished]/[job failed] message.`
+      : res.message,
+    state: res,
+  };
+}
+
+export interface SurviveNightParams {
+  /** false = never sleep in a bed, build a shelter even when a bed is at hand (default true: a bed at hand wins). */
+  useBed?: boolean;
+}
+
+/**
+ * Start the night job: sleep if a bed is at hand, else build a minimal shelter next to the
+ * requesting player (from dirt / cobblestone / planks, a door only if one is carried), get in,
+ * close up and wait for dawn. Returns at once like `build`.
+ */
+export async function surviveNight(bot: Bot, { useBed }: SurviveNightParams = {}): Promise<SkillResult> {
+  const runner = getJobRunner(bot.username);
+  if (!runner) return { ok: false, message: "the job runner isn't available right now" };
+  if (isCreative(bot)) return { ok: false, message: "creative mode: mobs can't hurt you, so there is nothing to survive. Just carry on." };
+  const requester = getCurrentConversationPartner(bot.username) ?? null;
+  const floor = (p: { x: number; y: number; z: number }) => ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) });
+  const reqEntity = requester ? bot.players[requester]?.entity : undefined;
+  const anchor = floor((reqEntity ?? bot.entity).position);
+  const avoid: Array<{ x: number; y: number; z: number }> = [];
+  for (const [name, p] of Object.entries(bot.players)) {
+    if (name === bot.username || !p.entity) continue;
+    if (p.entity.position.distanceTo(bot.entity.position) <= 48) avoid.push(floor(p.entity.position));
+  }
+  const inv = inventoryTotals(bot.inventory.slots);
+  const params: Record<string, unknown> = { wall: pickShelterWall(inv), door: holdsDoor(inv), ...(useBed === false ? { useBed: false } : {}) };
+  const res = await runner.startBuild({ blueprint: "shelter", params, anchor, avoid, hold: "night" }, requester);
+  return {
+    ok: res.ok,
+    message: res.ok
+      ? `night job started: ${res.message}. It runs in the background (building, then waiting inside until dawn); reply briefly and end your turn — you'll get a [job finished]/[job failed] message. Don't call movement/building tools while it runs (that cancels it).`
       : res.message,
     state: res,
   };

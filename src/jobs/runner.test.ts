@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { plan as realPlan } from "../planner/plan.js";
 import type { FailureKind, Goal, Plan, Step, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
-import { JobRunner, STEP_GRACE_MS, type ExploreOutcome, type RunnerDeps, type StepRunContext } from "./runner.js";
+import { JobRunner, STEP_GRACE_MS, type ExploreOutcome, type RelocateOutcome, type RunnerDeps, type StepRunContext } from "./runner.js";
 import type { Job, StepResult } from "./types.js";
 
 const gatherStep = (item: string, count: number, extra: Partial<Extract<Step, { op: "gather" }>> = {}): Step => ({
@@ -36,20 +36,27 @@ function harness(opts: {
   plans: Plan[];
   script: (step: Step, n: number, ctx: StepRunContext) => StepResult | Promise<StepResult>;
   explore?: (step: Step) => ExploreOutcome | Promise<ExploreOutcome>;
+  relocate?: (step: Step) => RelocateOutcome | Promise<RelocateOutcome>;
   load?: Job | null;
-  buildView?: () => Promise<WorldView>;
+  buildView?: RunnerDeps["buildView"];
+  onPlan?: (view: WorldView) => void;
 }): Harness {
   const h: Harness = { events: [], ended: [], saved: [], stops: 0, plans: [...opts.plans], calls: [], inv: {}, runner: null as never };
   let n = 0;
   const deps: RunnerDeps = {
     username: "bot",
-    plan: () => (h.plans.length > 1 ? h.plans.shift()! : h.plans[0]!),
+    plan: (_g, view) => {
+      opts.onPlan?.(view);
+      return h.plans.length > 1 ? h.plans.shift()! : h.plans[0]!;
+    },
     buildView: opts.buildView ?? (async () => VIEW),
     execute: async (step, ctx) => {
       h.calls.push({ step, ctx });
       return opts.script(step, n++, ctx);
     },
     explore: async (step) => (opts.explore ? opts.explore(step) : { found: false, detail: "nothing" }),
+    ...(opts.relocate ? { relocate: async (step: Step) => opts.relocate!(step) } : {}),
+    position: () => ({ x: 10, y: 64, z: 20 }),
     countItem: (item) => h.inv[item] ?? 0,
     requestStop: () => {
       h.stops++;
@@ -64,7 +71,7 @@ function harness(opts: {
 }
 
 const okRes = (d = "ok"): StepResult => ({ ok: true, detail: d });
-const failRes = (step: Step, kind: FailureKind, detail: string = kind): StepResult => ({ ok: false, failure: { kind, step, detail, attempts: 1 } });
+const failRes = (step: Step, kind: FailureKind, detail: string = kind, extra: { avoid?: string[]; positions?: string[] } = {}): StepResult => ({ ok: false, failure: { kind, step, detail, attempts: 1, ...extra } });
 const until = async (cond: () => boolean, ms = 2000): Promise<void> => {
   const t0 = Date.now();
   while (!cond()) {
@@ -450,5 +457,75 @@ describe("generic (tag) goals", () => {
     await h.runner.start([{ item: "oak_log", count: 1 }], null);
     await until(() => h.ended.length === 1);
     expect(h.runner.current()!.generic).toBeUndefined();
+  });
+});
+
+describe("explore-elsewhere recovery (relocate)", () => {
+  const POS = ["-313,53,-581", "-312,53,-580", "-312,52,-579", "-310,54,-577"];
+  const coal = (): Step => gatherStep("coal", 8, { blocks: ["coal_ore", "deepslate_coal_ore"] });
+
+  it("unreachable ore area: remembers the positions, relocates, rescans (no avoid), and gathers there", async () => {
+    const views: Array<{ exclude: boolean }> = [];
+    const avoidSeen: Array<string[] | undefined> = [];
+    const h = harness({
+      plans: [mkPlan([coal()]), mkPlan([coal()]), mkPlan([])],
+      script: (s, n, ctx) => (n === 0 ? failRes(s, "unreachable", "gave up after 6 unreachable coal_ore blocks", { avoid: ["coal_ore"], positions: POS }) : (expect(ctx.exclude?.(-313, 53, -581)).toBe(true), okRes())),
+      relocate: () => ({ moved: true, detail: "relocated 60 blocks" }),
+      onPlan: (v) => avoidSeen.push(v.avoidBlocks),
+      buildView: async (_g, _r, exclude) => {
+        views.push({ exclude: !!exclude });
+        return VIEW;
+      },
+    });
+    await h.runner.start([{ item: "coal", count: 8 }], null);
+    await until(() => h.ended.length === 1);
+    const job = h.runner.current()!;
+    expect(job.status).toBe("done");
+    expect(rungs(h).slice(0, 3)).toEqual(["relocate", "relocate", "replan"]); // decision, outcome, rescan
+    expect(job.relocations).toBe(1);
+    expect(job.exhausted!.positions).toEqual(POS);
+    expect(job.exhausted!.regions).toHaveLength(1);
+    expect(views.some((v) => v.exclude)).toBe(true);
+    expect(avoidSeen.every((a) => !a || !a.includes("coal_ore"))).toBe(true); // coal_ore was NOT put on the avoid list
+    // the retry after the move carries the exclusion
+    expect(h.calls.at(-1)!.ctx.exclude?.(-312, 52, -579)).toBe(true);
+    expect(h.calls.at(-1)!.ctx.exclude?.(0, 60, 0)).toBe(false);
+  });
+
+  it("is bounded: after MAX_RELOCATIONS the old avoid-and-replan rung takes over", async () => {
+    const h = harness({
+      plans: [mkPlan([coal()])],
+      script: (s) => failRes(s, "unreachable", "unreachable", { avoid: ["coal_ore"], positions: POS }),
+      relocate: () => ({ moved: true, detail: "moved" }),
+    });
+    await h.runner.start([{ item: "coal", count: 8 }], null);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.relocations).toBe(2);
+    expect(rungs(h).filter((r) => r === "relocate")).toHaveLength(4); // 2 x (decision + outcome)
+    expect(rungs(h)).toContain("replan");
+  });
+
+  it("a single unreachable block does not relocate (keeps the old ladder)", async () => {
+    const h = harness({
+      plans: [mkPlan([coal()]), mkPlan([])],
+      script: (s, n) => (n === 0 ? failRes(s, "unreachable", "no path", { positions: ["1,2,3"] }) : okRes()),
+      relocate: () => ({ moved: true, detail: "moved" }),
+    });
+    await h.runner.start([{ item: "coal", count: 8 }], null);
+    await until(() => h.ended.length === 1);
+    expect(rungs(h)).toEqual(["retry"]);
+    expect(h.runner.current()!.relocations).toBeUndefined();
+  });
+
+  it("a relocation that cannot move falls through to the avoid-and-replan rung", async () => {
+    const h = harness({
+      plans: [mkPlan([coal()]), mkPlan([gatherStep("coal", 8, { blocks: ["deepslate_coal_ore"] })]), mkPlan([])],
+      script: (s, n) => (n === 0 ? failRes(s, "unreachable", "unreachable", { avoid: ["coal_ore"], positions: POS }) : okRes()),
+      relocate: () => ({ moved: false, detail: "no dry land" }),
+    });
+    await h.runner.start([{ item: "coal", count: 8 }], null);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.status).toBe("done");
+    expect(rungs(h)[0]).toBe("relocate");
   });
 });

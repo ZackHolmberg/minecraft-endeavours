@@ -10,6 +10,7 @@ import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { plan as planGoals } from "../planner/plan.js";
 import type { Goal, WorldView } from "../planner/types.js";
 import { currentGameMode } from "../skills/game-mode.js";
+import { touchesLiquid, type ExcludeFn } from "./exhausted.js";
 import { isTreeLogName, speciesViewScore } from "../skills/tree-felling.js";
 
 export const DEFAULT_SCAN_RADIUS = 48;
@@ -88,7 +89,7 @@ function dimensionOf(bot: Bot): WorldView["dimension"] {
   return "overworld";
 }
 
-export async function buildWorldView(bot: Bot, goals: Goal[], radius: number = DEFAULT_SCAN_RADIUS): Promise<WorldView> {
+export async function buildWorldView(bot: Bot, goals: Goal[], radius: number = DEFAULT_SCAN_RADIUS, exclude?: ExcludeFn): Promise<WorldView> {
   const mode = currentGameMode(bot);
   const pos = bot.entity.position.clone(); // stable across the yields below
   const position = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
@@ -104,7 +105,14 @@ export async function buildWorldView(bot: Bot, goals: Goal[], radius: number = D
     if (id === undefined) return;
     if (scans++ % YIELD_EVERY === YIELD_EVERY - 1) await new Promise<void>((res) => setImmediate(res));
     const isLog = isTreeLogName(name);
-    const found = bot.findBlocks({ point: pos, matching: id, maxDistance: r, count: isLog ? Math.max(count, LOG_PER_TYPE_COUNT) : count });
+    // an exhausted area (unreachable ores, see exhausted.ts) is not "in view": scan deeper so what is left still shows
+    const want = isLog ? Math.max(count, LOG_PER_TYPE_COUNT) : count;
+    let found = bot.findBlocks({ point: pos, matching: id, maxDistance: r, count: exclude ? want * 8 : want });
+    if (exclude) {
+      // same rule as the gather: after an area was written off, ore touching water / lava is not a source either
+      const wet = name.endsWith("_ore") ? (p: Vec3): boolean => touchesLiquid((x, y, z) => bot.blockAt(new Vec3(x, y, z))?.name ?? null, p.x, p.y, p.z) : (): boolean => false;
+      found = found.filter((p) => !exclude(p.x, p.y, p.z) && !wet(p)).slice(0, want);
+    }
     if (found.length === 0) return;
     let nearest = Infinity;
     for (const p of found) nearest = Math.min(nearest, p.distanceTo(pos));

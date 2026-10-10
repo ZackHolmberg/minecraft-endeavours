@@ -159,6 +159,33 @@ export function house(raw: Record<string, unknown> | HouseParams | undefined, fa
   };
 }
 
+/** Shelter: the smallest hut that is safe to sleep in: 5x5 footprint = 3x3 interior, 2 high, flat roof over everything. */
+export const SHELTER_SIZE = 5;
+export const SHELTER_HEIGHT = 3;
+
+export interface ShelterParams {
+  wall: string;
+  /** A door in the gap; false = the gap stays open and the bot plugs it with two wall blocks from inside. */
+  door: boolean;
+}
+
+export function normalizeShelterParams(raw: Record<string, unknown> | undefined): ShelterParams {
+  const r = raw ?? {};
+  return { wall: str(r.wall) ?? "dirt", door: r.door === true };
+}
+
+/** `house` geometry at the minimum size, no windows (nothing to see through, nothing to shoot through). */
+export function shelter(raw: Record<string, unknown> | ShelterParams | undefined, facing: Facing): Blueprint {
+  const p = normalizeShelterParams(raw as Record<string, unknown> | undefined);
+  const bp = house({ width: SHELTER_SIZE, depth: SHELTER_SIZE, height: SHELTER_HEIGHT, wall: p.wall, roof: p.wall, windows: 0, door: p.door }, facing);
+  return {
+    ...bp,
+    kind: "shelter",
+    params: { ...p },
+    summary: `${SHELTER_SIZE}x${SHELTER_SIZE} ${p.wall} shelter (3x3 inside, 2 high), ${p.door ? "door" : "open doorway to plug"} facing ${facing}`,
+  };
+}
+
 /** Minimal nether portal frame: 4 wide × 5 tall, corners omitted = 10 obsidian, then lit. */
 export function portal(_raw: Record<string, unknown> | undefined, facing: Facing): Blueprint {
   const out: BlockPlacement[] = [];
@@ -222,6 +249,8 @@ export function buildBlueprint(kind: BlueprintKind, params: Record<string, unkno
       return portal(params, facing);
     case "farm":
       return farm(params, facing);
+    case "shelter":
+      return shelter(params, facing);
   }
 }
 
@@ -234,6 +263,8 @@ export function canonicalFootprint(kind: BlueprintKind, params: Record<string, u
     }
     case "portal":
       return { sx: 4, sz: 1, height: 5 };
+    case "shelter":
+      return { sx: SHELTER_SIZE, sz: SHELTER_SIZE, height: SHELTER_HEIGHT };
     case "farm": {
       const p = normalizeFarmParams(params);
       return { sx: p.size, sz: p.size, height: 1 };

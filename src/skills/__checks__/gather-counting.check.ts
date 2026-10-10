@@ -236,6 +236,19 @@ async function main(): Promise<void> {
     assert.equal(blocks.has("3,64,0"), true);
   }
 
+  // 4a. Job memory: `exclude` hides known-dead positions (never chosen), and unreachable ones are REPORTED as positions.
+  {
+    registerBotState("g4a", createBotState());
+    const blocks = logsColumn(3, 3, 0);
+    for (const [k, v] of logsColumn(3, 6, 0)) blocks.set(k, v);
+    const { bot, inv } = makeBot("g4a", blocks, { unreachable: new Set(["6,64,0", "*never-dig"]) });
+    const r = await mineBlocks(bot, { types: ["oak_log"], maxCount: 5, exclude: (x: number) => x === 3 });
+    console.log("  4a:", r.message, JSON.stringify((r.state as any).unreachablePositions));
+    assert.equal(blocks.has("3,64,0"), true, "excluded column is never mined");
+    assert.ok(((r.state as any).unreachablePositions as string[]).includes("6,64,0"), "the unreachable block is reported as x,y,z");
+    assert.ok((inv.get("oak_log") ?? 0) <= 2);
+  }
+
   // 4b. Buried target (no walkable approach, but diggable): the scoped digging retry reaches it.
   {
     registerBotState("g4b", createBotState());

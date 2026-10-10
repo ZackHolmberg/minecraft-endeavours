@@ -2,7 +2,9 @@
  * Recovery ladder policy (pure). Given a step failure and the per-step
  * "episode" state, decide the next rung. The runner executes the rung.
  *
- *   0. unreachable gather: re-plan at once with the unreachable block types avoided (`WorldView.avoidBlocks`)
+ *   0. unreachable gather: remember the unreachable positions + area (`exhausted.ts`); first RELOCATE (bounded surface
+ *      walk >= 48 blocks away over dry land, then rescan and retry), only then re-plan at once with the unreachable
+ *      block types avoided (`WorldView.avoidBlocks`: deep variants / shafts)
  *   1. retry once          (transient: unreachable / timeout / station / internal)
  *   2. rebuild view + re-plan   (max MAX_REPLANS per job; plan drifted or nothing in view)
  *   3. no_source: widen the scan 64 → 96 → 160
@@ -11,12 +13,17 @@
  */
 import type { FailureKind, Step, StepFailure } from "../planner/types.js";
 import { stepOutputItem } from "./describe.js";
+import type { JobStepFailure } from "./types.js";
 
 export const MAX_REPLANS = 5;
 /** Scan radii used by the gather step (blocks); the first is mineBlocks' own default. */
 export const SCAN_RADII = [64, 96, 160] as const;
 /** Max exploration runs per failing step (each run is itself bounded). */
 export const MAX_EXPLORES = 2;
+/** Surface relocations per job after unreachable gathers (each is itself bounded in distance and time). */
+export const MAX_RELOCATIONS = 2;
+/** A relocation needs this many distinct unreachable blocks: one bad path is not "the whole area is a dead end". */
+export const RELOCATE_MIN_POSITIONS = 3;
 
 export interface Episode {
   /** Failures seen for this exact step. */
@@ -38,6 +45,7 @@ export type Rung =
   | { rung: "replan"; detail: string }
   | { rung: "widen"; detail: string; radius: number }
   | { rung: "explore"; detail: string }
+  | { rung: "relocate"; detail: string }
   | { rung: "fail"; detail: string }
   | { rung: "cancel"; detail: string };
 
@@ -53,10 +61,11 @@ const TRANSIENT: ReadonlySet<FailureKind> = new Set(["unreachable", "timeout", "
 
 /** Mutates `ep` to record the rung taken. */
 export function decideRecovery(
-  failure: StepFailure,
+  failure: JobStepFailure,
   step: Step,
   ep: Episode,
   replansLeft: number,
+  relocationsLeft = 0,
 ): Rung {
   const kind = failure.kind;
   ep.fails += 1;
@@ -88,6 +97,11 @@ export function decideRecovery(
     return { rung: "fail", detail: failure.detail };
   }
 
+  // Everything in this area is unreachable (ore behind a lake, under sand beside a flooded pocket): leave the area
+  // for dry land and rescan before settling for a deep variant. Logs keep the cheaper re-plan (another species).
+  if (kind === "unreachable" && step.op === "gather" && relocationsLeft > 0 && (failure.positions?.length ?? 0) >= RELOCATE_MIN_POSITIONS && !step.blocks.every((b) => b.endsWith("_log"))) {
+    return { rung: "relocate", detail: `${step.item} unreachable here; trying another area on dry land` };
+  }
   // The step's blocks were seen but unreachable (e.g. jungle logs up in the canopy). Retrying the same
   // blocks only burns another ~20s; re-plan now with them excluded so another species/source is chosen.
   if (kind === "unreachable" && step.op === "gather" && failure.avoid && failure.avoid.length > 0 && canReplan) {

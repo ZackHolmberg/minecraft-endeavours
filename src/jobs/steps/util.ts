@@ -19,8 +19,15 @@ export function ok(detail: string): StepResult {
   return { ok: true, detail };
 }
 
-export function fail(step: Step, kind: FailureKind, detail: string, attempts = 1, avoid?: string[]): StepResult {
-  const failure: StepFailure = { kind, step, detail: detail.slice(0, 240), attempts, ...(avoid && avoid.length > 0 ? { avoid } : {}) };
+export function fail(step: Step, kind: FailureKind, detail: string, attempts = 1, avoid?: string[], positions?: string[]): StepResult {
+  const failure: StepFailure & { positions?: string[] } = {
+    kind,
+    step,
+    detail: detail.slice(0, 240),
+    attempts,
+    ...(avoid && avoid.length > 0 ? { avoid } : {}),
+    ...(positions && positions.length > 0 ? { positions } : {}),
+  };
   return { ok: false, failure };
 }
 

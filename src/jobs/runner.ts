@@ -18,7 +18,10 @@
 import type { Facing } from "../build/types.js";
 import { stepOutputItem, describeStep, goalsText, jobLabel } from "./describe.js";
 import { planReservations } from "./reserve.js";
+import { emptyExhausted, excludeFor, noteExhausted, type ExcludeFn } from "./exhausted.js";
+import { inNightWindow, shelterGeometry, type ShelterGeometry } from "./night.js";
 import {
+  MAX_RELOCATIONS,
   MAX_REPLANS,
   SCAN_RADII,
   decideRecovery,
@@ -31,7 +34,7 @@ import { isGoalTag } from "../planner/knowledge/tags.js";
 import type { FailureKind, Goal, PlanFn, Plan, Step, StepFailure, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import type { StopReason } from "../state/cancellation.js";
-import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, Job, JobStatus, ScaffoldCell, StepResult } from "./types.js";
+import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, Job, JobStatus, JobStepFailure, ScaffoldCell, StepResult } from "./types.js";
 
 export interface StepRunContext {
   signal: AbortSignal;
@@ -40,6 +43,8 @@ export interface StepRunContext {
   /** Inventory count of the step's output item when its episode began. Target = baseline + step.count. */
   baseline: number;
   jobId: string;
+  /** Positions/areas this job already found unreachable: gathers and scans skip them. */
+  exclude?: ExcludeFn;
 }
 
 export type ExecuteStep = (step: Step, ctx: StepRunContext) => Promise<StepResult>;
@@ -49,6 +54,24 @@ export interface ExploreOutcome {
   detail: string;
 }
 export type ExploreFn = (step: GatherStep, ctx: StepRunContext) => Promise<ExploreOutcome>;
+export interface RelocateOutcome {
+  moved: boolean;
+  detail: string;
+}
+/** Walk to another (dry, surface) area >= 48 blocks from `from`, avoiding the job's exhausted regions. */
+export type RelocateFn = (step: GatherStep, ctx: StepRunContext, regions: ReadonlyArray<{ x: number; z: number; r: number }>) => Promise<RelocateOutcome>;
+
+/** Bot-bound half of night survival (src/jobs/steps/night.ts); injected so the runner stays testable. */
+export interface NightDeps {
+  /** Server time of day (0..24000), null when unknown. */
+  timeOfDay: () => number | null;
+  /** A bed to sleep in (one within reach of a walk, or in the inventory): a short description, else null. */
+  findBed: () => string | null;
+  /** Go to the bed, sleep, and wait (re-sleeping if woken) until dawn. */
+  sleepThrough: (ctx: StepRunContext) => Promise<StepResult>;
+  /** From wherever the bot stands near the finished shelter: get in, close up, light it, wait for dawn, come out. */
+  holdInShelter: (geo: ShelterGeometry, ctx: StepRunContext) => Promise<StepResult>;
+}
 
 export interface BuildRunContext extends StepRunContext {
   /** Telemetry sink for per-layer `step` events. */
@@ -91,15 +114,21 @@ export type DeliverFn = (to: string, goals: Goal[], ctx: StepRunContext) => Prom
 export interface RunnerDeps {
   username: string;
   plan: PlanFn;
-  buildView: (goals: Goal[], radius: number) => Promise<WorldView>;
+  buildView: (goals: Goal[], radius: number, exclude?: ExcludeFn) => Promise<WorldView>;
   execute: ExecuteStep;
   explore: ExploreFn;
+  /** Explore-elsewhere rung (absent ⇒ unreachable gathers skip straight to the avoid-and-replan rung). */
+  relocate?: RelocateFn;
   /** Slice 3: builder. Absent ⇒ `startBuild` refuses. */
   build?: BuildDeps;
   /** Slice 3: deliver-to-player. Absent ⇒ jobs with `deliverTo` fail at the hand-over. */
   deliver?: DeliverFn;
+  /** Slice 2c-B: night survival (sleep / wait in the shelter). Absent ⇒ `surviveNight` refuses. */
+  night?: NightDeps;
   /** Inventory count of an item (postcondition baselines). */
   countItem: (item: string) => number;
+  /** The bot's position (centre for an exhausted area when a failure reported no positions). Optional: tests may omit. */
+  position?: () => { x: number; y: number; z: number };
   /** Ask the running skill to wind down (cancellation flag + pathfinder.stop). */
   requestStop: () => void;
   record: (e: TelemetryInput) => void;
@@ -125,6 +154,8 @@ export const JOB_MAX_MS = 30 * 60_000;
 /** Build phase budget (placing is the slow part; materials have their own step timeouts). */
 export const BUILD_TIMEOUT_MS = 14 * 60_000;
 export const DELIVER_TIMEOUT_MS = 2 * 60_000;
+/** A night is 10 500 ticks = 8.75 min at 20 tps; double that for slow ticks and getting in / out. */
+export const NIGHT_HOLD_TIMEOUT_MS = 18 * 60_000;
 export const BUILD_MAX_ATTEMPTS = 3;
 /** Don't start another build attempt with less than this left of the job's time cap. */
 export const MIN_BUILD_ATTEMPT_MS = 60_000;
@@ -270,9 +301,18 @@ export class JobRunner {
       console.log(`[${this.deps.username}] build refused by the failure ledger: ${spec.blueprint}`);
       return { ok: false, jobId: null, message: refusal };
     }
+    if (spec.hold === "night") {
+      const t = this.deps.night?.timeOfDay() ?? null;
+      if (!this.deps.night) return { ok: false, jobId: null, message: "night survival isn't available right now" };
+      if (t !== null && !inNightWindow(t)) return { ok: false, jobId: null, message: `it's daytime (time ${t}); there is nothing to shelter from. Night starts around 12500 (dusk ~11000).` };
+    }
     if (this.isRunning()) await this.cancel("replaced by a new job");
     await this.settleReclaim();
     const epoch = this.stopEpoch;
+    if (spec.hold === "night" && spec.params.useBed !== false) {
+      const bed = this.deps.night!.findBed();
+      if (bed) return this.launchSleep(spec, bed, requestedBy);
+    }
     // An unfinished structure of this kind nearby: continue it at its stored origin, never start a second one beside it.
     const resume = this.deps.buildHistory?.partial(spec) ?? this.partialFromLastJob(spec);
     if (resume) spec = { ...spec, params: { ...resume.params } };
@@ -323,6 +363,28 @@ export class JobRunner {
     const summary = plan.steps.length > 0 ? `${summaryText}. First get materials: ${plan.summary}` : summaryText;
     this.buildReserve = Object.fromEntries((prep.reserve ?? []).map((i) => [i, Number.POSITIVE_INFINITY]));
     return this.launch(job, summary, plan.rawNeeds, (j, c) => this.runBuildJob(j, c));
+  }
+
+  /** A bed is at hand: no building, just sleep through the night (the hold phase does the walking and waiting). */
+  private launchSleep(spec: BuildSpec, bed: string, requestedBy: string | null): AchieveResult {
+    const now = this.now();
+    const summary = `sleep in ${bed} until morning`;
+    const job: Job = {
+      id: newJobId(now),
+      kind: "build",
+      goals: [],
+      requestedBy,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      plan: { goals: [], steps: [], rawNeeds: {}, unresolved: [], summary: "" },
+      stepIndex: 0,
+      replans: 0,
+      progress: summary,
+      failure: null,
+      build: { ...spec, phase: "holding", origin: null, facing: null, summary, total: 0, placed: 0, holdMode: "sleep" },
+    };
+    return this.launch(job, summary, {}, (j, c) => this.runBuildJob(j, c));
   }
 
   /** The previous job, when it was an unfinished build of this blueprint near `spec.anchor` (job.json survives restarts). */
@@ -418,7 +480,7 @@ export class JobRunner {
       void this.cancel("stopped (player stop or abort)");
       return;
     }
-    const step = job.plan.steps[Math.min(job.stepIndex, job.plan.steps.length - 1)]!;
+    const step = job.plan.steps[Math.min(job.stepIndex, job.plan.steps.length - 1)] ?? PHASE_STEP; // builds / night holds with no material steps have none
     const failure: StepFailure =
       reason === "death"
         ? { kind: "died", step, detail: `the bot died during "${describeStep(step)}" (its items dropped where it died)`, attempts: 1 }
@@ -585,7 +647,7 @@ export class JobRunner {
       scanRadius = Math.max(scanRadius, radius);
       this.setProgress(job, `step ${job.stepIndex + 1}/${job.plan.steps.length}: ${describeStep(step)}`);
 
-      const res = await this.runStep(job, step, { signal: ctrl.signal, radius, baseline: ep.baseline, jobId: job.id });
+      const res = await this.runStep(job, step, { signal: ctrl.signal, radius, baseline: ep.baseline, jobId: job.id, exclude: excludeFor(job.exhausted) });
       if (!live()) return "ended";
       if (res.ok) {
         job.stepIndex += 1;
@@ -594,12 +656,19 @@ export class JobRunner {
         continue;
       }
 
-      const failure: StepFailure = { ...res.failure, attempts: ep.fails + 1 };
-      for (const b of failure.avoid ?? []) {
-        if (!avoid.has(b)) console.log(`[${this.deps.username}] job avoid: ${b} (unreachable); re-plans will prefer another source`);
-        avoid.add(b);
+      const failure: JobStepFailure = { ...res.failure, attempts: ep.fails + 1 };
+      const rung = decideRecovery(failure, step, ep, MAX_REPLANS - job.replans, this.deps.relocate ? MAX_RELOCATIONS - (job.relocations ?? 0) : 0);
+      if (rung.rung !== "relocate") {
+        // The positions stay remembered either way; the species is avoided only once relocating is out of the question.
+        if (failure.positions?.length) {
+          job.exhausted ??= emptyExhausted();
+          for (const k of failure.positions) if (!job.exhausted.positions.includes(k)) job.exhausted.positions.push(k);
+        }
+        for (const b of failure.avoid ?? []) {
+          if (!avoid.has(b)) console.log(`[${this.deps.username}] job avoid: ${b} (unreachable); re-plans will prefer another source`);
+          avoid.add(b);
+        }
       }
-      const rung = decideRecovery(failure, step, ep, MAX_REPLANS - job.replans);
       this.deps.record({ kind: "recovery", jobId: job.id, rung: rung.rung, detail: `${failure.kind}: ${rung.detail}`.slice(0, 200) });
       switch (rung.rung) {
         case "cancel":
@@ -632,12 +701,42 @@ export class JobRunner {
           if (verdict === "failed") return "ended";
           break;
         }
+        case "relocate": {
+          if (step.op !== "gather") break;
+          const here = this.deps.position?.() ?? { x: 0, y: 64, z: 0 };
+          job.relocations = (job.relocations ?? 0) + 1;
+          job.exhausted ??= emptyExhausted();
+          const region = noteExhausted(job.exhausted, failure.positions ?? [], here);
+          this.persist(job);
+          console.log(`[${this.deps.username}] job area exhausted: ${failure.positions?.length ?? 0} unreachable ${step.item} source blocks around (${region.x}, ${region.y}, ${region.z}) r=${region.r}`);
+          this.setProgress(job, `step ${job.stepIndex + 1}/${job.plan.steps.length}: ${describeStep(step)} (moving to another area)`);
+          const rctx: StepRunContext = { signal: ctrl.signal, radius, baseline: ep.baseline, jobId: job.id, exclude: excludeFor(job.exhausted) };
+          let out: RelocateOutcome;
+          try {
+            out = (await this.deps.relocate?.(step, rctx, job.exhausted.regions)) ?? { moved: false, detail: "relocation isn't available" };
+          } catch (err) {
+            out = { moved: false, detail: `relocate crashed: ${err instanceof Error ? err.message : String(err)}` };
+          }
+          if (!live()) return "ended";
+          this.deps.record({ kind: "recovery", jobId: job.id, rung: "relocate", detail: `${out.moved ? "moved" : "stayed"}: ${out.detail}`.slice(0, 200) });
+          episodes.delete(key); // a fresh area is a fresh episode (scan radius, retries)
+          scanRadius = SCAN_RADII[0];
+          if (!out.moved) break;
+          // rescan from the new spot: the plan may now find the ore in view (or fall back to deep variants / shafts on its own)
+          if (job.replans < MAX_REPLANS) {
+            const verdict = await this.replan(job, scanRadius, "relocated: rescan", avoid);
+            if (verdict === "continue") for (const e of episodes.values()) e.baseline = null;
+            if (verdict === "done") return "met";
+            if (verdict === "failed") return "ended";
+          }
+          break;
+        }
         case "explore": {
           if (step.op !== "gather") break;
           this.setProgress(job, `step ${job.stepIndex + 1}/${job.plan.steps.length}: exploring for ${step.item} (${step.searchHint?.kind ?? "surface"})`);
           let out: ExploreOutcome;
           try {
-            out = await this.deps.explore(step, { signal: ctrl.signal, radius, baseline: ep.baseline, jobId: job.id });
+            out = await this.deps.explore(step, { signal: ctrl.signal, radius, baseline: ep.baseline, jobId: job.id, exclude: excludeFor(job.exhausted) });
           } catch (err) {
             out = { found: false, detail: `explore crashed: ${err instanceof Error ? err.message : String(err)}` };
           }
@@ -659,7 +758,7 @@ export class JobRunner {
     }
     let view: WorldView;
     try {
-      view = await this.deps.buildView(job.goals, radius);
+      view = await this.deps.buildView(job.goals, radius, excludeFor(job.exhausted));
       if (avoid.size > 0) view = { ...view, avoidBlocks: [...avoid] };
     } catch (err) {
       this.finish(job, "failed", this.driftFailure(job, `could not rebuild the world view: ${err instanceof Error ? err.message : String(err)}`, "internal"));
@@ -797,6 +896,10 @@ export class JobRunner {
     }
     const live = (): boolean => job.status === "running" && !ctrl.signal.aborted;
     const deadline = job.startedAt + JOB_MAX_MS;
+    if (state.holdMode === "sleep") {
+      await this.runNightHold(job, ctrl);
+      return;
+    }
     if (job.plan.steps.length > 0) {
       if ((await this.runGoals(job, ctrl)) === "ended") return;
     }
@@ -931,6 +1034,10 @@ export class JobRunner {
       });
       if (!live()) return;
       if (res.ok) {
+        if (state.hold === "night") {
+          await this.runNightHold(job, ctrl);
+          return;
+        }
         this.finish(job, "done", null);
         return;
       }
@@ -951,6 +1058,58 @@ export class JobRunner {
       detail: (f ? `${f.detail} (placed ${f.placed}/${f.total})` : "build did not complete") + this.leftoverNote(job),
       attempts: BUILD_MAX_ATTEMPTS,
     });
+  }
+
+  /**
+   * Night hold phase: sleep in the bed, or (after the shelter is built) go in, close up and wait for dawn.
+   * Ends the job: done with a one-line account of the night, or failed with why.
+   */
+  private async runNightHold(job: Job, ctrl: AbortController): Promise<void> {
+    const state = job.build!;
+    const night = this.deps.night;
+    const live = (): boolean => job.status === "running" && !ctrl.signal.aborted;
+    if (!night) {
+      this.finish(job, "failed", { kind: "internal", step: PHASE_STEP, detail: "night survival isn't available", attempts: 1 });
+      return;
+    }
+    const mode = state.holdMode ?? "shelter";
+    state.phase = "holding";
+    this.buildReserve = {}; // the shelter is done; whatever is left is free to use
+    this.setProgress(job, mode === "sleep" ? "sleeping until morning" : "inside the shelter, waiting for dawn");
+    const ctx: StepRunContext = { signal: ctrl.signal, radius: SCAN_RADII[0], baseline: 0, jobId: job.id };
+    let exec: () => Promise<StepResult>;
+    if (mode === "sleep") exec = () => night.sleepThrough(ctx);
+    else {
+      if (!state.origin || !state.facing) {
+        this.finish(job, "failed", { kind: "internal", step: PHASE_STEP, detail: "shelter position unknown", attempts: 1 });
+        return;
+      }
+      const geo = shelterGeometry(state.origin, state.facing, state.params.door === true, typeof state.params.wall === "string" ? state.params.wall : "dirt");
+      exec = () => night.holdInShelter(geo, ctx);
+    }
+    const t0 = this.now();
+    const res = await this.timed(PHASE_STEP, "waiting out the night", NIGHT_HOLD_TIMEOUT_MS, exec);
+    this.deps.record({
+      kind: "step",
+      jobId: job.id,
+      op: "hold",
+      item: mode,
+      ok: res.ok,
+      durationMs: this.now() - t0,
+      failureKind: res.ok ? null : res.failure.kind,
+    });
+    if (!live()) return;
+    if (res.ok) {
+      state.holdDetail = res.detail;
+      this.finish(job, "done", null);
+      return;
+    }
+    if (res.failure.kind === "cancelled") {
+      job.progress = "cancelled during the night";
+      this.finish(job, "cancelled", null);
+      return;
+    }
+    this.finish(job, "failed", { ...res.failure, step: PHASE_STEP });
   }
 
   /** " (left 2 dirt at (1,64,2), ...)" when scaffold blocks are still standing, else "". */

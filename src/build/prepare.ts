@@ -5,7 +5,7 @@
  * supplies the grid, inventory and position and executes the result.
  */
 import type { FailureKind, Goal } from "../planner/types.js";
-import { buildBlueprint, normalizeHouseParams } from "./blueprints.js";
+import { buildBlueprint, normalizeHouseParams, normalizeShelterParams } from "./blueprints.js";
 import { computeNeeds, type BuildNeeds } from "./materials.js";
 import { findSite, isAir, isReplaceable, isWaterName, type WorldGrid } from "./site.js";
 import { isSupportBlock, planOrder, type AbsPlacement, type OrderResult } from "./support.js";
@@ -94,7 +94,7 @@ export function prepare(inp: PrepareInput): Prepared | PrepareFailure {
   const abs: AbsPlacement[] = bp.placements.map((p) => ({ ...p, ...shift(p, origin) }));
   // foundation under columns where the ground is 1 lower than the base
   if (spec.blueprint !== "farm") {
-    const wall = spec.blueprint === "house" ? normalizeHouseParams(params).wall : "dirt";
+    const wall = spec.blueprint === "house" ? normalizeHouseParams(params).wall : spec.blueprint === "shelter" ? normalizeShelterParams(params).wall : "dirt";
     const seen = new Set<string>();
     for (const p of abs) {
       if (p.y !== origin.y || p.action) continue;
