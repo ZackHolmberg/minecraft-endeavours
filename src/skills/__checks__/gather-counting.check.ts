@@ -140,11 +140,24 @@ function makeBot(name: string, blocks: Map<string, string>, o: Opts = {}) {
   return { bot: bot as unknown as Bot, inv };
 }
 
+/**
+ * `n` logs stacked from y=64 on a stone floor at y=63. Logging is bottom-up and only the lowest
+ * FELL_MAX_HEIGHT+1 = 5 logs of a column are reachable from the ground (R5), so tests wanting more
+ * logs than that use {@link grove}.
+ */
 function logsColumn(n: number, x = 3, z = 0, name = "oak_log"): Map<string, string> {
   const m = new Map<string, string>();
+  m.set(`${x},63,${z}`, "stone");
   for (let i = 0; i < n; i++) m.set(`${x},${64 + i},${z}`, name);
   // a leaf next to the crown makes the column a "tree" for the log tree-check (structure-guard.isTreeLog)
   if (name.endsWith("_log")) m.set(`${x + 1},${64 + n},${z}`, name.replace("_log", "_leaves"));
+  return m;
+}
+
+/** `cols` separate trees of `h` logs each (x = 3, 6, 9, ...). */
+function grove(cols: number, h: number): Map<string, string> {
+  const m = new Map<string, string>();
+  for (let i = 0; i < cols; i++) for (const [k, v] of logsColumn(h, 3 + 3 * i, 0)) m.set(k, v);
   return m;
 }
 
@@ -175,10 +188,10 @@ async function main(): Promise<void> {
     assert.equal(await waitForDropNear(bot, pos, 300, new Set([2])), true, "explicit pre-dig snapshot: id 3 is new");
   }
 
-  // 1. 11 logs, drops appear 200ms AFTER the dig; asking for 10 -> collected 10 (mined 10 or 11).
+  // 1. 12 logs, drops appear 200ms AFTER the dig; asking for 10 -> collected 10 (mined 10 or 11).
   {
     registerBotState("g1", createBotState());
-    const { bot, inv } = makeBot("g1", logsColumn(11));
+    const { bot, inv } = makeBot("g1", grove(3, 4));
     const r = await mineBlock(bot, { type: "oak_log", count: 10 });
     console.log("  1:", r.message, JSON.stringify(r.state));
     assert.equal(r.ok, true);
@@ -189,7 +202,7 @@ async function main(): Promise<void> {
   // 2. Some drops vanish (e.g. fell into lava): the loop keeps going until the INVENTORY has 10.
   {
     registerBotState("g2", createBotState());
-    const blocks = logsColumn(14);
+    const blocks = grove(3, 5);
     const noDrop = new Set(["3,65,0", "3,67,0"]);
     const { bot, inv } = makeBot("g2", blocks, { noDrop });
     const r = await mineBlock(bot, { type: "oak_log", count: 10 });
@@ -270,7 +283,7 @@ async function main(): Promise<void> {
   // 6. Inventory full: nothing is picked up -> stops after a few fruitless digs, ok:false, says why.
   {
     registerBotState("g6", createBotState());
-    const { bot } = makeBot("g6", logsColumn(10), { full: true });
+    const { bot } = makeBot("g6", grove(2, 5), { full: true });
     const r = await mineBlock(bot, { type: "oak_log", count: 5 });
     console.log("  6:", r.message);
     assert.equal(r.ok, false);
@@ -280,7 +293,7 @@ async function main(): Promise<void> {
   // 7. A stop landing mid-skill is not wiped by mineBlocks (no second cancellation.begin()).
   {
     registerBotState("g7", createBotState());
-    const { bot, inv } = makeBot("g7", logsColumn(10), { onDig: (n) => { if (n === 2) getBotState("g7")!.cancellation.request(); } });
+    const { bot, inv } = makeBot("g7", grove(2, 5), { onDig: (n) => { if (n === 2) getBotState("g7")!.cancellation.request(); } });
     const r = await mineBlock(bot, { type: "oak_log", count: 10 });
     console.log("  7:", r.message);
     assert.ok((inv.get("oak_log") ?? 0) <= 3, "stopped early");
@@ -292,6 +305,33 @@ async function main(): Promise<void> {
     console.log("  7b:", r2.message);
     assert.match(r2.message, /cancelled|no .* within/);
     assert.equal(getBotState("g7")!.cancellation.isRequested(), true);
+  }
+
+  // 9. R5 tree felling: bottom-up, reachable from the ground only, short trees first.
+  {
+    registerBotState("g9", createBotState());
+    const blocks = logsColumn(20, 3, 0, "jungle_log"); // tall giant right next to the bot
+    for (const [k, v] of logsColumn(5, 9, 0, "oak_log")) blocks.set(k, v); // small oak further away
+    const { bot, inv } = makeBot("g9", blocks);
+    const r = await mineBlocks(bot, { types: ["jungle_log", "oak_log"], maxCount: 5 });
+    console.log("  9:", r.message);
+    assert.equal(inv.get("oak_log"), 5, "short oak preferred over the nearer jungle giant");
+    assert.equal(inv.get("jungle_log") ?? 0, 0);
+    assert.equal(blocks.has("3,64,0"), true, "giant untouched");
+  }
+  {
+    registerBotState("g9b", createBotState());
+    const blocks = logsColumn(20, 3, 0, "jungle_log");
+    const order: number[] = [];
+    const { bot, inv } = makeBot("g9b", blocks, { onDig: () => {} });
+    const dig = (bot as any).dig as (b: any) => Promise<void>;
+    (bot as any).dig = async (b: any) => { order.push(b.position.y); return dig(b); };
+    const r = await mineBlocks(bot, { types: ["jungle_log"], maxCount: 10 });
+    console.log("  9b:", r.message);
+    assert.deepEqual(order, [64, 65, 66, 67, 68], "bottom-up, and stops at arm's reach");
+    assert.equal(inv.get("jungle_log"), 5);
+    assert.equal(blocks.has("3,69,0"), true, "no towering for the canopy");
+    assert.match(r.message, /too high to reach/);
   }
 
   // 8. pickUpNearby counts the inventory delta.

@@ -99,7 +99,7 @@ async function worldLines(bot: Bot, actionHistory = false): Promise<string[]> {
     L.push(
       `nearby blocks: ${s.nearbyBlocks
         .slice(0, MAX_BLOCKS)
-        .map((b) => `${b.type} x${b.count} @${fmt(b.nearest)} (${b.nearest.dist}m)`)
+        .map((b) => `${b.type} x${b.count} @${fmt(b.nearest)} (${b.nearest.dist}m)${b.note ? ` [${b.note}]` : ""}`)
         .join(", ")}`,
     );
   }
@@ -195,7 +195,7 @@ export async function buildExecutorContext(bot: Bot): Promise<string> {
     L.push(
       `nearby: ${s.nearbyBlocks
         .slice(0, MAX_BLOCKS)
-        .map((b) => `${b.type} x${b.count} @${fmt(b.nearest)} (${b.nearest.dist}m)`)
+        .map((b) => `${b.type} x${b.count} @${fmt(b.nearest)} (${b.nearest.dist}m)${b.note ? ` [${b.note}]` : ""}`)
         .join(", ")}`,
     );
   }

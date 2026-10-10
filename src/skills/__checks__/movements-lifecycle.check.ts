@@ -11,7 +11,7 @@ import minecraftData from "minecraft-data";
 import pathfinderPkg from "mineflayer-pathfinder";
 import PrismarineBlock from "prismarine-block";
 import { Vec3 } from "vec3";
-import { BASE_DIG_COST, SCOPED_DIG_COST, diggingDepth, ensureMovements, hasConfiguredMovements, resetMovementsToBase, withDiggingMovements, DIG_SCOPE_MAX_MS, type BotWithPathfinder } from "../pathfinder-config.js";
+import { BASE_DIG_COST, LIQUID_COST, SCOPED_DIG_COST, diggingDepth, ensureMovements, hasConfiguredMovements, resetMovementsToBase, withDiggingMovements, DIG_SCOPE_MAX_MS, type BotWithPathfinder } from "../pathfinder-config.js";
 import { isBoxedIn, navigate, navFailureOf } from "../navigation.js";
 import { isNaturalTerrain } from "../structure-guard.js";
 
@@ -73,7 +73,7 @@ for (const n of ["oak_leaves", "jungle_leaves", "azalea_leaves", "cherry_leaves"
 for (const n of ["oak_log", "jungle_log", "oak_planks", "cobblestone", "oak_door", "glass", "chest", "crafting_table", "bedrock", "water", "white_wool", "furnace", "oak_stairs", "red_bed"]) assert.equal(breaks(mv(bot1), n), false, `base must not break ${n}`);
 assert.equal(mv(bot1).allow1by1towers, false);
 assert.equal(mv(bot1).canOpenDoors, false);
-assert.equal(mv(bot1).liquidCost, 3);
+assert.equal(mv(bot1).liquidCost, LIQUID_COST);
 assert.equal(mv(bot1).maxDropDown, 3);
 assert.deepEqual(mv(bot1).scafoldingBlocks, [], "A* may not place scaffolding");
 const door = mv(bot1).getBlock(new Vec3(5, 64, 5), 0, 0, 0);

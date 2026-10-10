@@ -20,9 +20,12 @@ import {
 import {
   defendTick,
   idleLookTick,
+  inferHurtCause,
   maybeAutoEat,
   maybeEquipArmor,
   noteHurt,
+  survivalTick,
+  trackSurvivalState,
 } from "../skills/auto-behaviors.js";
 import { isFlying, stopFlyingNow } from "../skills/flight.js";
 import { currentGameMode, type GameMode } from "../skills/game-mode.js";
@@ -196,9 +199,12 @@ export function attachBotEventHooks(
   // while a skill is in flight, so they never fight the agent for control.
   const reflexTick = setInterval(() => {
     if (!bot.entity) return;
+    // Breath / suffocation first: it preempts whatever skill is moving the bot.
+    survivalTick(bot, state);
     defendTick(bot, state);
     idleLookTick(bot, state);
   }, REFLEX_TICK_MS);
+  trackSurvivalState(bot);
   bot.on("health", () => maybeAutoEat(bot, state));
   bot.on("playerCollect", (collector) => {
     if (collector !== bot.entity) return;
@@ -226,11 +232,13 @@ export function attachBotEventHooks(
     if (entity !== bot.entity) return;
     noteHurt(bot, source);
     const who = source ? source.username ?? source.name ?? "something" : "something";
-    console.log(`${tag} hurt by ${who} (health ${Math.round(bot.health)}/20)`);
+    const cause = inferHurtCause(bot, source);
+    console.log(`${tag} hurt by ${source ? who : cause} (health ${Math.round(bot.health)}/20)`);
     recordEvent(username, {
       kind: "hurt",
       health: Math.round((bot.health ?? 0) * 10) / 10,
       by: source ? source.username ?? source.name ?? null : null,
+      cause,
     });
   });
 

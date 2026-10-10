@@ -51,9 +51,9 @@ export function describe(e: TelemetryEvent): Described {
     case "structure_skip":
       return { icon: <IBot />, tone: "info", title: `Left ${e.skipped} player-built ${e.block.replace(/_/g, " ")} alone` };
     case "reflex":
-      return { icon: <IZap />, tone: e.reflex === "defend" ? "warn" : "info", title: `Reflex: ${e.reflex}`, detail: e.detail };
+      return { icon: <IZap />, tone: e.reflex === "defend" || e.reflex === "surface" ? "warn" : "info", title: `Reflex: ${e.reflex}`, detail: e.detail };
     case "hurt":
-      return { icon: <IHeart />, tone: e.health <= 6 ? "bad" : "warn", title: `Hurt${e.by ? ` by ${e.by}` : ""}`, detail: `health ${e.health}/20` };
+      return { icon: <IHeart />, tone: e.health <= 6 ? "bad" : "warn", title: `Hurt${e.by ? ` by ${e.by}` : e.cause ? ` (${e.cause})` : ""}`, detail: `health ${e.health}/20` };
     case "death":
       return { icon: <ISkull />, tone: "bad", title: `Died: ${e.cause}`, detail: fmtPos(e.pos) };
     case "connection":
