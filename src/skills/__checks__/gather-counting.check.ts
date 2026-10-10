@@ -15,8 +15,11 @@ import PrismarineBlock from "prismarine-block";
 import { Vec3 } from "vec3";
 import { createBotState, registerBotState, getBotState } from "../../state/index.js";
 import { mineBlock, mineBlocks } from "../world.js";
+import { SCOPED_DIG_COST } from "../pathfinder-config.js";
 import { pickUpNearby, waitForDropNear } from "../inventory.js";
 import type { Bot } from "mineflayer";
+/** Base Movements now digs natural terrain at BASE_DIG_COST; the scoped "digging" variant is the cheap one. */
+const scoped = (m: any): boolean => m.canDig === true && m.digCost === SCOPED_DIG_COST;
 
 const { pathfinder } = pathfinderPkg;
 const registry = minecraftData("1.21.9");
@@ -114,14 +117,14 @@ function makeBot(name: string, blocks: Map<string, string>, o: Opts = {}) {
   bot.pathfinder.getPathTo = (_m: unknown, goal: any) => {
     const p = goal.pos; // only GoalLookAtBlock targets can be "unreachable" in this stub
     const key = p ? `${p.x},${p.y},${p.z}` : "";
-    const digging = (bot.pathfinder.movements as any).canDig;
+    const digging = scoped(bot.pathfinder.movements);
     if (o.hard?.has(key)) return { status: "partial", path: [] };
     return { status: o.unreachable?.has(key) && (!digging || o.unreachable.has("*never-dig")) ? "noPath" : "success", path: [] };
   };
   bot._gotos = [] as boolean[];
   bot.pathfinder.goto = async (goal: any) => {
     const p = goal.pos ?? new Vec3(goal.x, goal.y, goal.z);
-    const canDig = (bot.pathfinder.movements as any).canDig as boolean;
+    const canDig = scoped(bot.pathfinder.movements) as boolean;
     if (goal.pos && o.hard?.has(`${p.x},${p.y},${p.z}`)) {
       bot._gotos.push(canDig);
       if (!canDig || o.digFails) throw new Error("No path to the goal!");
@@ -140,6 +143,8 @@ function makeBot(name: string, blocks: Map<string, string>, o: Opts = {}) {
 function logsColumn(n: number, x = 3, z = 0, name = "oak_log"): Map<string, string> {
   const m = new Map<string, string>();
   for (let i = 0; i < n; i++) m.set(`${x},${64 + i},${z}`, name);
+  // a leaf next to the crown makes the column a "tree" for the log tree-check (structure-guard.isTreeLog)
+  if (name.endsWith("_log")) m.set(`${x + 1},${64 + n},${z}`, name.replace("_log", "_leaves"));
   return m;
 }
 
@@ -225,7 +230,7 @@ async function main(): Promise<void> {
     const r = await mineBlock(bot, { type: "oak_log", count: 2 });
     console.log("  4b:", r.message);
     assert.equal(inv.get("oak_log"), 2);
-    assert.equal((bot as any).pathfinder.movements.canDig, false, "digging scope restored");
+    assert.equal(scoped((bot as any).pathfinder.movements), false, "digging scope restored");
   }
 
   // 4c. Large open region + buried target: the probe says "partial" (not noPath), the no-dig goto
@@ -237,7 +242,7 @@ async function main(): Promise<void> {
     console.log("  4c:", r.message);
     assert.equal(inv.get("oak_log"), 2);
     assert.deepEqual((bot as any)._gotos, [false, true, false, true], "no-dig attempt then ONE dig retry, per target");
-    assert.equal((bot as any).pathfinder.movements.canDig, false, "digging scope restored");
+    assert.equal(scoped((bot as any).pathfinder.movements), false, "digging scope restored");
   }
   // 4d. Digging doesn't help either: still one retry per target, then skipped as unreachable.
   {
@@ -247,7 +252,7 @@ async function main(): Promise<void> {
     console.log("  4d:", r.message);
     assert.equal(r.ok, false);
     assert.deepEqual((bot as any)._gotos, [false, true]);
-    assert.equal((bot as any).pathfinder.movements.canDig, false);
+    assert.equal(scoped((bot as any).pathfinder.movements), false);
   }
 
   // 5. Baseline respected: existing cobblestone doesn't count; stone -> cobblestone delta.

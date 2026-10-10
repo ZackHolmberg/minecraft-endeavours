@@ -30,20 +30,26 @@ import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
 import { recordEvent } from "../observability/telemetry.js";
 import { getBotState } from "../state/index.js";
+import { spendable } from "../state/reservations.js";
 import type { SkillResult } from "./types.js";
 
+/**
+ * Cheapest-to-lose first: junk blocks the bot digs up anyway before cobblestone,
+ * which is a crafting input (stone tools, furnaces) and the most common thing a
+ * job is gathering. sand / gravel are excluded: they would fall out from under us.
+ */
 export const PILLAR_FILLER_PRIORITY = [
-  "cobblestone",
-  "cobbled_deepslate",
   "dirt",
   "netherrack",
-  "stone",
+  "cobbled_deepslate",
   "andesite",
   "diorite",
   "granite",
   "tuff",
+  "cobblestone",
+  "stone",
   "blackstone",
-] as const; // sand / gravel would fall out from under us
+] as const;
 
 export const PILLAR_MAX_HEIGHT = 32;
 const ATTEMPTS_PER_LEVEL = 3;
@@ -53,12 +59,25 @@ const WATER_RISE_TIMEOUT_MS = 3_000; // swimming up is much slower
 const LAND_TIMEOUT_MS = 1_200;
 const GROUND_WAIT_MS = 1_000;
 
+/**
+ * Best filler stack to place under the bot, never touching items the active job
+ * has reserved (see state/reservations.ts). Counts are summed across stacks; a
+ * partially reserved item is usable only if more is held than reserved.
+ */
 export function pickFiller(bot: Bot): Item | null {
   const items = bot.inventory.items();
+  const skipped: string[] = [];
   for (const name of PILLAR_FILLER_PRIORITY) {
-    const found = items.find((i) => i.name === name);
-    if (found) return found;
+    const stacks = items.filter((i) => i.name === name);
+    if (stacks.length === 0) continue;
+    const held = stacks.reduce((n, i) => n + i.count, 0);
+    if (spendable(bot.username, name, held) <= 0) {
+      skipped.push(`${name}x${held}`);
+      continue;
+    }
+    return stacks[0]!;
   }
+  if (skipped.length > 0) console.log(`[${bot.username}] [reserve] no spendable filler: ${skipped.join(", ")} reserved by the active job`);
   return null;
 }
 
@@ -150,7 +169,7 @@ async function tryOnce(bot: Bot): Promise<Attempt> {
 
   const filler = pickFiller(bot);
   if (!filler) {
-    return { ok: false, fatal: true, message: "no filler block (cobblestone/dirt/stone/etc.) in inventory" };
+    return { ok: false, fatal: true, message: "no spendable filler block (dirt/cobblestone/stone/etc.) in inventory (blocks the active job needs are reserved)" };
   }
 
   const pos = bot.entity.position;

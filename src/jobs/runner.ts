@@ -16,6 +16,7 @@
  * so they are not mistaken for a player stop.
  */
 import { stepOutputItem, describeStep, goalsText } from "./describe.js";
+import { planReservations } from "./reserve.js";
 import {
   MAX_REPLANS,
   SCAN_RADII,
@@ -60,6 +61,11 @@ export interface RunnerDeps {
   record: (e: TelemetryInput) => void;
   load: () => Job | null;
   save: (job: Job) => void;
+  /**
+   * Reserve the inventory the (re)planned job still needs so filler consumers (pillar escapes)
+   * leave it alone; `null` clears (job end). Optional: tests may omit.
+   */
+  reserve?: (items: Record<string, number> | null) => void;
   /** Called once when a job ends done or failed. */
   onEnd?: (job: Job) => void;
   /** Called by `dispose()` (unsubscribe listeners). */
@@ -178,6 +184,7 @@ export class JobRunner {
     };
     this.job = job;
     this.persist(job);
+    this.setReservations(planReservations(plan));
     this.deps.record({ kind: "job_start", jobId: job.id, goals: plan.goals, steps: plan.steps.length });
     const ctrl = new AbortController();
     this.ctrl = ctrl;
@@ -266,6 +273,14 @@ export class JobRunner {
     }
   }
 
+  private setReservations(items: Record<string, number> | null): void {
+    try {
+      this.deps.reserve?.(items);
+    } catch {
+      // best-effort
+    }
+  }
+
   private persist(job: Job): void {
     try {
       this.deps.save(job);
@@ -290,6 +305,7 @@ export class JobRunner {
   private finish(job: Job, status: Exclude<JobStatus, "running">, failure: StepFailure | null): void {
     if (job.status !== "running") return;
     job.status = status;
+    this.setReservations(null);
     job.endedAt = this.now();
     job.failure = status === "failed" ? failure : null;
     if (status === "done") job.progress = `done: ${goalsText(job.goals)}`;
@@ -314,6 +330,8 @@ export class JobRunner {
 
   private async run(job: Job, ctrl: AbortController): Promise<void> {
     const episodes = new Map<string, Episode>();
+    // Block types gathers could not reach during this job; fed to the planner on every re-plan.
+    const avoid = new Set<string>();
     const deadline = this.now() + JOB_MAX_MS;
     let scanRadius: number = SCAN_RADII[0];
     const live = (): boolean => job.status === "running" && !ctrl.signal.aborted;
@@ -327,7 +345,7 @@ export class JobRunner {
 
       // Plan exhausted: verify against a fresh view (re-plan finds drift).
       if (job.stepIndex >= job.plan.steps.length) {
-        const verdict = await this.replan(job, scanRadius, "verify");
+        const verdict = await this.replan(job, scanRadius, "verify", avoid);
         if (verdict === "done") {
           this.finish(job, "done", null);
           return;
@@ -358,6 +376,10 @@ export class JobRunner {
       }
 
       const failure: StepFailure = { ...res.failure, attempts: ep.fails + 1 };
+      for (const b of failure.avoid ?? []) {
+        if (!avoid.has(b)) console.log(`[${this.deps.username}] job avoid: ${b} (unreachable); re-plans will prefer another source`);
+        avoid.add(b);
+      }
       const rung = decideRecovery(failure, step, ep, MAX_REPLANS - job.replans);
       this.deps.record({ kind: "recovery", jobId: job.id, rung: rung.rung, detail: `${failure.kind}: ${rung.detail}`.slice(0, 200) });
       switch (rung.rung) {
@@ -385,7 +407,7 @@ export class JobRunner {
           this.setProgress(job, `step ${job.stepIndex + 1}/${job.plan.steps.length}: ${describeStep(step)} (widening search to ${rung.radius})`);
           break;
         case "replan": {
-          const verdict = await this.replan(job, scanRadius, rung.detail);
+          const verdict = await this.replan(job, scanRadius, rung.detail, avoid);
           if (verdict === "continue") for (const e of episodes.values()) e.baseline = null; // inventory changed: re-baseline lazily
           if (verdict === "done") {
             this.finish(job, "done", null);
@@ -412,7 +434,7 @@ export class JobRunner {
   }
 
   /** Rebuild the view and re-plan. Returns whether the goals are met / the job failed / execution continues. */
-  private async replan(job: Job, radius: number, why: string): Promise<"done" | "failed" | "continue"> {
+  private async replan(job: Job, radius: number, why: string, avoid: ReadonlySet<string> = new Set()): Promise<"done" | "failed" | "continue"> {
     const verifying = why === "verify";
     if (!verifying && job.replans >= MAX_REPLANS) {
       this.finish(job, "failed", this.driftFailure(job, `replan limit (${MAX_REPLANS}) reached`));
@@ -421,6 +443,7 @@ export class JobRunner {
     let view: WorldView;
     try {
       view = await this.deps.buildView(job.goals, radius);
+      if (avoid.size > 0) view = { ...view, avoidBlocks: [...avoid] };
     } catch (err) {
       this.finish(job, "failed", this.driftFailure(job, `could not rebuild the world view: ${err instanceof Error ? err.message : String(err)}`, "internal"));
       return "failed";
@@ -447,6 +470,7 @@ export class JobRunner {
     job.replans += 1;
     job.plan = plan;
     job.stepIndex = 0;
+    this.setReservations(planReservations(plan));
     this.deps.record({ kind: "recovery", jobId: job.id, rung: "replan", detail: `#${job.replans} ${why}: ${plan.summary}`.slice(0, 200) });
     this.setProgress(job, `step 1/${plan.steps.length}: ${describeStep(plan.steps[0]!)} (replanned)`);
     return "continue";

@@ -366,3 +366,57 @@ describe("JobRunner state machine", () => {
     expect(r.message).toContain("already have");
   });
 });
+
+describe("unreachable gather feeds the planner (avoidBlocks) and reserves the plan's items", () => {
+  const view0: WorldView = {
+    inventory: {},
+    gameMode: "survival",
+    nearbyBlocks: { jungle_log: { count: 5, nearest: 3.8 }, oak_log: { count: 5, nearest: 7.1 } },
+    stations: { crafting_table: false, furnace: false },
+    containers: [],
+    position: { x: 0, y: 64, z: 0 },
+    dimension: "overworld",
+  };
+
+  it("replans at once (no same-step retry) with the unreachable species avoided, and clears reservations at the end", async () => {
+    const views: Array<string[] | undefined> = [];
+    const reserved: Array<Record<string, number> | null> = [];
+    const events: TelemetryInput[] = [];
+    const ended: Job[] = [];
+    const runner = new JobRunner({
+      username: "bot",
+      plan: (goals, view) => {
+        views.push(view.avoidBlocks);
+        return realPlan(goals, view);
+      },
+      buildView: async () => view0,
+      execute: async (step) => {
+        if (step.op === "gather" && step.blocks.includes("jungle_log")) {
+          return { ok: false, failure: { kind: "unreachable", step, detail: "gave up after 6 unreachable jungle_log blocks", attempts: 1, avoid: ["jungle_log"] } };
+        }
+        return okRes();
+      },
+      explore: async () => ({ found: false, detail: "" }),
+      countItem: () => 0,
+      requestStop: () => {},
+      record: (e) => events.push(e),
+      load: () => null,
+      save: () => {},
+      reserve: (items) => reserved.push(items),
+      onEnd: (j) => ended.push(j),
+    });
+    const r = await runner.start([{ item: "wooden_pickaxe", count: 1 }], null);
+    expect(r.ok).toBe(true);
+    expect(r.message).toContain("jungle_log");
+    await until(() => ended.length > 0 || !runner.isRunning(), 3000);
+    const rec = events.filter((e) => e.kind === "recovery").map((e) => (e as { rung: string }).rung);
+    expect(rec[0]).toBe("replan"); // not "retry"
+    expect(views[0]).toBeUndefined();
+    expect(views[1]).toEqual(["jungle_log"]);
+    expect(runner.current()!.plan.steps.some((s) => s.op === "gather" && s.blocks.includes("oak_log"))).toBe(true);
+    // reservations: set at start (plan items), refreshed on replan, cleared at job end
+    expect(reserved[0]).toMatchObject({ jungle_log: Infinity, wooden_pickaxe: Infinity });
+    expect(reserved.some((x) => x && "oak_log" in x)).toBe(true);
+    expect(reserved.at(-1)).toBeNull();
+  });
+});

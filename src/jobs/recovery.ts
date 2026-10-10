@@ -2,6 +2,7 @@
  * Recovery ladder policy (pure). Given a step failure and the per-step
  * "episode" state, decide the next rung. The runner executes the rung.
  *
+ *   0. unreachable gather: re-plan at once with the unreachable block types avoided (`WorldView.avoidBlocks`)
  *   1. retry once          (transient: unreachable / timeout / station / internal)
  *   2. rebuild view + re-plan   (max MAX_REPLANS per job; plan drifted or nothing in view)
  *   3. no_source: widen the scan 64 → 96 → 160
@@ -87,6 +88,11 @@ export function decideRecovery(
     return { rung: "fail", detail: failure.detail };
   }
 
+  // The step's blocks were seen but unreachable (e.g. jungle logs up in the canopy). Retrying the same
+  // blocks only burns another ~20s; re-plan now with them excluded so another species/source is chosen.
+  if (kind === "unreachable" && step.op === "gather" && failure.avoid && failure.avoid.length > 0 && canReplan) {
+    return replan(`unreachable ${failure.avoid.join(",")}: re-plan avoiding it`);
+  }
   if (TRANSIENT.has(kind) && !ep.retried) {
     ep.retried = true;
     return { rung: "retry", detail: `retry after ${kind}` };

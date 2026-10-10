@@ -425,3 +425,50 @@ describe("sources and edge cases", () => {
     expect(p.summary.length).toBeLessThanOrEqual(200);
   });
 });
+
+describe("avoidBlocks (unreachable species fed back from the recovery ladder)", () => {
+  const jungleAndOak = { jungle_log: 3.8, oak_log: 7.1, stone: 5 };
+  const gatherBlocks = (p: Plan) => find(p, "gather").flatMap((s) => s.blocks);
+
+  it("without avoidance the nearest species wins (the regression scenario)", () => {
+    const p = plan([g("wooden_pickaxe")], mkView({ near: jungleAndOak }));
+    expect(gatherBlocks(p)).toEqual(["jungle_log"]);
+  });
+
+  it("an avoided species is dropped from recipe variants: oak planks and oak logs are planned instead", () => {
+    const p = plan([g("wooden_pickaxe")], mkView({ near: jungleAndOak, avoidBlocks: ["jungle_log"] }));
+    expect(p.unresolved).toEqual([]);
+    expect(gatherBlocks(p)).toEqual(["oak_log"]);
+    expect(find(p, "craft", "oak_planks")).toHaveLength(1);
+    expect(find(p, "craft", "jungle_planks")).toHaveLength(0);
+    expect(() => simulate(p, mkView({ near: jungleAndOak, avoidBlocks: ["jungle_log"] }))).not.toThrow();
+  });
+
+  it("logs already held of an avoided species do not pull the plan back to it when another species is in view", () => {
+    const view = mkView({ near: jungleAndOak, inventory: { jungle_log: 2 }, avoidBlocks: ["jungle_log"] });
+    const p = plan([g("wooden_pickaxe")], view);
+    expect(gatherBlocks(p)).toEqual(["oak_log"]);
+    expect(() => simulate(p, view)).not.toThrow();
+  });
+
+  it("held logs of the avoided species are still used when nothing else is in view", () => {
+    const view = mkView({ near: { stone: 5 }, inventory: { jungle_log: 3 }, avoidBlocks: ["jungle_log"] });
+    const p = plan([g("wooden_pickaxe")], view);
+    expect(p.unresolved).toEqual([]);
+    expect(find(p, "craft", "jungle_planks")).toHaveLength(1);
+  });
+
+  it("last resort: an avoided block is still planned when it is the only source (no dead end)", () => {
+    const view = mkView({ near: { jungle_log: 3.8 }, avoidBlocks: ["jungle_log"] });
+    const p = plan([g("jungle_log", 3)], view);
+    expect(p.unresolved).toEqual([]);
+    expect(gatherBlocks(p)).toEqual(["jungle_log"]);
+  });
+
+  it("gather source choice: an avoided block leaves a multi-source item's block list", () => {
+    const view = mkView({ near: { stone: 4, cobblestone: 6 }, avoidBlocks: ["stone"] });
+    const p = plan([g("cobblestone", 3)], view);
+    expect(gatherBlocks(p)).not.toContain("stone");
+    expect(gatherBlocks(p)).toContain("cobblestone");
+  });
+});

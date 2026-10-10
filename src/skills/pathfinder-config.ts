@@ -4,18 +4,26 @@
  * used to live in world / movement / combat / inventory / storage / crafting /
  * interaction / survival.
  *
- * Key policy choice — **`canDig = false`**. By default mineflayer-pathfinder
- * is allowed to break blocks to clear a path; that's how the bot was tearing
- * holes in player-built walls to reach a closer interior point instead of
- * walking around to the door. The bot can still mine explicitly via
- * `bot.dig` (e.g. inside the `mineBlock` skill), which is unaffected by this
- * flag — `canDig` only governs whether the path-search algorithm itself
- * counts breaking blocks as a valid traversal step.
+ * Key policy choice — **A\* may only break NATURAL terrain, at a high price,
+ * and never places blocks.** By default mineflayer-pathfinder may break
+ * anything to clear a path; that is how the bot was tearing holes in
+ * player-built walls to reach a closer interior point instead of walking
+ * around to the door. v2 first forbade breaking entirely (`canDig=false`), but
+ * with no digging at all A* exhausts its think budget on ordinary terrain
+ * ("Took to long to decide path to goal!": jungle canopy, hills, ore under a
+ * dirt layer). So the BASE Movements now has `canDig = true` with:
+ *  - `blocksCantBreak` = complement of the natural-terrain allowlist
+ *    (`isNaturalTerrain` + foliage `isCheapBreak`): no logs, planks, cobblestone,
+ *    glass, doors, containers, stations, crops, beds ... ever;
+ *  - the player-built structure guard on (`builtStructureReason` via
+ *    `exclusionAreasBreak`): natural blocks set into a built wall stay put;
+ *  - `digCost = BASE_DIG_COST` so walking (and doors) stay strongly preferred;
+ *  - no towers / bridges / scaffolding (placing is a deliberate act).
+ * Explicit `bot.dig` in `mineBlock` is unaffected by any of this.
  *
- * Trade-off: this also blocks legitimate "mine through stone to reach buried
- * ore" pathing. In practice the agent handles that case by calling
- * `mineBlock("stone", N)` on the obstructing blocks first, so we don't lose
- * anything important by forbidding implicit destruction.
+ * `withDiggingMovements` remains as the "tunnel toward this natural target"
+ * scope: same allowlist, cheap `digCost = 1`, and the guard can be lifted with
+ * `allowStructures`.
  *
  * The other half of "don't break walls" is **doors**: with digging off, a
  * building is only reachable if the planner knows doors and gates can be
@@ -28,11 +36,15 @@ import type { Bot } from "mineflayer";
 import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 import type { Block } from "prismarine-block";
 import { installDoorAssist, patchMovementsForDoors } from "./doors.js";
-import { builtStructureReason, isNaturalTerrain } from "./structure-guard.js";
+import { builtStructureReason, isCheapBreak, isNaturalTerrain } from "./structure-guard.js";
 import { isCreative } from "./game-mode.js";
 
 const { Movements } = pathfinderPkg;
 
+/** Walking costs ~1 per block; breaking a dirt block by hand then costs ~13 at 4, so A* digs only when it saves a long detour. */
+export const BASE_DIG_COST = 4;
+/** The scoped digging variant (retry toward a buried/blocked natural target). */
+export const SCOPED_DIG_COST = 1;
 const SURVIVAL_MAX_DROP = 3;
 /** No fall damage in creative; players hop off ledges freely. */
 const CREATIVE_MAX_DROP = 8;
@@ -78,6 +90,10 @@ export function ensureMovements(bot: BotWithPathfinder): void {
   let st = states.get(bot);
   if (!st) {
     st = { base: buildMovements(bot), depth: 0, strict: 0, generation: 0, digSince: 0 };
+    // Base always keeps the player-built structure guard (a scope may lift it for its own variant only).
+    const guard = st.base.exclusionAreasBreak as unknown as Array<(b: Block) => number>;
+    guard.length = 0;
+    guard.push((b) => (builtStructureReason(bot, b) ? 100 : 0));
     states.set(bot, st);
     bot.pathfinder.setMovements(st.base);
   } else {
@@ -123,13 +139,12 @@ export function resetMovementsToBase(bot: BotWithPathfinder): void {
 }
 
 /**
- * Run `fn` with a digging-enabled Movements installed, then restore the
- * no-dig policy in `finally`. Digging is NEVER on globally; use this only
- * around a single navigate/getPathTo call whose target is a natural block the
- * bot is about to mine anyway (e.g. ore buried under dirt). The dig variant
- * may only break NATURAL terrain (`isNaturalTerrain` allowlist, via
- * `blocksCantBreak`), is additionally limited by `builtStructureReason` unless
- * `allowStructures`, and never places blocks.
+ * Run `fn` with the cheap-digging Movements installed (digCost 1 instead of the
+ * base's BASE_DIG_COST), then restore base in `finally`. Use it around a single
+ * navigate/getPathTo call toward a natural block the bot is about to mine anyway
+ * (e.g. ore buried under dirt). Like base, the variant may only break NATURAL
+ * terrain (allowlist via `blocksCantBreak`) and never places blocks; it differs
+ * in price and in that `allowStructures` lifts the built-structure guard.
  *
  * Re-entrant: scopes are counted per bot, and base is restored only when the
  * outermost scope exits (a nested or overlapping scope can't restore early).
@@ -172,21 +187,19 @@ export async function withDiggingMovements<T>(
 export function naturalOnlyCantBreak(registry: { blocksArray: Array<{ id: number; name: string; diggable?: boolean }> }): Set<number> {
   const out = new Set<number>();
   for (const b of registry.blocksArray) {
-    if (!b.diggable || !isNaturalTerrain(b.name)) out.add(b.id);
+    if (!b.diggable || !(isNaturalTerrain(b.name) || isCheapBreak(b.name))) out.add(b.id);
   }
   return out;
 }
 
 function buildMovements(bot: BotWithPathfinder, digging = false): MovementsT {
   const m = new Movements(bot);
-  // Pathfinder must never break blocks to clear a path. The bot tearing
-  // through player-built walls instead of walking around to a door was the
-  // motivating regression — see docstring above for why this is safe.
-  m.canDig = digging;
-  // The dig variant may only tunnel through natural terrain (allowlist, not a
-  // denylist): furnaces, tables, containers, planks, cobblestone, glass, wool,
-  // beds, logs, crops... are all off-limits to A*.
-  if (digging) (m as unknown as { blocksCantBreak: Set<number> }).blocksCantBreak = naturalOnlyCantBreak(bot.registry as never);
+  // See the file header: natural terrain only (allowlist), structure-guarded, priced
+  // so walking wins. Logs, planks, cobblestone, builds and containers are never
+  // breakable to A* in either variant.
+  m.canDig = true;
+  m.digCost = digging ? SCOPED_DIG_COST : BASE_DIG_COST;
+  (m as unknown as { blocksCantBreak: Set<number> }).blocksCantBreak = naturalOnlyCantBreak(bot.registry as never);
   // Leave pathfinder's built-in door handling OFF (it's gate-only and its
   // executor branch throws after the first use); ours replaces it.
   m.canOpenDoors = false;

@@ -20,12 +20,24 @@
  *    gates are reported to the A* search as walk-through air for *cardinal*
  *    moves only. Diagonal and parkour moves see them as walls, so the bot
  *    always walks squarely through a doorway.
- *  - **Execution** (`installDoorAssist`): a physicsTick watcher looks up to
- *    two cells ahead along the travel direction; if a door/gate on the
- *    current path physically blocks that direction (computed from the live
- *    collision shape, so open/closed/hinge/facing all fall out naturally) it
- *    right-clicks it. Doors the bot opened from closed are closed again once
- *    the bot is ≥2 blocks past them and no other player is standing nearby.
+ *  - **Execution** (`installDoorAssist`): on every `path_update` the path's
+ *    door nodes are repaired (see below), then a physicsTick watcher looks at
+ *    the next few *path nodes* (not the bot's yaw); if one is a door/gate whose
+ *    live collision shape blocks the move into it (open/closed/hinge/facing
+ *    all fall out of the shape) and the bot is within {@link DOOR_REACH}, it
+ *    right-clicks it and waits for the block state to flip. Doors the bot
+ *    opened from closed are closed again once the bot is >=2 blocks past them
+ *    and no other player is standing nearby.
+ *
+ * Why the path repair exists (v2 regression, t2.door_house / t2.door_exit):
+ * pathfinder's `postProcessPath` rewrites every node to "the top of whatever
+ * block it is in" via `getPositionOnTopOf`. A door cell is a block with a 1-high
+ * collision shape, so its node becomes (x + leafOffset, y + 1, z + 0.5): one
+ * block too high. The executor only counts a node as reached when |dy| < 1, so
+ * the bot pushed at the door forever ("stuck N blocks from target"), and the
+ * old assist, which matched on the exact integer door coordinates, never saw
+ * the door on the path. {@link normalizeDoorNodes} snaps those nodes back to the
+ * cell centre at feet level.
  *
  * Iron doors are deliberately excluded (need redstone); trapdoors too — a
  * closed trapdoor is a floor/ceiling, not a doorway, and treating it as air
@@ -103,19 +115,157 @@ export function patchMovementsForDoors(bot: Bot, m: object): void {
 }
 
 // ---------------------------------------------------------------------------
-// Execution-side assist
+// Path analysis (pure: takes a blockAt function, unit-testable without a bot)
 // ---------------------------------------------------------------------------
 
-const LOOKAHEAD_STEPS = [0, 1, 2] as const;
-const PER_DOOR_COOLDOWN_MS = 1_000;
-const CLOSE_BEHIND_DIST = 2.0; // horizontal blocks past the door before we close it
-const CLOSE_GIVE_UP_DIST = 4.0; // beyond activation reach comfortably — just leave it
-const CLOSE_GIVE_UP_MS = 20_000;
-const PLAYER_NEARBY_DIST = 2.5; // someone right at the door → leave it open for them
-// Bot hitbox spans center ± 0.3; a shape blocks travel along an axis if it
+/** Structural subset of prismarine-block's Block that the door logic needs. */
+export interface DoorBlockLike {
+  name: string;
+  position: Vec3;
+  shapes: number[][];
+  getProperties(): Record<string, unknown>;
+}
+export type BlockAtFn = (p: Vec3) => DoorBlockLike | null;
+export interface PathNodeLike {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Open doors from this far (horizontal, to the door cell centre). activateBlock reach is 4.5; this keeps us "at" the door. */
+export const DOOR_REACH = 2.0;
+/** How many upcoming path nodes are inspected for a door. */
+export const LOOKAHEAD_NODES = 3;
+// Bot hitbox spans center +/- 0.3; a shape blocks travel along an axis if it
 // overlaps that band on the perpendicular horizontal axis.
 const HITBOX_LO = 0.2;
 const HITBOX_HI = 0.8;
+
+/**
+ * Door/gate at `cell`, normalised to the lower half for doors (both halves
+ * toggle together, and path nodes are feet-level). Null if not hand-openable.
+ */
+export function doorAt(blockAt: BlockAtFn, cell: Vec3): DoorBlockLike | null {
+  const b = blockAt(cell);
+  if (!b || !isHandOpenable(b.name)) return null;
+  if (b.name.endsWith("_door") && b.getProperties().half === "upper") {
+    const below = blockAt(cell.offset(0, -1, 0));
+    return below && below.name === b.name ? below : null;
+  }
+  return b;
+}
+
+/**
+ * The door/gate (lower half) a path node belongs to, or null. Looks at the
+ * node's own column at `floor(y)` and one below, which covers both the
+ * original feet-level node and the pathfinder-mutated "top of the door" one
+ * (y+1 for doors, y+1.5 for closed gates).
+ */
+export function doorCellForNode(node: PathNodeLike, blockAt: BlockAtFn): DoorBlockLike | null {
+  const cx = Math.floor(node.x);
+  const cz = Math.floor(node.z);
+  const fy = Math.floor(node.y + 1e-6);
+  for (const dy of [0, -1]) {
+    const d = doorAt(blockAt, new Vec3(cx, fy + dy, cz));
+    if (d) return d;
+  }
+  return null;
+}
+
+/**
+ * Snap every door node of `path` back to the door cell centre at feet level
+ * (mutates in place; the executor holds the same array). Returns how many
+ * nodes were repaired.
+ */
+export function normalizeDoorNodes(path: PathNodeLike[], blockAt: BlockAtFn): number {
+  let n = 0;
+  for (const node of path) {
+    const d = doorCellForNode(node, blockAt);
+    if (!d) continue;
+    const x = d.position.x + 0.5;
+    const z = d.position.z + 0.5;
+    if (node.x !== x || node.y !== d.position.y || node.z !== z) {
+      node.x = x;
+      node.y = d.position.y;
+      node.z = z;
+      n++;
+    }
+  }
+  return n;
+}
+
+/** Does the block's current collision shape block walking along `axis`? */
+export function blocksTravel(block: DoorBlockLike, axis: "x" | "z"): boolean {
+  for (const s of block.shapes) {
+    // shape = [minX, minY, minZ, maxX, maxY, maxZ] in block-local coords
+    const lo = axis === "x" ? s[2]! : s[0]!;
+    const hi = axis === "x" ? s[5]! : s[3]!;
+    if (lo < HITBOX_HI && hi > HITBOX_LO) return true;
+  }
+  return false;
+}
+
+export interface DoorAhead {
+  door: DoorBlockLike;
+  axis: "x" | "z";
+  /** Horizontal distance from the bot to the door cell centre. */
+  dist: number;
+  /** Index into the inspected path slice. */
+  nodeIndex: number;
+}
+
+/**
+ * First door/gate among the next {@link LOOKAHEAD_NODES} remaining path nodes
+ * that (a) is within `reach` of the bot and (b) physically blocks the move
+ * into it. Direction comes from the path (previous node -> door node), never
+ * from the bot's yaw.
+ */
+export function findDoorAhead(pos: PathNodeLike, path: ReadonlyArray<PathNodeLike>, blockAt: BlockAtFn, reach = DOOR_REACH): DoorAhead | null {
+  const n = Math.min(path.length, LOOKAHEAD_NODES);
+  for (let i = 0; i < n; i++) {
+    const node = path[i]!;
+    const door = doorCellForNode(node, blockAt);
+    if (!door) continue;
+    const dist = Math.hypot(pos.x - (door.position.x + 0.5), pos.z - (door.position.z + 0.5));
+    if (dist > reach || Math.abs(pos.y - door.position.y) > 2) continue;
+    const from = i > 0 ? path[i - 1]! : pos;
+    let dx = node.x - from.x;
+    let dz = node.z - from.z;
+    if (Math.hypot(dx, dz) < 0.25) {
+      // Bot is standing in the door cell: use the way out instead.
+      const next = path[i + 1];
+      if (!next) continue;
+      dx = next.x - node.x;
+      dz = next.z - node.z;
+    }
+    const axis: "x" | "z" = Math.abs(dx) >= Math.abs(dz) ? "x" : "z";
+    if (!blocksTravel(door, axis)) continue;
+    return { door, axis, dist, nodeIndex: i };
+  }
+  return null;
+}
+
+/** Is `door` (lower half) the cell of one of the next few remaining nodes? */
+export function pathUsesDoor(path: ReadonlyArray<PathNodeLike>, door: { x: number; y: number; z: number }): boolean {
+  const n = Math.min(path.length, LOOKAHEAD_NODES + 1);
+  for (let i = 0; i < n; i++) {
+    const p = path[i]!;
+    if (Math.floor(p.x) === door.x && Math.floor(p.z) === door.z && Math.abs(p.y - door.y) < 1.6) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Execution-side assist
+// ---------------------------------------------------------------------------
+
+const PER_DOOR_COOLDOWN_MS = 1_000;
+const STATE_WAIT_MS = 1_200; // how long to wait for the server to flip the door
+const MAX_ATTEMPTS = 3; // consecutive no-change toggles before we stop poking a door
+const CLOSE_BEHIND_DIST = 2.0; // horizontal blocks past the door before we close it
+const CLOSE_GIVE_UP_DIST = 4.0; // beyond activation reach comfortably - just leave it
+const CLOSE_GIVE_UP_MS = 20_000;
+const PLAYER_NEARBY_DIST = 2.5; // someone right at the door -> leave it open for them
 
 interface OpenedDoor {
   pos: Vec3;
@@ -127,73 +277,85 @@ const installed = new WeakSet<Bot>();
 /**
  * Attach the door watcher to `bot` (idempotent). Cheap: when the bot isn't
  * pathing and has no doors to close, the tick handler is a couple of
- * property reads.
+ * property reads. Log tags: `[door] open|close at x,y,z`, `[door] path`,
+ * `[door] FAILED`.
  */
 export function installDoorAssist(bot: Bot): void {
   if (installed.has(bot)) return;
   installed.add(bot);
 
-  const pathKeys = new Set<string>();
+  const blockAt: BlockAtFn = (p) => bot.blockAt(p);
+  // The executor's own array (shifted as nodes are reached), captured from path_update.
+  let livePath: PathNodeLike[] = [];
   const opened = new Map<string, OpenedDoor>();
   const lastToggle = new Map<string, number>();
+  const attempts = new Map<string, number>();
   let busy = false;
 
   bot.on("path_update", (results) => {
-    pathKeys.clear();
-    for (const n of results.path) pathKeys.add(key(n.x, n.y, n.z));
+    livePath = results.path as unknown as PathNodeLike[];
+    const fixed = normalizeDoorNodes(livePath, blockAt);
+    if (fixed > 0) console.log(`[${bot.username}] [door] path: repaired ${fixed} door node(s) (pathfinder lifts them onto the door top)`);
   });
-  bot.on("goal_updated", () => pathKeys.clear());
+  const clearPath = (): void => {
+    livePath = [];
+  };
+  bot.on("goal_updated", clearPath);
+  bot.on("path_reset", clearPath);
+  bot.on("path_stop", clearPath);
 
-  const toggle = (block: Block, k: string, rememberToClose: boolean): void => {
+  const toggle = async (block: DoorBlockLike, rememberToClose: boolean): Promise<void> => {
+    const p = block.position.clone();
+    const k = key(p.x, p.y, p.z);
     busy = true;
     lastToggle.set(k, Date.now());
-    const wasClosed = block.getProperties().open === false;
-    bot
-      .activateBlock(block)
-      .then(() => {
-        if (rememberToClose && wasClosed) opened.set(k, { pos: block.position.clone(), openedAt: Date.now() });
-        const p = block.position;
-        recordEvent(bot.username, {
-          kind: "door",
-          action: wasClosed ? "open" : "close",
-          block: block.name,
-          pos: { x: p.x, y: p.y, z: p.z },
-        });
-      })
-      .catch((err: unknown) => {
-        console.warn(`[${bot.username}] door toggle failed at ${k}: ${err instanceof Error ? err.message : String(err)}`);
-      })
-      .finally(() => {
-        busy = false;
-      });
+    const wasOpen = block.getProperties().open === true;
+    const action = wasOpen ? "close" : "open";
+    try {
+      await bot.activateBlock(block as Block);
+      const deadline = Date.now() + STATE_WAIT_MS;
+      let changed = false;
+      while (Date.now() < deadline) {
+        const now = bot.blockAt(p);
+        if (now && (now.getProperties().open === true) !== wasOpen) {
+          changed = true;
+          break;
+        }
+        await sleep(50);
+      }
+      if (changed) {
+        attempts.delete(k);
+        console.log(`[${bot.username}] [door] ${action} at ${p.x},${p.y},${p.z} (${block.name})`);
+        if (rememberToClose && !wasOpen) opened.set(k, { pos: p, openedAt: Date.now() });
+        recordEvent(bot.username, { kind: "door", action, block: block.name, pos: { x: p.x, y: p.y, z: p.z } });
+      } else {
+        const n = (attempts.get(k) ?? 0) + 1;
+        attempts.set(k, n);
+        console.warn(`[${bot.username}] [door] ${action} FAILED at ${p.x},${p.y},${p.z} (${block.name}): no state change after ${STATE_WAIT_MS}ms (attempt ${n}/${MAX_ATTEMPTS})`);
+      }
+    } catch (err) {
+      attempts.set(key(p.x, p.y, p.z), (attempts.get(k) ?? 0) + 1);
+      console.warn(`[${bot.username}] [door] ${action} FAILED at ${p.x},${p.y},${p.z}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      busy = false;
+    }
   };
 
   bot.on("physicsTick", () => {
     if (busy || !bot.entity) return;
     const pos = bot.entity.position;
-
-    // 1) Open whatever door/gate on the path is in the way.
     const pf = (bot as Bot & { pathfinder?: { isMoving(): boolean } }).pathfinder;
-    if (pf?.isMoving() && pathKeys.size > 0) {
-      const yaw = bot.entity.yaw;
-      const fx = -Math.sin(yaw);
-      const fz = -Math.cos(yaw);
-      const axis: "x" | "z" = Math.abs(fx) >= Math.abs(fz) ? "x" : "z";
-      const major = axis === "x" ? fx : fz;
-      if (Math.abs(major) >= 0.7) {
-        const step = new Vec3(axis === "x" ? Math.sign(fx) : 0, 0, axis === "z" ? Math.sign(fz) : 0);
-        for (const k of LOOKAHEAD_STEPS) {
-          for (const dy of [0, 1]) {
-            const cell = pos.plus(step.scaled(k)).offset(0, dy, 0).floored();
-            const door = doorAt(bot, cell);
-            if (!door) continue;
-            const dk = key(door.position.x, door.position.y, door.position.z);
-            if (!pathKeys.has(dk)) continue;
-            if (!blocksTravel(door, axis)) continue;
-            if (Date.now() - (lastToggle.get(dk) ?? 0) < PER_DOOR_COOLDOWN_MS) continue;
-            toggle(door, dk, true);
-            return;
-          }
+    const moving = !!pf?.isMoving();
+
+    // 1) Open whatever door/gate on the upcoming path is in the way.
+    if (moving && livePath.length > 0) {
+      const ahead = findDoorAhead(pos, livePath, blockAt);
+      if (ahead) {
+        const dp = ahead.door.position;
+        const dk = key(dp.x, dp.y, dp.z);
+        if (Date.now() - (lastToggle.get(dk) ?? 0) >= PER_DOOR_COOLDOWN_MS && (attempts.get(dk) ?? 0) < MAX_ATTEMPTS) {
+          void toggle(ahead.door, true);
+          return;
         }
       }
     }
@@ -208,44 +370,21 @@ export function installDoorAssist(bot: Bot): void {
         continue;
       }
       if (horiz < CLOSE_BEHIND_DIST) continue;
-      const door = doorAt(bot, entry.pos);
+      const door = doorAt(blockAt, entry.pos);
       if (!door || door.getProperties().open !== true) {
         opened.delete(dk); // already shut (by someone else) or gone
         continue;
       }
-      if (pathKeys.has(dk) && pf?.isMoving()) continue; // still about to walk back through
+      if (moving && pathUsesDoor(livePath, entry.pos)) continue; // still about to walk back through
       if (someoneNear(bot, entry.pos)) continue;
       opened.delete(dk);
-      toggle(door, dk, false);
+      void toggle(door, false);
       return;
     }
   });
 }
 
-/**
- * Door/gate at `cell`, normalised to the lower half for doors (both halves
- * toggle together, and path nodes are feet-level). Null if not hand-openable.
- */
-function doorAt(bot: Bot, cell: Vec3): Block | null {
-  const b = bot.blockAt(cell);
-  if (!b || !isHandOpenable(b.name)) return null;
-  if (b.name.endsWith("_door") && b.getProperties().half === "upper") {
-    const below = bot.blockAt(cell.offset(0, -1, 0));
-    return below && below.name === b.name ? below : null;
-  }
-  return b;
-}
-
-/** Does the block's current collision shape block walking along `axis`? */
-function blocksTravel(block: Block, axis: "x" | "z"): boolean {
-  for (const s of block.shapes) {
-    // shape = [minX, minY, minZ, maxX, maxY, maxZ] in block-local coords
-    const lo = axis === "x" ? s[2]! : s[0]!;
-    const hi = axis === "x" ? s[5]! : s[3]!;
-    if (lo < HITBOX_HI && hi > HITBOX_LO) return true;
-  }
-  return false;
-}
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 function someoneNear(bot: Bot, doorPos: Vec3): boolean {
   const center = doorPos.offset(0.5, 0, 0.5);

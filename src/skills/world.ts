@@ -31,6 +31,8 @@ const MAX_UNREACHABLE_SKIPS = 6;
 // ...or after this many consecutive digs that put nothing in the inventory.
 const MAX_FRUITLESS_DIGS = 3;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
+/** A* think budget for mining approaches (pathfinder default 5 s is too short in jungles / hills). */
+const GATHER_THINK_TIMEOUT_MS = 10_000;
 // How many nearest matches to pull per scan so a protected (player-built)
 // nearest block doesn't hide an unprotected one just behind it.
 const CANDIDATE_SCAN_COUNT = 48;
@@ -238,6 +240,8 @@ async function mineBlocksInner(
   let sameBlockRetries = 0;
   // Blocks we couldn't reach/dig: skipped so one bad candidate doesn't end the batch.
   const unreachable = new Map<string, string>();
+  /** Block type of each unreachable position: lets the job runner avoid that species when re-planning. */
+  const unreachableTypes: Record<string, number> = {};
   let lastFailure = "";
   let fruitlessStreak = 0;
   // Positions refused by the structure guard, reported so the agent knows
@@ -283,6 +287,7 @@ async function mineBlocksInner(
         byType: minedByType,
         gained: inventoryGain(baseline, inventoryCounts(bot)),
         unreachable: unreachable.size,
+        unreachableTypes,
         position: posOf(bot),
         ...extra,
       },
@@ -306,7 +311,7 @@ async function mineBlocksInner(
         return {
           ok: false,
           message: `could not reach any ${types.length === 1 ? mineable[0]!.name : "of those blocks"} (${unreachable.size} tried; ${lastFailure}). Walk somewhere with open access to them or pick another spot.${protectedNote()}`,
-          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, position: posOf(bot) },
+          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, unreachableTypes, position: posOf(bot) },
         };
       }
       if (mined === 0) {
@@ -315,7 +320,7 @@ async function mineBlocksInner(
           message: (types.length === 1
             ? `no ${protectedSeen.size > 0 ? "minable " : ""}${mineable[0]!.name} within ${maxDistance} blocks`
             : `no mineable blocks within ${maxDistance} blocks${skippedNote}`) + unreachNote + protectedNote(),
-          state: { mined, collected: 0, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, unreachable: unreachable.size, position: posOf(bot) },
+          state: { mined, collected: 0, byType: minedByType, skipped, protectedSkipped: protectedSeen.size, unreachable: unreachable.size, unreachableTypes, position: posOf(bot) },
         };
       }
       return finish(
@@ -349,6 +354,7 @@ async function mineBlocksInner(
       if ((oneResult.state as { unreachable?: boolean } | undefined)?.unreachable === true) {
         // Couldn't get at THIS block (e.g. a log above reach) — try the next one.
         unreachable.set(targetKey, oneResult.message);
+        unreachableTypes[thisName] = (unreachableTypes[thisName] ?? 0) + 1;
         lastFailure = oneResult.message;
         if (unreachable.size >= MAX_UNREACHABLE_SKIPS) {
           return finish(mined > 0, `{summary}${mined > 0 ? "; " : ""}gave up after ${unreachable.size} unreachable ${thisName} blocks (${oneResult.message})`);
@@ -410,6 +416,7 @@ function findMineCandidate(
     maxDistance,
     count: CANDIDATE_SCAN_COUNT + skip.size,
   }).filter((p) => !skip.has(`${p.x},${p.y},${p.z}`));
+  rankAvoidingPits(bot, positions);
   if (allowStructures) {
     const first = positions[0];
     return first ? bot.blockAt(first) : null;
@@ -435,6 +442,42 @@ function findMineCandidate(
   }
   reportSkips();
   return null;
+}
+
+/**
+ * Virtual extra distance for a candidate that can only be reached by digging
+ * straight down from the surface (below the bot's feet and covered by a solid
+ * block). Players don't dig themselves into a pit to get stone: a candidate on
+ * a hillside, cave floor or ledge within this many blocks beats it. 8 means a
+ * stone 5 blocks down loses to an exposed one up to ~13 blocks away.
+ */
+export const PIT_DIG_PENALTY = 8;
+
+/** True if reaching `pos` means digging down into a hole: >1 below the feet and a solid block on top. */
+export function isPitCandidate(bot: Bot, pos: Vec3): boolean {
+  if (pos.y >= Math.floor(bot.entity.position.y) - 1) return false;
+  const above = bot.blockAt(pos.offset(0, 1, 0));
+  return !!above && above.boundingBox === "block";
+}
+
+/** Stable re-sort of nearest-first `positions` by distance + pit penalty (in place). */
+function rankAvoidingPits(bot: Bot, positions: Vec3[]): void {
+  if (positions.length < 2) return;
+  const me = bot.entity.position;
+  const pits = new Set<Vec3>();
+  const key = (p: Vec3): number => {
+    const pit = isPitCandidate(bot, p);
+    if (pit) pits.add(p);
+    return p.distanceTo(me) + (pit ? PIT_DIG_PENALTY : 0);
+  };
+  const first = positions[0]!;
+  const keyed = positions.map((p, i) => ({ p, i, k: key(p) }));
+  keyed.sort((a, b) => a.k - b.k || a.i - b.i);
+  for (let i = 0; i < positions.length; i++) positions[i] = keyed[i]!.p;
+  if (positions[0] !== first && pits.has(first)) {
+    const f = positions[0]!;
+    console.log(`[${bot.username}] [mine] pit-avoid: preferring (${f.x}, ${f.y}, ${f.z}) over nearest (${first.x}, ${first.y}, ${first.z}) which needs digging straight down`);
+  }
 }
 
 function posOf(bot: Bot): { x: number; y: number; z: number } {
@@ -871,7 +914,7 @@ function describeRequiredTool(block: Block): string {
 async function pathToBlock(bot: BotWithPathfinder, block: Block, allowStructures = false): Promise<SkillResult> {
   const { x, y, z } = block.position;
   const goal = new goals.GoalLookAtBlock(block.position, bot.world);
-  const opts = { label: `${block.name} at ${fmt(x, y, z)}`, target: block.position.offset(0.5, 0.5, 0.5) };
+  const opts = { label: `${block.name} at ${fmt(x, y, z)}`, target: block.position.offset(0.5, 0.5, 0.5), thinkTimeoutMs: GATHER_THINK_TIMEOUT_MS };
   // Natural target only: never dig toward something that is itself player-made
   // (unless the caller was explicitly asked to demolish).
   const digEligible = allowStructures || isNaturalTarget(block.name);

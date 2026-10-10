@@ -19,8 +19,8 @@ export function ok(detail: string): StepResult {
   return { ok: true, detail };
 }
 
-export function fail(step: Step, kind: FailureKind, detail: string, attempts = 1): StepResult {
-  const failure: StepFailure = { kind, step, detail: detail.slice(0, 240), attempts };
+export function fail(step: Step, kind: FailureKind, detail: string, attempts = 1, avoid?: string[]): StepResult {
+  const failure: StepFailure = { kind, step, detail: detail.slice(0, 240), attempts, ...(avoid && avoid.length > 0 ? { avoid } : {}) };
   return { ok: false, failure };
 }
 

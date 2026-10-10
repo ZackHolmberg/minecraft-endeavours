@@ -35,6 +35,13 @@ export interface WorldView {
   sightings?: Record<string, { pos: Vec3; distance: number }>;
   position: Vec3;
   dimension: "overworld" | "the_nether" | "the_end";
+  /**
+   * Block types a gather has already failed to reach this job (the recovery
+   * ladder feeds them back on re-plan). The planner treats them as not in view,
+   * so recipe-variant choice and gather source choice prefer another species;
+   * they are still used as a last resort when nothing else could supply the item.
+   */
+  avoidBlocks?: string[];
 }
 
 export type Step =
@@ -97,6 +104,8 @@ export interface StepFailure {
   /** Short, specific, player-agnostic, e.g. "no iron_ore within 64 blocks; explored 3 areas". */
   detail: string;
   attempts: number;
+  /** Block types the failed step could not reach (gather only); fed back to the planner as `WorldView.avoidBlocks`. */
+  avoid?: string[];
 }
 
 export interface PlanOptions {

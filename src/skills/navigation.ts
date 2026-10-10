@@ -37,6 +37,7 @@ const BASE_TIMEOUT_MS = 20_000;
 // Walking is ~4.3 b/s; budget ~1 s per straight-line block to cover detours.
 const TIMEOUT_PER_BLOCK_MS = 1_000;
 const MAX_TIMEOUT_MS = 5 * 60_000;
+export const MAX_THINK_TIMEOUT_MS = 10_000;
 
 export interface NavigateOptions {
   /** Human/LLM-readable target name for messages, e.g. "oak_log at (1, 64, 2)". */
@@ -45,6 +46,13 @@ export interface NavigateOptions {
   target: Vec3;
   /** Override the distance-scaled hard timeout. */
   timeoutMs?: number;
+  /**
+   * Pathfinder A* think budget for this goto (default: pathfinder's 5000 ms). Dense
+   * terrain (jungle canopy, hills) routinely exhausts 5 s ("Took to long to decide
+   * path to goal!"); gather approaches ask for more. Clamped to MAX_THINK_TIMEOUT_MS
+   * and restored afterwards.
+   */
+  thinkTimeoutMs?: number;
   /**
    * What to try (once per call) when navigation fails with no path while the
    * bot is boxed in (a pit deeper than the drop limit, a shaft it dug):
@@ -245,17 +253,24 @@ async function navigateInner(
     if (abort) pBot.pathfinder.setGoal(null);
   }, WATCHDOG_TICK_MS);
 
+  const pfTimeouts = pBot.pathfinder as unknown as { thinkTimeout: number };
+  const prevThink = pfTimeouts.thinkTimeout;
+  if (opts.thinkTimeoutMs !== undefined) pfTimeouts.thinkTimeout = Math.min(MAX_THINK_TIMEOUT_MS, Math.max(prevThink, opts.thinkTimeoutMs));
   try {
     await pBot.pathfinder.goto(goal);
   } catch (err) {
     if (!abort) {
       const message = err instanceof Error ? err.message : String(err);
+      if (/took to long/i.test(message)) {
+        console.warn(`[${bot.username}] [nav] think timeout (${pfTimeouts.thinkTimeout}ms) deciding path to ${opts.label}`);
+      }
       note(/no ?path|noPath/i.test(message) ? "no_path" : "error");
       const kind = /no ?path|noPath/i.test(message) ? "no_path" : "error";
       return fail(bot, opts, `pathfinding to ${opts.label} failed: ${message}`, kind);
     }
   } finally {
     clearInterval(watchdog);
+    pfTimeouts.thinkTimeout = prevThink;
   }
 
   if (abort === "cancelled") {

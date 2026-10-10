@@ -18,6 +18,13 @@ export function naturalBlocks(blocks: string[]): string[] {
   return natural.length > 0 ? natural : blocks;
 }
 
+/** Block types `mineBlocks` reported it could not reach (state.unreachableTypes), limited to this step's blocks. */
+export function unreachableBlocksOf(state: unknown, blocks: readonly string[]): string[] {
+  const t = (state as { unreachableTypes?: Record<string, number> } | undefined)?.unreachableTypes;
+  if (!t) return [];
+  return Object.keys(t).filter((b) => (t[b] ?? 0) > 0 && blocks.includes(b));
+}
+
 export async function gatherStep({ bot, ctx }: StepEnv, step: Gather): Promise<StepResult> {
   const target = ctx.baseline + step.count;
   const blocks = naturalBlocks(step.blocks);
@@ -35,14 +42,17 @@ export async function gatherStep({ bot, ctx }: StepEnv, step: Gather): Promise<S
     const gained = have() - before;
     if (gained <= 0 || !r.ok) {
       const kind = classifyFailure(r.message, r.state, "unreachable");
-      return fail(step, kind, `${r.message} (have ${have() - ctx.baseline}/${step.count} ${step.item})`);
+      return fail(step, kind, `${r.message} (have ${have() - ctx.baseline}/${step.count} ${step.item})`, 1, kind === "unreachable" ? unreachableBlocksOf(r.state, step.blocks) : undefined);
     }
     // progress but short ("no more within N blocks"): loop; the next call reports no_source cleanly if empty
   }
   if (have() >= target) return ok(`gathered ${have() - ctx.baseline} ${step.item}`);
+  const lastKind = classifyFailure(last.message, last.state, "no_source");
   return fail(
     step,
-    classifyFailure(last.message, last.state, "no_source"),
+    lastKind,
     `${last.message || "gather made no progress"} (have ${have() - ctx.baseline}/${step.count} ${step.item})`,
+    1,
+    lastKind === "unreachable" ? unreachableBlocksOf(last.state, step.blocks) : undefined,
   );
 }
