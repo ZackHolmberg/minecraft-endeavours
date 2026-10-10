@@ -52,7 +52,7 @@
  * more quota per ARCHITECTURE.md "Resilience".
  */
 
-import { coalesceMessages } from "../coalesce.js";
+import { coalesceMessages, isDirectAddress } from "../coalesce.js";
 import {
   query,
   type Query,
@@ -65,6 +65,7 @@ import {
   beginTask,
   clip,
   endTask,
+  hasReplied,
   recordEvent,
   takeRoutedChat,
   type RoutedChatMeta,
@@ -266,6 +267,8 @@ interface ActiveSession {
   closedByUs: boolean;
   /** Closed because a player said stop. */
   interrupted: boolean;
+  /** The task answers a direct address (name mention, whisper, @all) or a job event: silence is a bug. */
+  direct?: boolean;
 }
 
 export class ClaudeBackend implements AgentBackend {
@@ -530,6 +533,8 @@ export class ClaudeBackend implements AgentBackend {
         this.interruptRequested = false;
         const wasFollowUp = this.followUpQueued;
         this.followUpQueued = false;
+        // v2: Haiku plans in plain text (invisible) and ends the turn without say. One nudge, never a loop.
+        const silent = active.direct === true && !wasFollowUp && !wasInterrupted && msg.subtype === "success" && !hasReplied(this.opts.bot.username);
         if (msg.subtype === "success") {
           const usage = msg.usage as Partial<TurnUsage> | undefined;
           const totalCost = (msg as { total_cost_usd?: number | null }).total_cost_usd ?? null;
@@ -590,6 +595,8 @@ export class ClaudeBackend implements AgentBackend {
         );
         if (msg.subtype === "error_max_turns" && !wasInterrupted && !wasFollowUp) {
           this.queueMaxTurnsFollowUp();
+        } else if (silent) {
+          this.queueSilentFollowUp();
         }
         if (this.mode === "per_task") {
           // Task done: tear the session down; onSessionEnded starts the next one.
@@ -616,6 +623,18 @@ export class ClaudeBackend implements AgentBackend {
     this.followUpQueued = true;
     this.pushUserMessage(
       `[orchestrator note — not a player message] You ran out of steps on the last request and were cut off mid-task. Using only ${how}, tell the player in one short line what you got done and what's left, and ask if they want you to keep going. Don't call any other tool this turn.`,
+    );
+  }
+
+  /** The model ended a directly-addressed task without calling say/whisper: ask once for the reply. */
+  private queueSilentFollowUp(): void {
+    if (this.stopped || this.cooldown.isActive()) return;
+    const partner = getCurrentConversationPartner(this.opts.bot.username);
+    const how = partner ? `say (or whisper to ${partner} if they whispered you)` : "say";
+    console.log(`[${this.opts.bot.username}] task ended without say/whisper; nudging once`);
+    this.followUpQueued = true;
+    this.pushUserMessage(
+      `[orchestrator note — not a player message] Nobody heard anything from you on the last message: plain text is invisible, only the say/whisper tools reach players. Using only ${how}, answer them now in one short line (what you're doing, or your proposal/question). Don't call any other tool this turn.`,
     );
   }
 
@@ -822,6 +841,7 @@ export class ClaudeBackend implements AgentBackend {
       const active = this.openSession();
       this.eventLabels.push(labelFor(batch));
       this.queueTelemetryTask(batch, metas, ctxMs, context, injected);
+      active.direct = batch.some(isDirectAddress);
       this.task = active;
       active.input.push(userMessage(context ? `${context}\n\n${body}` : body));
     } catch (err) {

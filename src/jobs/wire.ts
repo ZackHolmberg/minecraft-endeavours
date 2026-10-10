@@ -16,6 +16,8 @@ import { createExplorer } from "./explore.js";
 import { ledgerFor } from "./ledger.js";
 import { registerJobRunner, unregisterJobRunner } from "./registry.js";
 import { JobRunner } from "./runner.js";
+import { createBuildDeps } from "./steps/build.js";
+import { createDeliver } from "./steps/deliver.js";
 import { createStepExecutor } from "./steps/index.js";
 import { itemCount, slotDump } from "./steps/util.js";
 import type { Job } from "./types.js";
@@ -35,7 +37,7 @@ function logJobEvent(username: string, e: TelemetryInput): void {
       console.log(`${tag} recovery ${e.rung}: ${e.detail}`);
       break;
     case "job_end":
-      console.log(`${tag} ${e.jobId} end: ${e.status}${e.failureKind ? ` (${e.failureKind})` : ""} in ${Math.round(e.durationMs / 1000)}s, ${e.replans} replans`);
+      console.log(`${tag} ${e.jobId} end: ${e.status}${e.failureKind ? ` (${e.failureKind})` : ""} in ${Math.round(e.durationMs / 1000)}s, ${e.replans} replans${e.total ? `, placed ${e.placed ?? 0}/${e.total}` : ""}`);
       break;
     default:
       break;
@@ -61,6 +63,8 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     },
     execute: createStepExecutor(bot),
     explore: createExplorer(bot),
+    build: createBuildDeps(bot),
+    deliver: createDeliver(bot),
     countItem: (item) => itemCount(bot, item),
     reserve: (items) => {
       if (items) {
@@ -84,7 +88,9 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     save: (job) => saveJsonAtomic(path, job),
     onEnd: (job) => {
       // Loop guard (H2): remember failures so `achieve` can refuse a goal that keeps failing.
-      if (job.status === "failed") ledgerFor(username).recordFailure(job.goals, job.failure?.kind ?? "internal");
+      if (job.kind === "build") {
+        // builds are not goal-keyed; the synthetic-event cap is their loop guard
+      } else if (job.status === "failed") ledgerFor(username).recordFailure(job.goals, job.failure?.kind ?? "internal");
       else if (job.status === "done") ledgerFor(username).recordSuccess(job.goals);
       const text = formatJobEvent(job);
       if (text) getAgent(username)?.pushJobEvent(text);

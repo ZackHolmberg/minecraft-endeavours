@@ -3,15 +3,18 @@
  * the pure policy for which Haiku tool calls auto-cancel a running job.
  */
 import type { Bot } from "mineflayer";
+import { defaultPlanks } from "../build/materials.js";
 import { getCurrentConversationPartner } from "../orchestrator/chat-router.js";
 import type { Goal } from "../planner/types.js";
 import { resolveItem } from "../skills/item-naming.js";
 import type { SkillResult } from "../skills/types.js";
 import { isCreative } from "../skills/game-mode.js";
 import { goalsText } from "./describe.js";
+import { findPlayer } from "./steps/deliver.js";
+import { inventoryTotals } from "./world-view.js";
 import { ledgerFor } from "./ledger.js";
 import { getJobRunner } from "./registry.js";
-import type { AchieveResult } from "./types.js";
+import type { AchieveResult, BuildSpec } from "./types.js";
 
 /** Tools that never disturb a running job: reads, talk, notes, job control. Everything else is a new instruction. */
 export const JOB_EXEMPT_TOOLS: ReadonlySet<string> = new Set([
@@ -23,6 +26,7 @@ export const JOB_EXEMPT_TOOLS: ReadonlySet<string> = new Set([
   "setTaskQueue",
   "advanceTaskQueue",
   "achieve",
+  "build",
   "cancelJob",
 ]);
 
@@ -33,14 +37,24 @@ export function shouldCancelJobFor(tool: string, jobRunning: boolean): boolean {
 
 export interface AchieveParams {
   goals: Array<{ item: string; count: number }>;
+  /** Hand the goal items to this player once they're in hand ("give me / get me X"). */
+  deliverTo?: string;
 }
 
 /** Validate names (with did-you-mean), merge duplicates, start the job, return at once. */
-export async function achieve(bot: Bot, { goals }: AchieveParams): Promise<SkillResult> {
+export async function achieve(bot: Bot, { goals, deliverTo }: AchieveParams): Promise<SkillResult> {
   const runner = getJobRunner(bot.username);
   if (!runner) return { ok: false, message: "the job runner isn't available right now" };
-  if (isCreative(bot)) {
-    return { ok: false, message: "creative mode: don't gather or craft — take what you need with getItems", state: { ok: false, jobId: null } };
+  if (isCreative(bot) && !deliverTo) {
+    return { ok: false, message: "creative mode: don't gather or craft — take what you need with getItems (or pass deliverTo to hand items to a player)", state: { ok: false, jobId: null } };
+  }
+  let recipient: string | null = null;
+  if (deliverTo) {
+    recipient = findPlayer(bot, deliverTo);
+    if (!recipient) {
+      const msg = `can't hand things to "${deliverTo}": no player by that name is in sight. Ask them to come closer, or omit deliverTo.`;
+      return { ok: false, message: msg, state: { ok: false, jobId: null, message: msg } satisfies AchieveResult };
+    }
   }
   const merged = new Map<string, number>();
   const errors: string[] = [];
@@ -62,11 +76,53 @@ export async function achieve(bot: Bot, { goals }: AchieveParams): Promise<Skill
     console.log(`[${bot.username}] achieve refused by the failure ledger: ${goalsText(list)}`);
     return { ok: false, message: refusal, state: { ok: false, jobId: null, message: refusal } satisfies AchieveResult };
   }
-  const res = await runner.start(list, getCurrentConversationPartner(bot.username) ?? null);
+  const res = await runner.start(list, getCurrentConversationPartner(bot.username) ?? null, { deliverTo: recipient });
   return {
     ok: res.ok,
     message: res.ok
-      ? `job started: ${goalsText(list)}. Plan: ${res.message}. It runs in the background; reply briefly and end your turn — you'll get a [job finished]/[job failed] message.`
+      ? `job started: ${goalsText(list)}${recipient ? ` → give to ${recipient}` : ""}. Plan: ${res.message}. It runs in the background; reply briefly and end your turn — you'll get a [job finished]/[job failed] message.`
+      : res.message,
+    state: res,
+  };
+}
+
+export interface BuildParams {
+  blueprint: "house" | "portal" | "farm";
+  params?: Record<string, unknown>;
+  at?: "here" | { x: number; y: number; z: number };
+}
+
+/**
+ * Start a build job. "here" = beside the requesting player (else the bot). The
+ * site, materials gap and oriented blueprint are worked out by the runner's
+ * builder; this resolves the anchor, fills the one inventory-dependent default
+ * (which planks), and returns at once like `achieve`.
+ */
+export async function build(bot: Bot, { blueprint, params, at }: BuildParams): Promise<SkillResult> {
+  const runner = getJobRunner(bot.username);
+  if (!runner) return { ok: false, message: "the job runner isn't available right now" };
+  const requester = getCurrentConversationPartner(bot.username) ?? null;
+  const floor = (p: { x: number; y: number; z: number }) => ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) });
+  const me = floor(bot.entity.position);
+  const reqEntity = requester ? bot.players[requester]?.entity : undefined;
+  let anchor = me;
+  if (at && at !== "here") anchor = { x: Math.floor(at.x), y: Math.floor(at.y), z: Math.floor(at.z) };
+  else if (reqEntity) anchor = floor(reqEntity.position);
+  // never cover a nearby player
+  const avoid: Array<{ x: number; y: number; z: number }> = [];
+  for (const [name, p] of Object.entries(bot.players)) {
+    if (name === bot.username || !p.entity) continue;
+    if (p.entity.position.distanceTo(bot.entity.position) <= 48) avoid.push(floor(p.entity.position));
+  }
+  const resolved: Record<string, unknown> = { ...(params ?? {}) };
+  if (blueprint === "house" && typeof resolved.wall !== "string") resolved.wall = defaultPlanks(inventoryTotals(bot.inventory.slots));
+  if (blueprint === "farm") delete resolved.water; // decided by the site
+  const spec: BuildSpec = { blueprint, params: resolved, anchor, avoid };
+  const res = await runner.startBuild(spec, requester);
+  return {
+    ok: res.ok,
+    message: res.ok
+      ? `build started: ${res.message}. It runs in the background; reply briefly and end your turn — you'll get a [job finished]/[job failed] message.`
       : res.message,
     state: res,
   };

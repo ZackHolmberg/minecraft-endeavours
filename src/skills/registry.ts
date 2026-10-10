@@ -25,7 +25,7 @@
 
 import type { Bot } from "mineflayer";
 import { z } from "zod";
-import { achieve, cancelJob } from "../jobs/tools.js";
+import { achieve, build, cancelJob } from "../jobs/tools.js";
 import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
@@ -602,7 +602,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "achieve",
     description:
-      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID. After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. Survival only.",
+      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID. When the player wants the items themselves ('give me', 'get me', 'bring me'), add deliverTo: their name: the job then walks to them and hands the items over (creative: takes them with getItems first). After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. In creative it only works with deliverTo.",
     schema: {
       goals: z
         .array(
@@ -613,8 +613,33 @@ export const SKILL_SPECS: SkillSpec[] = [
         )
         .min(1)
         .max(8),
+      deliverTo: z.string().min(1).optional().describe("Player name to hand the finished items to (they must be nearby)"),
     },
     run: withParams("achieve", achieve, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "build",
+    description:
+      "Build a house, a nether portal or a wheat farm as a background job and return at once. It picks a level site next to the player (never on top of them or on anyone's build), gets any missing materials (survival: gathers/crafts them; creative: getItems), places everything bottom-up with temporary scaffolding and a door added last, then verifies the block count. blueprint 'house': params width/depth 5-9, height 3-4, wall/roof/floor block ids (default: the planks you hold), windows 0-8 (glass if you have it), door. 'portal': 10 obsidian frame + flint_and_steel. 'farm': size 3-9, needs a hoe + seeds, uses water within 4 or a water bucket. at: 'here' (default) or {x,y,z}. After it starts, reply briefly and end your turn — you get '[job finished]' or '[job failed]'. Don't call movement/building tools while it runs (that cancels it).",
+    schema: {
+      blueprint: z.enum(["house", "portal", "farm"]),
+      params: z
+        .object({
+          width: z.number().int().min(5).max(9).optional(),
+          depth: z.number().int().min(5).max(9).optional(),
+          height: z.number().int().min(3).max(4).optional().describe("Rows including the roof: 3 = a 2-high interior"),
+          wall: z.string().optional().describe("Wall block id, e.g. oak_planks, cobblestone"),
+          roof: z.string().optional().describe("Roof block id (default: same as wall)"),
+          floor: z.string().optional().describe("Optional floor block id"),
+          door: z.boolean().optional(),
+          windows: z.number().int().min(0).max(8).optional(),
+          size: z.number().int().min(3).max(9).optional().describe("Farm plot size"),
+        })
+        .optional(),
+      at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = beside the requesting player (default)"),
+    },
+    run: withParams("build", build, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
   {

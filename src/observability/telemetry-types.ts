@@ -159,11 +159,14 @@ export type TelemetryEvent =
       replans: number;
       /** FailureKind of the failure (status failed), else null. */
       failureKind: string | null;
+      /** Build jobs only: blocks placed vs the blueprint total. */
+      placed?: number;
+      total?: number;
     })
   | (TelemetryBase & {
       kind: "step";
       jobId: string;
-      /** Step op: gather | craft | smelt | withdraw | place_station */
+      /** Step op: gather | craft | smelt | withdraw | place_station | build | layer | scaffold | light | deliver */
       op: string;
       item: string;
       ok: boolean;
