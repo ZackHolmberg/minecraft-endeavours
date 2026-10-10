@@ -29,3 +29,9 @@ export function coalesceMessages(batch: readonly string[]): string {
   }
   return parts.join("\n\n");
 }
+
+/** Messages a player aimed at the bot (or a job result for it): the routing note says "reply" without the soft follow-up escape. */
+export function isDirectAddress(message: string): boolean {
+  return /^\[job (finished|failed)\]/.test(message) || /they said your name;|sent to @all|^\[whisper from /.test(message);
+}
+

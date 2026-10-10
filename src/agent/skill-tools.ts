@@ -29,7 +29,7 @@
 
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Bot } from "mineflayer";
-import { goalsText } from "../jobs/describe.js";
+import { jobLabel } from "../jobs/describe.js";
 import { getJobRunner } from "../jobs/registry.js";
 import { shouldCancelJobFor } from "../jobs/tools.js";
 import { recordConversation } from "../memory/conversation-log.js";
@@ -143,13 +143,13 @@ async function withJobAutoCancel(
 ): Promise<SkillResult> {
   const runner = getJobRunner(bot.username);
   if (!runner || !shouldCancelJobFor(spec.name, runner.isRunning())) return run();
-  const goals = runner.current() ? goalsText(runner.current()!.goals) : "?";
+  const goals = runner.current() ? jobLabel(runner.current()!) : "?";
   console.log(`[${bot.username}] ${spec.name} while a job runs — cancelling job (${goals})`);
   await runner.cancel(`superseded by ${spec.name}`);
   const result = await run();
   return spec.name === "stop"
     ? result
-    : { ...result, message: `(your running job "achieve ${goals}" was cancelled because you started something else) ${result.message}` };
+    : { ...result, message: `(your running job "${goals}" was cancelled because you started something else) ${result.message}` };
 }
 
 function wrapSpec(spec: SkillSpec): SkillSpec {

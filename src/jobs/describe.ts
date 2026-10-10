@@ -37,6 +37,12 @@ export function goalsText(goals: readonly Goal[]): string {
   return goals.map((g) => `${g.item} x${g.count}`).join(", ");
 }
 
+/** Short name of what a job is doing: "achieve iron_pickaxe x1", "build house (...)", plus "→ deliver to X". */
+export function jobLabel(job: Job): string {
+  const base = job.kind === "build" && job.build ? `build ${job.build.blueprint}${job.build.summary ? ` (${job.build.summary})` : ""}` : `achieve ${goalsText(job.goals)}`;
+  return job.deliverTo ? `${base} → give to ${job.deliverTo}` : base;
+}
+
 export function formatDuration(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(total / 60);
@@ -59,16 +65,21 @@ export function remainingPlanText(job: Job, max = 8): string {
  */
 export function formatJobEvent(job: Job): string | null {
   const who = job.requestedBy ? ` (requested by ${job.requestedBy} — tell them)` : "";
-  const goals = `achieve ${goalsText(job.goals)}`;
+  const goals = jobLabel(job);
   const dur = formatDuration((job.endedAt ?? Date.now()) - job.startedAt);
   if (job.status === "done") {
+    if (job.kind === "build" && job.build) {
+      const b = job.build;
+      return `[job finished] ${goals} — done in ${dur}, ${b.placed}/${b.total} blocks placed${who}. Reply with one short line saying it's built (and where, if useful).`;
+    }
+    if (job.deliverTo) return `[job finished] ${goals} — handed over in ${dur}${who}. Reply with one short line (they have it now).`;
     return `[job finished] ${goals} — done in ${dur}${who}. Reply with one short line saying you've got it (or what you now have).`;
   }
   if (job.status === "failed" && job.failure) {
     const f = job.failure;
     return (
-      `[job failed] ${goals} — failure: ${f.kind} — ${f.detail}; remaining plan: ${remainingPlanText(job)}${who}. ` +
-      `Tell them in one short line what's blocking, and offer a realistic alternative. Don't just call achieve again with the same goals.`
+      `[job failed] ${goals} — failure: ${f.kind} — ${f.detail}${job.kind === "build" ? "" : `; remaining plan: ${remainingPlanText(job)}`}${who}. ` +
+      `Tell them in one short line what's blocking, and offer a realistic alternative. Don't just call ${job.kind === "build" ? "build" : "achieve"} again with the same arguments.`
     );
   }
   if (job.status === "failed") return `[job failed] ${goals} — ${job.progress}${who}.`;
@@ -86,7 +97,7 @@ export function jobContextLines(job: Job | null, now = Date.now()): string[] {
   if (job.status === "running") {
     const total = job.plan.steps.length;
     const L = [
-      `running: achieve ${goalsText(job.goals)} (started ${formatDuration(now - job.startedAt)} ago, ${job.replans} replan(s))`,
+      `running: ${jobLabel(job)} (started ${formatDuration(now - job.startedAt)} ago, ${job.replans} replan(s))`,
       `progress: ${job.progress || `step ${Math.min(job.stepIndex + 1, total)}/${total}`}`,
     ];
     if (job.requestedBy) L.push(`requested by: ${job.requestedBy}`);
@@ -95,9 +106,9 @@ export function jobContextLines(job: Job | null, now = Date.now()): string[] {
   }
   if (job.endedAt === null || now - job.endedAt > RECENT_END_MS) return [];
   const ago = formatDuration(now - job.endedAt);
-  const base = `last job (${ago} ago): achieve ${goalsText(job.goals)} — ${job.status}`;
+  const base = `last job (${ago} ago): ${jobLabel(job)} — ${job.status}`;
   if (job.status === "failed" && job.failure) {
-    return [`${base}: ${job.failure.kind} — ${job.failure.detail}; remaining plan: ${remainingPlanText(job, 5)}`];
+    return [`${base}: ${job.failure.kind} — ${job.failure.detail}${job.kind === "build" ? "" : `; remaining plan: ${remainingPlanText(job, 5)}`}`];
   }
   if (job.status === "done") return [`${base} in ${formatDuration(job.endedAt - job.startedAt)}`];
   return [`${base}${job.progress ? ` (${job.progress})` : ""}`];

@@ -6,14 +6,64 @@
  * and, on end, queues a synthetic event so Haiku makes the next decision.
  * Persisted to data/orchestrator/memory/<bot>/job.json (disk is the source of truth).
  */
-import type { Goal, Plan, Step, StepFailure } from "../planner/types.js";
+import type { Facing, BlueprintKind } from "../build/types.js";
+import type { FailureKind, Goal, Plan, Step, StepFailure, Vec3 } from "../planner/types.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
 
+export type JobKind = "achieve" | "build";
+
+/** What a `build` job was asked for (slice 3). `anchor` is the resolved "here" (requester, else bot). */
+export interface BuildSpec {
+  blueprint: BlueprintKind;
+  /** Raw blueprint params from the model (normalised by the blueprint). */
+  params: Record<string, unknown>;
+  anchor: Vec3;
+  /** Player positions the footprint must not cover. */
+  avoid: Vec3[];
+}
+
+/** Live state of a build job (persisted with the job). */
+export interface BuildState extends BuildSpec {
+  phase: "materials" | "building";
+  /** Chosen once at start; retries and resumes reuse them so a half-built house isn't mistaken for a player build. */
+  origin: Vec3 | null;
+  facing: Facing | null;
+  summary: string;
+  total: number;
+  placed: number;
+}
+
+/** `prepare` result: the site, blueprint and materials gap, or why the build cannot start. */
+export type BuildPrep =
+  | {
+      ok: true;
+      origin: Vec3;
+      facing: Facing;
+      /** Params with the site-dependent choices resolved (farm water mode); the runner stores them for later attempts. */
+      params: Record<string, unknown>;
+      summary: string;
+      /** Blocks the blueprint will have when done (for the postcondition). */
+      total: number;
+      /** Survival: planner goals for materials the bot lacks. Creative: always empty (getItems runs inside `run`). */
+      missing: Goal[];
+      /** Opaque to the runner; handed back to `run`. */
+      payload: unknown;
+    }
+  | { ok: false; kind: FailureKind; detail: string };
+
+export type BuildOutcome =
+  | { ok: true; placed: number; total: number; detail: string }
+  | { ok: false; kind: FailureKind; detail: string; placed: number; total: number };
+
 export interface Job {
   id: string;
-  kind: "achieve";
+  kind: JobKind;
   goals: Goal[];
+  /** achieve: hand the goal items to this player when the goals are met. */
+  deliverTo?: string | null;
+  /** Set when kind is "build". */
+  build?: BuildState;
   /** Player who asked (for the follow-up event), null if self-initiated. */
   requestedBy: string | null;
   status: JobStatus;

@@ -94,6 +94,8 @@ export type FailureKind =
   | "timeout"
   | "died"
   | "hostile" // aborted due to combat / danger
+  | "no_site" // build: no suitable level natural spot near the requester
+  | "build_incomplete" // build: some blueprint blocks could not be placed
   | "unknown_item" // name not in minecraft-data
   | "not_obtainable" // planner has no source (e.g. needs trading / Nether, not supported yet)
   | "internal"; // bug / exception
