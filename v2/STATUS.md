@@ -11,6 +11,9 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
+## LIVE TEST (owner request, 2026-10-10 17:05)
+- `Steve_v2` (v2 @ `6d5af8b`) is running on the **real server** from worktree `../mcv2-live` (`.env` MC_PORT=25565, docker disabled there). Started live MC via main checkout `scripts/start.sh`; backup `backups/world_2026-10-10_17-05-14.tar.gz` (main checkout) taken first; `whitelist add Steve_v2` on live. Stop: `cd ../mcv2-live && ./scripts/botStop.sh`. Logs: `../mcv2-live/.bot-runtime/bot.log` (+ `data/orchestrator/telemetry/Steve_v2/` there). Panel doesn't show it. Afterwards: `./scripts/botReport.sh` in mcv2-live; consider `whitelist remove Steve_v2`.
+
 ## In flight (2026-10-10 ~16:00)
 - Merged into `v2` @ `6d5af8b`: slice-3 review fixes, 2c-A (`f183dde`: nearby containers, gather continuation, generic `#tag` goals, side replies, strictMcpConfig), 2c-B (`8463bb8`: explore-elsewhere recovery — coal live 2/3; shelter + survive_night job — still failing live), deliverTo prompt fix. 319 tests.
 - **Run `v2/runs/v2-s4`** (core ×2, bench `../mcv2-bench` @ `6d5af8b`), log ends CHAIN_DONE.
