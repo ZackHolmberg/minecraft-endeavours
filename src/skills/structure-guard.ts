@@ -49,8 +49,113 @@ export function isCraftedBlockName(name: string): boolean {
   return CRAFTED_PATTERNS.some((re) => re.test(name));
 }
 
+/**
+ * Cheap-break allowlist: foliage a player would simply cut through, so the BASE
+ * (never-digging) pathfinder policy may break it: all leaves (jungle canopies
+ * otherwise make `Took to long to decide path` / unreachable logs), vines and
+ * non-solid plants. Everything else stays unbreakable to A*. Leaves count as
+ * natural even when they touch player builds (hedges, tree-hugging walls), so
+ * the structure guard never protects them.
+ */
+const CHEAP_BREAK_PATTERNS: readonly RegExp[] = [
+  /_leaves$/,
+  /^(vine|cave_vines(_plant)?|weeping_vines(_plant)?|twisting_vines(_plant)?)$/,
+  /^(short_grass|tall_grass|grass|fern|large_fern|dead_bush|seagrass|tall_seagrass)$/,
+];
+
+export function isCheapBreak(name: string): boolean {
+  return CHEAP_BREAK_PATTERNS.some((re) => re.test(name));
+}
+
+// ---------------------------------------------------------------------------
+// Tree check (v2 regression pl.no_grief: the bot chopped a player's log hut)
+// ---------------------------------------------------------------------------
+
+/** Unstripped log / wood blocks. Stripped ones never occur in natural trees. */
+const TREE_LOG_RE = /^(?!stripped_)[a-z_]+_(log|wood)$/;
+const ANY_LOG_RE = /_(log|wood)$/;
+const TREE_LEAF_RADIUS = 2;
+const TREE_CLUSTER_CAP = 200;
+/** Natural trunks/limbs never run 3+ logs in a straight horizontal line (2x2 trunks and 2-long limbs do). */
+const HORIZONTAL_RUN = 3;
+
+export function isLogName(name: string): boolean {
+  return ANY_LOG_RE.test(name);
+}
+
+type NameAt = (p: Vec3) => { name: string } | null;
+
+/**
+ * Is the log at `start` part of a natural tree? True only if its connected log
+ * cluster (26-neighbourhood) (a) has leaves within {@link TREE_LEAF_RADIUS}
+ * blocks of some log and (b) has no horizontal run of {@link HORIZONTAL_RUN}+
+ * logs, i.e. is not a wall/beam/floor. A bare pillar or wall of logs, or any
+ * stripped log, is treated as player-built. Pure over `nameAt`, so unit-testable.
+ * `verdicts` (optional) memoises the answer for every cell of the cluster.
+ */
+export function isTreeLog(nameAt: NameAt, start: Vec3, verdicts?: Map<string, boolean>): boolean {
+  const k = (p: Vec3): string => `${p.x},${p.y},${p.z}`;
+  const first = nameAt(start);
+  if (!first || !TREE_LOG_RE.test(first.name)) return false;
+  const known = verdicts?.get(k(start));
+  if (known !== undefined) return known;
+
+  const seen = new Set<string>([k(start)]);
+  const cells: Vec3[] = [start];
+  for (let i = 0; i < cells.length && cells.length < TREE_CLUSTER_CAP; i++) {
+    const c = cells[i]!;
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+      if (dx === 0 && dy === 0 && dz === 0) continue;
+      const n = new Vec3(c.x + dx, c.y + dy, c.z + dz);
+      const nk = k(n);
+      if (seen.has(nk)) continue;
+      const b = nameAt(n);
+      if (!b || !ANY_LOG_RE.test(b.name)) continue;
+      seen.add(nk);
+      cells.push(n);
+    }
+  }
+  const anyStripped = cells.some((c) => !TREE_LOG_RE.test(nameAt(c)?.name ?? ""));
+  let verdict = !anyStripped;
+  if (verdict) {
+    for (const c of cells) {
+      for (const [dx, dz] of [[1, 0], [0, 1]] as const) {
+        if (seen.has(k(new Vec3(c.x + dx, c.y, c.z + dz))) && seen.has(k(new Vec3(c.x + 2 * dx, c.y, c.z + 2 * dz)))) {
+          verdict = false;
+        }
+      }
+      if (!verdict) break;
+    }
+  }
+  if (verdict) verdict = clusterTouchesLeaves(nameAt, cells);
+  if (verdicts) for (const c of cells) verdicts.set(k(c), verdict);
+  return verdict;
+}
+
+function clusterTouchesLeaves(nameAt: NameAt, cells: Vec3[]): boolean {
+  const r = TREE_LEAF_RADIUS;
+  // top cells first: the crown is above the trunk
+  const order = [...cells].sort((a, b) => b.y - a.y);
+  for (const c of order) {
+    for (let dy = r; dy >= -r; dy--) for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+      const b = nameAt(new Vec3(c.x + dx, c.y + dy, c.z + dz));
+      if (b && b.name.endsWith("_leaves")) return true;
+    }
+  }
+  return false;
+}
+
+let treeCache: { bot: Bot | null; at: number; map: Map<string, boolean> } = { bot: null, at: 0, map: new Map() };
+const TREE_CACHE_MS = 1_500;
+
 /** Returns a short reason if `block` looks player-built, else null. */
 export function builtStructureReason(bot: Bot, block: Block): string | null {
+  if (isCheapBreak(block.name)) return null;
+  if (isLogName(block.name)) {
+    const now = Date.now();
+    if (treeCache.bot !== bot || now - treeCache.at > TREE_CACHE_MS) treeCache = { bot, at: now, map: new Map() };
+    if (!isTreeLog((p) => bot.blockAt(p), block.position, treeCache.map)) return `${block.name} is not part of a tree (log wall/pillar/stripped: looks player-built)`;
+  }
   if (ALWAYS_PATTERNS.some((re) => re.test(block.name))) return `${block.name} is a door/window`;
   const crafted = isCraftedBlockName(block.name);
   let craftedNeighbours = 0;

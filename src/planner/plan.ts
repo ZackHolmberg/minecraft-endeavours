@@ -30,6 +30,7 @@ import type { Goal, Plan, PlanFn, PlanOptions, Step, Vec3, WorldView } from "./t
 const INF = Infinity;
 const MAX_DEPTH = 40;
 const DEFAULT_MAX_STEPS = 200;
+const AVOIDED_OWNED_COST = 2;
 const TABLE = "@crafting_table";
 const FURNACE = "@furnace";
 
@@ -58,11 +59,14 @@ class Planner {
   private costBusy = new Set<string>();
   private cycleTo = INF;
   private containerTotals = new Map<string, number>();
+  /** Block types the executor failed to reach (WorldView.avoidBlocks): treated as not in view. */
+  private avoid: ReadonlySet<string>;
 
   constructor(
     private book: RecipeBook,
     private view: WorldView,
   ) {
+    this.avoid = new Set(view.avoidBlocks ?? []);
     for (const c of view.containers) for (const [k, v] of Object.entries(c.items)) this.containerTotals.set(k, (this.containerTotals.get(k) ?? 0) + v);
   }
 
@@ -76,11 +80,18 @@ class Planner {
   private cost(item: string, depth = 0): number {
     const m = this.costMemo.get(item);
     if (m !== undefined) return m;
-    if (this.owned(item) > 0) return 0;
+    if (this.owned(item) > 0) {
+      // Held, but only obtainable from avoided blocks: a replacement is cheap to plan around, so any
+      // species that is actually in view (cost ~1) beats topping this one up; still beats "nothing in reach".
+      const src = this.book.blocksYielding(item);
+      if (this.avoid.size > 0 && src.length > 0 && src.every((s) => this.avoid.has(s.block))) return AVOIDED_OWNED_COST;
+      return 0;
+    }
     if (depth > 4 || this.costBusy.has(item)) return INF;
     this.costBusy.add(item);
     let best = INF;
     for (const s of this.book.blocksYielding(item)) {
+      if (this.avoid.has(s.block)) continue;
       const nb = this.view.nearbyBlocks[s.block];
       if (nb && nb.count > 0) best = Math.min(best, 1 + nb.nearest / 1000);
     }
@@ -283,7 +294,7 @@ class Planner {
   }
 
   private planGather(item: string, stack: string[]): { method?: Extract<Method, { t: "gather" }>; fail: string } {
-    const inView = (b: string) => (this.view.nearbyBlocks[b]?.count ?? 0) > 0;
+    const inView = (b: string) => !this.avoid.has(b) && (this.view.nearbyBlocks[b]?.count ?? 0) > 0;
     const dist = (b: string) => this.view.nearbyBlocks[b]?.nearest ?? INF;
     const all = this.book.blocksYielding(item);
     if (all.length === 0) return { fail: "" };
@@ -292,10 +303,13 @@ class Planner {
     if (crop && !inView(crop.block)) {
       return { fail: `no_source: ${item} needs a farm/village crop (no ${crop.block} in view)` };
     }
-    const allowed = all.filter((s) => blockDimension(s.block) === this.view.dimension || inView(s.block));
+    let allowed = all.filter((s) => blockDimension(s.block) === this.view.dimension || inView(s.block));
     if (allowed.length === 0) {
       return { fail: `not_obtainable: ${item} only generates in ${blockDimension(all[0]!.block)} (not supported)` };
     }
+    // avoided (unreachable) sources only as a last resort
+    const usable = allowed.filter((s) => !this.avoid.has(s.block));
+    if (usable.length > 0) allowed = usable;
     allowed.sort((a, b) => dist(a.block) - dist(b.block));
     const base = allowed.some((s) => inView(s.block)) ? allowed.filter((s) => inView(s.block)) : allowed;
     const rank = (t: string | null) => (t === null ? -1 : this.toolRank(t));

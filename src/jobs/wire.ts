@@ -10,6 +10,7 @@ import { recordEvent, type TelemetryInput } from "../observability/telemetry.js"
 import { plan } from "../planner/plan.js";
 import type { BotState } from "../state/index.js";
 import { loadJson, memoryFileFor, saveJsonAtomic } from "../state/persist.js";
+import { clearReserved, reservedSnapshot, setReserved } from "../state/reservations.js";
 import { formatJobEvent } from "./describe.js";
 import { createExplorer } from "./explore.js";
 import { ledgerFor } from "./ledger.js";
@@ -61,6 +62,15 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     execute: createStepExecutor(bot),
     explore: createExplorer(bot),
     countItem: (item) => itemCount(bot, item),
+    reserve: (items) => {
+      if (items) {
+        setReserved(username, items);
+        console.log(`[${username}] [reserve] job needs: ${Object.keys(items).join(", ")}`);
+      } else if (Object.keys(reservedSnapshot(username)).length > 0) {
+        clearReserved(username);
+        console.log(`[${username}] [reserve] cleared (job ended)`);
+      }
+    },
     requestStop: () => {
       state.cancellation.request();
       const pf = (bot as Bot & { pathfinder?: { isMoving(): boolean; stop(): void } }).pathfinder;

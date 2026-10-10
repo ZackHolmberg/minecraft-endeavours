@@ -11,7 +11,7 @@ import minecraftData from "minecraft-data";
 import pathfinderPkg from "mineflayer-pathfinder";
 import PrismarineBlock from "prismarine-block";
 import { Vec3 } from "vec3";
-import { diggingDepth, ensureMovements, hasConfiguredMovements, resetMovementsToBase, withDiggingMovements, DIG_SCOPE_MAX_MS, type BotWithPathfinder } from "../pathfinder-config.js";
+import { BASE_DIG_COST, SCOPED_DIG_COST, diggingDepth, ensureMovements, hasConfiguredMovements, resetMovementsToBase, withDiggingMovements, DIG_SCOPE_MAX_MS, type BotWithPathfinder } from "../pathfinder-config.js";
 import { isBoxedIn, navigate, navFailureOf } from "../navigation.js";
 import { isNaturalTerrain } from "../structure-guard.js";
 
@@ -41,11 +41,16 @@ function fakeBot(username: string, blocks: Map<string, string> = new Map()): Bot
 }
 
 type M = {
-  bot: unknown; canDig: boolean; allow1by1towers: boolean; canOpenDoors: boolean; maxDropDown: number;
+  bot: unknown; canDig: boolean; blocksCantBreak: Set<number>; allow1by1towers: boolean; canOpenDoors: boolean; maxDropDown: number;
   liquidCost: number; scafoldingBlocks: number[]; getBlock: (p: Vec3, dx: number, dy: number, dz: number) => { safe: boolean; physical: boolean };
   countScaffoldingItems(): number;
 };
 const mv = (b: BotWithPathfinder): M => b.pathfinder.movements as unknown as M;
+const id = (n: string): number => registry.blocksByName[n]!.id;
+/** Can A* break this block under the currently installed Movements? */
+const breaks = (m: M, name: string): boolean => m.canDig && !m.blocksCantBreak.has(id(name));
+/** "Scoped digging variant installed": the cheap one (base digs natural terrain too, but at BASE_DIG_COST). */
+const digs = (m: M): boolean => m.canDig && (m as unknown as { digCost: number }).digCost === SCOPED_DIG_COST;
 
 // 0. Reproduce the bug: the plugin's own default Movements already has .bot === bot and canDig.
 const blocks = new Map([["5,64,5", "oak_door"]]);
@@ -61,7 +66,11 @@ const defaultInstance = mv(bot1);
 assert.equal(hasConfiguredMovements(bot1), false);
 ensureMovements(bot1);
 assert.notEqual(mv(bot1), defaultInstance, "default instance replaced");
-assert.equal(mv(bot1).canDig, false);
+assert.equal(digs(mv(bot1)), false, "base is the expensive variant");
+assert.equal((mv(bot1) as unknown as { digCost: number }).digCost, BASE_DIG_COST);
+// cheap-break foliage allowlist: leaves/vines/plants yes, everything else no
+for (const n of ["oak_leaves", "jungle_leaves", "azalea_leaves", "cherry_leaves", "mangrove_leaves", "vine", "short_grass", "tall_grass", "fern", "large_fern", "stone", "dirt", "grass_block", "sand", "gravel", "iron_ore", "coal_ore", "andesite"]) assert.equal(breaks(mv(bot1), n), true, `base breaks ${n}`);
+for (const n of ["oak_log", "jungle_log", "oak_planks", "cobblestone", "oak_door", "glass", "chest", "crafting_table", "bedrock", "water", "white_wool", "furnace", "oak_stairs", "red_bed"]) assert.equal(breaks(mv(bot1), n), false, `base must not break ${n}`);
 assert.equal(mv(bot1).allow1by1towers, false);
 assert.equal(mv(bot1).canOpenDoors, false);
 assert.equal(mv(bot1).liquidCost, 3);
@@ -95,22 +104,22 @@ assert.equal(mv(bot1), installed);
 const bot2 = fakeBot("a", blocks);
 assert.equal(mv(bot2).canDig, true);
 ensureMovements(bot2);
-assert.equal(mv(bot2).canDig, false);
+assert.equal(digs(mv(bot2)), false);
 assert.notEqual(mv(bot2), installed);
 assert.equal(mv(bot1), installed, "old bot unaffected");
 
 // 5. Scoped digging: on inside, restored after (also on throw), never global.
 await withDiggingMovements(bot1, { allowStructures: false }, async () => {
-  assert.equal(mv(bot1).canDig, true);
+  assert.equal(digs(mv(bot1)), true);
   assert.equal(mv(bot1).allow1by1towers, false);
   assert.deepEqual(mv(bot1).scafoldingBlocks, []);
   const inner = mv(bot1).getBlock(new Vec3(5, 64, 5), 0, 0, 0);
   assert.equal(inner.physical, false, "digging variant keeps the door patch");
   ensureMovements(bot1); // navigate() calls this inside the scope: must not clobber it
-  assert.equal(mv(bot1).canDig, true);
+  assert.equal(digs(mv(bot1)), true);
 });
 assert.equal(mv(bot1), installed);
-assert.equal(mv(bot1).canDig, false);
+assert.equal(digs(mv(bot1)), false);
 await assert.rejects(withDiggingMovements(bot1, {}, async () => { throw new Error("boom"); }), /boom/);
 assert.equal(mv(bot1), installed, "restored after throw");
 
@@ -130,12 +139,12 @@ await withDiggingMovements(bot3, { allowStructures: true }, async () => {
 // 7. End-to-end A* on a tiny world: 21x21 stone floor at y=63 (nothing beyond is loaded),
 //    a closed 3x3 stone room around (8,64,0). Default Movements tunnels in; ours says noPath;
 //    scoped digging finds a path; a gap with cobblestone in the inventory is NOT bridged.
-function room(extra: (m: Map<string, string>) => void = () => {}): Map<string, string> {
+function room(extra: (m: Map<string, string>) => void = () => {}, wall = "stone"): Map<string, string> {
   const m = new Map<string, string>();
   for (let x = -10; x <= 10; x++) for (let z = -10; z <= 10; z++) m.set(`${x},63,${z}`, "stone");
   for (let x = 7; x <= 9; x++) for (let z = -1; z <= 1; z++) {
     if (x === 8 && z === 0) continue;
-    for (const y of [64, 65]) m.set(`${x},${y},${z}`, "stone");
+    for (const y of [64, 65]) m.set(`${x},${y},${z}`, wall);
   }
   extra(m);
   return m;
@@ -147,10 +156,22 @@ const goal = new goals.GoalBlock(8, 64, 0);
   const dflt = b.pathfinder.getPathTo(b.pathfinder.movements, goal, 3000);
   assert.equal(dflt.status, "success", "default Movements tunnels into the closed room");
   ensureMovements(b);
-  assert.equal(b.pathfinder.getPathTo(b.pathfinder.movements, goal, 3000).status, "noPath", "configured Movements refuses");
+  // v2 change: base Movements may dig NATURAL terrain (stone walls), at BASE_DIG_COST.
+  assert.equal(b.pathfinder.getPathTo(b.pathfinder.movements, goal, 3000).status, "success", "base digs natural stone");
   const dug = await withDiggingMovements(b, {}, async () => b.pathfinder.getPathTo(b.pathfinder.movements, goal, 3000));
   assert.equal(dug.status, "success", "scoped digging reaches it");
-  assert.equal(b.pathfinder.getPathTo(b.pathfinder.movements, goal, 3000).status, "noPath", "and is off again afterwards");
+  // ...but never a built room: planks walls stay a wall for both variants.
+  const pb = fakeBot("rp", room(() => {}, "oak_planks"));
+  ensureMovements(pb);
+  assert.equal(pb.pathfinder.getPathTo(pb.pathfinder.movements, goal, 3000).status, "noPath", "base refuses a planks room");
+  const pdug = await withDiggingMovements(pb, {}, async () => pb.pathfinder.getPathTo(pb.pathfinder.movements, goal, 3000));
+  assert.equal(pdug.status, "noPath", "scoped digging refuses a planks room");
+  // ...and cobblestone / logs / doors-less glass likewise
+  for (const wall of ["cobblestone", "oak_log", "glass"]) {
+    const w = fakeBot("rw", room(() => {}, wall));
+    ensureMovements(w);
+    assert.equal(w.pathfinder.getPathTo(w.pathfinder.movements, goal, 3000).status, "noPath", `base refuses a ${wall} room`);
+  }
 }
 {
   // A door in the room wall: configured Movements walks in through it (planner treats it as passable).
@@ -180,14 +201,14 @@ const goal = new goals.GoalBlock(8, 64, 0);
   await withDiggingMovements(b, {}, async () => {
     assert.equal(diggingDepth(b), 1);
     const dig = mv(b);
-    assert.equal(dig.canDig, true);
+    assert.equal(digs(dig), true);
     await withDiggingMovements(b, { allowStructures: true }, async () => {
       assert.equal(diggingDepth(b), 2);
       assert.equal(mv(b), dig, "nested scope reuses the digging instance");
     });
     assert.equal(diggingDepth(b), 1);
     assert.equal(mv(b), dig, "inner exit must NOT restore base early");
-    assert.equal(mv(b).canDig, true);
+    assert.equal(digs(mv(b)), true);
   });
   assert.equal(diggingDepth(b), 0);
   assert.equal(mv(b), base);
@@ -198,7 +219,7 @@ const goal = new goals.GoalBlock(8, 64, 0);
   assert.equal(diggingDepth(b), 2);
   releaseA(); await a;
   assert.equal(diggingDepth(b), 1);
-  assert.equal(mv(b).canDig, true, "B still has digging after A exits");
+  assert.equal(digs(mv(b)), true, "B still has digging after A exits");
   releaseB(); await bb;
   assert.equal(mv(b), base);
   // Throw inside nested scope unwinds the counter.
@@ -275,8 +296,14 @@ const goal = new goals.GoalBlock(8, 64, 0);
     assert.equal(m.safeToBreak(mk("furnace", new Vec3(0, 70, 0))), false);
     assert.equal(m.safeToBreak(mk("cobblestone", new Vec3(0, 70, 0))), false);
   });
-  // Base policy is unaffected (still canDig=false; and its own safeToBreak is false).
-  assert.equal((b.pathfinder.movements as unknown as { canDig: boolean }).canDig, false);
+  // Base policy: natural terrain only (expensive); its own safeToBreak agrees.
+  assert.equal(digs(mv(b)), false);
+  {
+    const m = b.pathfinder.movements as unknown as { safeToBreak(blk: unknown): boolean };
+    const mk = (n: string, pos: Vec3) => Object.assign(Block.fromStateId(registry.blocksByName[n]!.defaultState!, 0), { position: pos });
+    for (const n of ["jungle_leaves", "stone", "dirt"]) assert.equal(m.safeToBreak(mk(n, new Vec3(0, 70, 0))), true, `base may break ${n}`);
+    for (const n of ["oak_planks", "furnace", "oak_log", "cobblestone"]) assert.equal(m.safeToBreak(mk(n, new Vec3(0, 70, 0))), false, `base must not break ${n}`);
+  }
 }
 
 // 10. isBoxedIn: sealed shaft / deep pit = boxed; open ground, 1-high step, door = not.
@@ -339,7 +366,7 @@ const goal = new goals.GoalBlock(8, 64, 0);
     b.entity.position = new Vec3(0.5, y, 0.5);
     const calls: boolean[] = [];
     (b.pathfinder as unknown as { goto: (g: unknown) => Promise<void> }).goto = async () => {
-      const dig = (b.pathfinder.movements as unknown as { canDig: boolean }).canDig;
+      const dig = digs(mv(b));
       calls.push(dig);
       if (!dig || !digWorks) throw new Error("No path to the goal!");
       b.entity.position = new Vec3(8.5, 64, 0.5); // "arrived"
@@ -357,7 +384,7 @@ const goal = new goals.GoalBlock(8, 64, 0);
     assert.deepEqual(calls, [false, true], "no-dig attempt, then exactly one dig-out");
     assert.equal((r.state as { escaped?: string }).escaped, "dig");
     assert.equal(diggingDepth(b), 0);
-    assert.equal(mv(b).canDig, false);
+    assert.equal(digs(mv(b)), false);
   }
   {
     const { b, calls } = mkNav("esc2", pit, 59, false);
