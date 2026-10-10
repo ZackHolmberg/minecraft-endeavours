@@ -38,7 +38,7 @@
 ## Benchmark scores
 | run | core | t1 | t2 | t3 | conv | int | pl | cr | turns | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| v1-baseline | 13/30 | 7/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 1/2 | 187 | [report](reports/baseline-v1.md); t1.eat re-run after harness fix; results.jsonl reconstructed |
+| v1-baseline | 12/30 | 7/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 0/2 | ~230 | [report](reports/baseline-v1.md); t1.eat + 4 confirm-policy scenarios re-run (D13); cr.build_house flipped PASS→FAIL on re-run (plan only in thinking, never said) — single-repeat noise is real, use repeats for milestone numbers |
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
