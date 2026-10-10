@@ -24,8 +24,11 @@ describe("isOperatorItem / creative refusal (M5)", () => {
       "zombie_spawn_egg", "creeper_spawn_egg", "knowledge_book", "end_portal_frame", "spawner", "trial_spawner", "reinforced_deepslate",
     ]) expect(isOperatorItem(n), n).toBe(true);
   });
-  it("leaves normal items alone (tnt/lava are not on the list)", () => {
-    for (const n of ["cobblestone", "torch", "oak_planks", "diamond_pickaxe", "tnt", "lava_bucket", "light_gray_wool", "lightning_rod"]) expect(isOperatorItem(n), n).toBe(false);
+  it("refuses griefing tools (tnt, lava, end crystals)", () => {
+    for (const n of ["tnt", "tnt_minecart", "lava_bucket", "end_crystal"]) expect(isOperatorItem(n), n).toBe(true);
+  });
+  it("leaves normal items alone", () => {
+    for (const n of ["cobblestone", "torch", "oak_planks", "diamond_pickaxe", "flint_and_steel", "light_gray_wool", "lightning_rod"]) expect(isOperatorItem(n), n).toBe(false);
   });
 
   const creativeBot = (): Bot =>
