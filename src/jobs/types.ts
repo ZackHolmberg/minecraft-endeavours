@@ -23,6 +23,11 @@ export interface BuildSpec {
   avoid: Vec3[];
 }
 
+/** A temporary support block the builder placed (and must remove again). Persisted so a crash/stop can't orphan it. */
+export interface ScaffoldCell extends Vec3 {
+  item: string;
+}
+
 /** Live state of a build job (persisted with the job). */
 export interface BuildState extends BuildSpec {
   phase: "materials" | "building";
@@ -32,6 +37,8 @@ export interface BuildState extends BuildSpec {
   summary: string;
   total: number;
   placed: number;
+  /** True when this job continues an earlier failed/cancelled build at its stored origin (no re-siting). */
+  resumed?: boolean;
 }
 
 /** `prepare` result: the site, blueprint and materials gap, or why the build cannot start. */
@@ -49,6 +56,8 @@ export type BuildPrep =
       missing: Goal[];
       /** Opaque to the runner; handed back to `run`. */
       payload: unknown;
+      /** Inventory items the build consumes or needs in hand (blocks, scaffold, tools, seeds, bucket, flint): reserved for the whole job. */
+      reserve?: string[];
     }
   | { ok: false; kind: FailureKind; detail: string };
 
@@ -64,6 +73,10 @@ export interface Job {
   deliverTo?: string | null;
   /** Set when kind is "build". */
   build?: BuildState;
+  /** Set when the job failed at the hand-over to the player (not at gathering): not a goal-keyed failure for the ledger. */
+  handoverFailed?: boolean;
+  /** Scaffold blocks placed by a builder and not yet confirmed removed (survives stop/crash/restart; reclaimed by the next build or at boot). */
+  scaffolds?: ScaffoldCell[];
   /** Player who asked (for the follow-up event), null if self-initiated. */
   requestedBy: string | null;
   status: JobStatus;

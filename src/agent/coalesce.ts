@@ -35,3 +35,17 @@ export function isDirectAddress(message: string): boolean {
   return /^\[job (finished|failed)\]/.test(message) || /they said your name;|sent to @all|^\[whisper from /.test(message);
 }
 
+
+/**
+ * The one-shot nudge sent when a directly-addressed task ended with no say/whisper. It runs as a fresh
+ * task with no memory of the silent turn, so the wording must not invite a claim of work that never
+ * started (review M8): say only what the tool results / context block show.
+ */
+export function silentNudgeText(how: string): string {
+  return (
+    `[orchestrator note — not a player message] Nobody heard anything from you on the last message: plain text is invisible, only the say/whisper tools reach players. ` +
+    `Using only ${how}, answer them now in one short line. Say only what is TRUE according to the status in your context and your tool results: ` +
+    `if no job is running and no tool call succeeded, you have NOT started anything, so don't say you are doing it or "on it". ` +
+    `Instead say what you can do, give your proposal, or ask your one question. Never claim work that hasn't begun. Don't call any other tool this turn.`
+  );
+}

@@ -40,8 +40,8 @@ import type { BotState } from "../state/index.js";
 import { pickBestWeapon, swingCooldownMs } from "./combat.js";
 import { isCreative } from "./game-mode.js";
 import { pickBestFood } from "./survival.js";
-import { isCheapBreak, isNaturalTerrain } from "./structure-guard.js";
-import { findAirRoute, findRoofDig, isPassable, isWet, suffocatingBlock } from "./surfacing.js";
+import { builtStructureReason, craftedWithin, isCheapBreak, isNaturalTerrain } from "./structure-guard.js";
+import { findAirRoute, findFallbackSwim, findRoofDig, isPassable, isWet, ROOF_CRAFTED_RADIUS, suffocatingBlock } from "./surfacing.js";
 
 const IDLE_LOOK_RANGE = 6;
 const AUTO_EAT_FOOD_AT = 14;
@@ -279,17 +279,32 @@ const SUFFOCATE_TICKS = 2;
 const SUFFOCATE_MAX_DIGS = 5;
 const REFLEX_DIG_TIMEOUT_MS = 8_000;
 
+/** Back-off after a routine that found no way out: 1 s, 2 s, 4 s, 8 s, then this cap (review M4). */
+export const SURFACE_BACKOFF_CAP_MS = 10_000;
+/** The reflex logs/records telemetry at most once per this long (more are counted and folded into the next). */
+export const SURFACE_EVENT_MIN_GAP_MS = 10_000;
+
+/** Pure: delay before the reflex may retry after `streak` consecutive failed attempts (1-based). */
+export function surfaceBackoffMs(streak: number): number {
+  return Math.min(SURFACE_BACKOFF_CAP_MS, 1_000 * 2 ** Math.max(0, streak - 1));
+}
+
 interface SurfaceState {
   active: boolean;
   endedAt: number;
   lastOxygen: number;
   suffocateTicks: number;
+  /** Consecutive routines that did not get the bot out (drives the back-off). */
+  failStreak: number;
+  nextAllowedAt: number;
+  lastEventAt: number;
+  suppressed: number;
 }
 const surfaceStates = new WeakMap<Bot, SurfaceState>();
 function surfaceState(bot: Bot): SurfaceState {
   let st = surfaceStates.get(bot);
   if (!st) {
-    st = { active: false, endedAt: 0, lastOxygen: 20, suffocateTicks: 0 };
+    st = { active: false, endedAt: 0, lastOxygen: 20, suffocateTicks: 0, failStreak: 0, nextAllowedAt: 0, lastEventAt: 0, suppressed: 0 };
     surfaceStates.set(bot, st);
   }
   return st;
@@ -329,7 +344,10 @@ function eyeCell(bot: Bot): Vec3 {
  * entity's packets instead.
  */
 const ownOxygen = new WeakMap<Bot, number>();
-const oxygenOf = (bot: Bot): number => ownOxygen.get(bot) ?? (typeof bot.oxygenLevel === "number" ? bot.oxygenLevel : 20);
+const ownOxygenTracked = new WeakSet<Bot>();
+/** Our own reading; before the first own packet assume full air (bot.oxygenLevel is polluted by other entities) unless tracking is unavailable. */
+const oxygenOf = (bot: Bot): number =>
+  ownOxygen.get(bot) ?? (ownOxygenTracked.has(bot) ? 20 : typeof bot.oxygenLevel === "number" ? bot.oxygenLevel : 20);
 
 function headInWater(bot: Bot): boolean {
   return isWet(bot.blockAt(eyeCell(bot)));
@@ -351,7 +369,7 @@ export function survivalTick(bot: Bot, state: BotState): void {
     st.suffocateTicks += 1;
     if (st.suffocateTicks >= SUFFOCATE_TICKS) {
       st.suffocateTicks = 0;
-      startRoutine(bot, state, st, `suffocation: head inside ${headBlock!.name}`, "suffocate");
+      if (Date.now() >= st.nextAllowedAt) startRoutine(bot, state, st, `suffocation: head inside ${headBlock!.name}`, "suffocate");
     }
     return;
   }
@@ -366,25 +384,61 @@ export function survivalTick(bot: Bot, state: BotState): void {
       reason = `underwater, oxygen ${oxygen}/20 falling, ${route ? `${route.path.length} blocks to air` : "no open air reachable"}`;
     }
   }
-  if (reason) startRoutine(bot, state, st, reason, "surface");
+  if (reason && Date.now() >= st.nextAllowedAt) startRoutine(bot, state, st, reason, "surface");
+}
+
+/** Record a failed attempt and delay the next one. */
+function backOff(st: SurfaceState): void {
+  st.failStreak += 1;
+  st.nextAllowedAt = Date.now() + surfaceBackoffMs(st.failStreak);
+}
+
+/** Log + telemetry + action log, at most once per {@link SURFACE_EVENT_MIN_GAP_MS}; suppressed ones are counted into the next. */
+function emitReflex(bot: Bot, state: BotState, st: SurfaceState, detail: string): void {
+  const now = Date.now();
+  if (now - st.lastEventAt < SURFACE_EVENT_MIN_GAP_MS) {
+    st.suppressed += 1;
+    return;
+  }
+  const text = st.suppressed > 0 ? `${detail} (+${st.suppressed} similar suppressed)` : detail;
+  st.suppressed = 0;
+  st.lastEventAt = now;
+  console.warn(`[${bot.username}] [reflex] ${text}`);
+  recordEvent(bot.username, { kind: "reflex", reflex: "surface", detail: text.slice(0, 200) });
+  state.actions.record(`reflex: ${text}`);
+}
+
+/** Is there any way out of the water: a swim to air, a diggable roof, or a wider/other swim? Read-only. */
+function hasSurfaceWay(bot: Bot): boolean {
+  const at = (p: Vec3) => bot.blockAt(p);
+  const head = eyeCell(bot);
+  return !!findAirRoute(at, head) || !!findRoofDig(at, head) || !!findFallbackSwim(at, head);
 }
 
 function startRoutine(bot: Bot, state: BotState, st: SurfaceState, reason: string, mode: "surface" | "suffocate"): void {
+  // With nowhere to go, leave the pathfinder and any running dig alone (they may be the bot's best chance) and back off.
+  if (mode === "surface" && !hasSurfaceWay(bot)) {
+    emitReflex(bot, state, st, `${reason}; no swim, roof dig or shore found, backing off`);
+    backOff(st);
+    return;
+  }
   st.active = true; // set synchronously: navigate's catch checks it when the goal drops
-  console.warn(`[${bot.username}] [reflex] ${reason}`);
-  recordEvent(bot.username, { kind: "reflex", reflex: "surface", detail: reason.slice(0, 200) });
-  state.actions.record(`reflex: ${reason}`);
+  emitReflex(bot, state, st, reason);
   void (async () => {
+    let ok = false;
     try {
-      interruptMovement(bot);
-      if (mode === "suffocate") await digOut(bot);
-      else await swimToAir(bot);
+      interruptMovement(bot); // once per attempt
+      ok = mode === "suffocate" ? await digOut(bot) : await swimToAir(bot, (d) => emitReflex(bot, state, st, d));
     } catch (err) {
       console.warn(`[${bot.username}] survival reflex failed:`, err instanceof Error ? err.message : err);
     } finally {
       releaseControls(bot);
       st.active = false;
       st.endedAt = Date.now();
+      if (ok) {
+        st.failStreak = 0;
+        st.nextAllowedAt = 0;
+      } else backOff(st);
     }
   })();
 }
@@ -416,18 +470,20 @@ async function steerTo(bot: Bot, to: Vec3): Promise<void> {
   }
 }
 
-async function swimToAir(bot: Bot): Promise<void> {
+/** Returns true when the head ended up out of the water. */
+async function swimToAir(bot: Bot, note: (detail: string) => void): Promise<boolean> {
   const t0 = Date.now();
   const at = (p: Vec3) => bot.blockAt(p);
   let dug = false;
   let airSince = 0;
+  let fellBack = false;
   bot.setControlState("jump", true);
   while (Date.now() - t0 < SURFACE_MAX_MS && bot.health > 0) {
     const head = eyeCell(bot);
     if (!isWet(at(head))) {
       // Head is out. Keep swimming a moment (to clear the water's edge), then call it done.
       airSince ||= Date.now();
-      if (Date.now() - airSince > 1_000 || oxygenOf(bot) >= 18) return;
+      if (Date.now() - airSince > 1_000 || oxygenOf(bot) >= 18) return true;
       await sleepMs(SURFACE_STEP_MS);
       continue;
     }
@@ -442,28 +498,44 @@ async function swimToAir(bot: Bot): Promise<void> {
       await sleepMs(REPLAN_MS);
       continue;
     }
-    // Sealed water: dig up through a natural roof.
+    // Sealed water: dig up through a natural roof that is not a player's floor/ceiling (M1) ...
     const roof = findRoofDig(at, head);
-    if (!roof) {
-      console.warn(`[${bot.username}] [reflex] no air and no diggable roof reachable from ${head.x},${head.y},${head.z}`);
-      return;
-    }
-    const roofReached = roof.stand.x === head.x && roof.stand.z === head.z && roof.stand.y <= head.y + 0;
-    if (!roofReached) {
-      const step = roof.swim[0] ?? roof.stand;
-      if (step.y > head.y) { bot.setControlState("jump", true); bot.setControlState("forward", false); }
-      else { bot.setControlState("jump", false); await steerTo(bot, step); }
-      await sleepMs(REPLAN_MS);
+    if (roof) {
+      const roofReached = roof.stand.x === head.x && roof.stand.z === head.z && roof.stand.y <= head.y + 0;
+      if (!roofReached) {
+        const step = roof.swim[0] ?? roof.stand;
+        if (step.y > head.y) { bot.setControlState("jump", true); bot.setControlState("forward", false); }
+        else { bot.setControlState("jump", false); await steerTo(bot, step); }
+        await sleepMs(REPLAN_MS);
+        continue;
+      }
+      releaseControls(bot);
+      const block = at(roof.dig[0]!);
+      // re-check against the live world right before breaking
+      if (!block || builtStructureReason(bot, block) !== null || craftedWithin((p) => bot.blockAt(p), block.position, ROOF_CRAFTED_RADIUS) || !(await digWithTool(bot, block))) return false;
+      dug = true;
+      bot.setControlState("jump", true);
+      await sleepMs(SURFACE_STEP_MS);
       continue;
     }
-    releaseControls(bot);
-    const block = at(roof.dig[0]!);
-    if (!block || !(await digWithTool(bot, block))) return;
-    dug = true;
+    // ... or, with no roof we may dig, swim toward the nearest air / the highest water instead.
+    const fb = findFallbackSwim(at, head);
+    if (!fb || fb.path.length === 0) {
+      console.warn(`[${bot.username}] [reflex] no air and no diggable roof reachable from ${head.x},${head.y},${head.z}`);
+      return false;
+    }
+    if (!fellBack) {
+      fellBack = true;
+      note(`sealed water and the roof is not safe to dig; swimming toward ${fb.kind === "air" ? "open air" : "the highest water"} (${fb.path.length} blocks)`);
+    }
+    const target = fb.path.find((c) => c.x !== head.x || c.z !== head.z) ?? fb.path[0]!;
+    if (target.x === head.x && target.z === head.z) bot.setControlState("forward", false);
+    else await steerTo(bot, target);
     bot.setControlState("jump", true);
-    await sleepMs(SURFACE_STEP_MS);
+    await sleepMs(REPLAN_MS);
   }
   if (dug) console.log(`[${bot.username}] [reflex] dug through a roof to reach air`);
+  return !isWet(at(eyeCell(bot)));
 }
 
 async function digWithTool(bot: Bot, block: NonNullable<ReturnType<Bot["blockAt"]>>): Promise<boolean> {
@@ -496,12 +568,12 @@ async function digWithTool(bot: Bot, block: NonNullable<ReturnType<Bot["blockAt"
   }
 }
 
-/** Head inside a solid block: dig it if natural (repeat for falling blocks that refill), else step out. */
-async function digOut(bot: Bot): Promise<void> {
+/** Head inside a solid block: dig it if natural and not set into a player build (repeat for falling blocks that refill), else step out. */
+async function digOut(bot: Bot): Promise<boolean> {
   for (let i = 0; i < SUFFOCATE_MAX_DIGS && bot.health > 0; i++) {
     const head = bot.blockAt(eyeCell(bot));
-    if (!suffocatingBlock(head as never)) return;
-    if (head && (isNaturalTerrain(head.name) || isCheapBreak(head.name))) {
+    if (!suffocatingBlock(head as never)) return true;
+    if (head && (isNaturalTerrain(head.name) || isCheapBreak(head.name)) && builtStructureReason(bot, head) === null) {
       if (await digWithTool(bot, head)) {
         await sleepMs(250);
         continue;
@@ -509,8 +581,8 @@ async function digOut(bot: Bot): Promise<void> {
     }
     break;
   }
-  if (!suffocatingBlock(bot.blockAt(eyeCell(bot)) as never)) return;
-  // Not natural (or the dig failed): walk to the nearest free 2-high cell.
+  if (!suffocatingBlock(bot.blockAt(eyeCell(bot)) as never)) return true;
+  // Not natural / player-built (or the dig failed): walk to the nearest free 2-high cell.
   const p = bot.entity.position;
   const base = new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z));
   let best: { c: Vec3; d: number } | null = null;
@@ -520,13 +592,14 @@ async function digOut(bot: Bot): Promise<void> {
     const d = Math.abs(dx) + Math.abs(dz) + Math.abs(dy);
     if (d > 0 && (!best || d < best.d)) best = { c: feet, d };
   }
-  if (!best) return;
+  if (!best) return false;
   const t0 = Date.now();
   bot.setControlState("jump", true);
   while (Date.now() - t0 < 4_000 && suffocatingBlock(bot.blockAt(eyeCell(bot)) as never)) {
     await steerTo(bot, best.c);
     await sleepMs(SURFACE_STEP_MS);
   }
+  return !suffocatingBlock(bot.blockAt(eyeCell(bot)) as never);
 }
 
 // ── hurt cause (telemetry) ───────────────────────────────────────────────────
@@ -547,6 +620,7 @@ export function trackSurvivalState(bot: Bot): void {
   const airKey = (bot.registry.entitiesByName.player as { metadataKeys?: string[] } | undefined)?.metadataKeys?.indexOf("air_supply") ?? -1;
   const client = (bot as unknown as { _client: { on(ev: string, fn: (p: { entityId: number; metadata: Array<{ key: number; value: unknown }> }) => void): void } })._client;
   if (airKey >= 0) {
+    ownOxygenTracked.add(bot);
     client.on("entity_metadata", (packet) => {
       if (!bot.entity || packet.entityId !== bot.entity.id) return;
       const m = packet.metadata.find((e) => e.key === airKey);

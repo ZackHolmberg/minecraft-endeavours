@@ -83,7 +83,7 @@ export function isLogName(name: string): boolean {
   return ANY_LOG_RE.test(name);
 }
 
-type NameAt = (p: Vec3) => { name: string } | null;
+export type NameAt = (p: Vec3) => { name: string } | null | undefined;
 
 /**
  * Is the log at `start` part of a natural tree? True only if its connected log
@@ -145,27 +145,79 @@ function clusterTouchesLeaves(nameAt: NameAt, cells: Vec3[]): boolean {
   return false;
 }
 
+/** Leaves count as part of a tree when a natural tree log is within this many blocks. */
+export const LEAF_TREE_LOG_RADIUS = 4;
+
+/**
+ * Pure check behind `freeStuckDrops` (breaking the block a dropped item rests on during
+ * tree felling). True only for a block that is clearly a natural tree part:
+ *  - a natural tree log (`isTreeLog`: leaves nearby, no wall/beam runs, nothing stripped), or
+ *  - leaves with a natural tree log within {@link LEAF_TREE_LOG_RADIUS} blocks,
+ * and, for both, NO crafted block (planks, glass, stairs, ...) within 1 block of it
+ * (26-neighbourhood) or directly above/below it. A player's hedge, treehouse floor or
+ * log post therefore never qualifies. `verdicts` memoises `isTreeLog`.
+ */
+export function isFreeableTreeBlock(nameAt: NameAt, pos: Vec3, verdicts?: Map<string, boolean>): boolean {
+  const here = nameAt(pos);
+  if (!here) return false;
+  const isLog = TREE_LOG_RE.test(here.name);
+  const isLeaf = here.name.endsWith("_leaves");
+  if (!isLog && !isLeaf) return false;
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+    if (dx === 0 && dy === 0 && dz === 0) continue;
+    const n = nameAt(new Vec3(pos.x + dx, pos.y + dy, pos.z + dz));
+    if (n && isCraftedBlockName(n.name)) return false;
+  }
+  if (isLog) return isTreeLog(nameAt, pos, verdicts);
+  const r = LEAF_TREE_LOG_RADIUS;
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+    const p = new Vec3(pos.x + dx, pos.y + dy, pos.z + dz);
+    const b = nameAt(p);
+    if (b && TREE_LOG_RE.test(b.name) && isTreeLog(nameAt, p, verdicts)) return true;
+  }
+  return false;
+}
+
 let treeCache: { bot: Bot | null; at: number; map: Map<string, boolean> } = { bot: null, at: 0, map: new Map() };
 const TREE_CACHE_MS = 1_500;
 
 /** Returns a short reason if `block` looks player-built, else null. */
 export function builtStructureReason(bot: Bot, block: Block): string | null {
   if (isCheapBreak(block.name)) return null;
+  let verdicts: Map<string, boolean> | undefined;
   if (isLogName(block.name)) {
     const now = Date.now();
     if (treeCache.bot !== bot || now - treeCache.at > TREE_CACHE_MS) treeCache = { bot, at: now, map: new Map() };
-    if (!isTreeLog((p) => bot.blockAt(p), block.position, treeCache.map)) return `${block.name} is not part of a tree (log wall/pillar/stripped: looks player-built)`;
+    verdicts = treeCache.map;
+  }
+  return builtReasonAt((p) => bot.blockAt(p), block, verdicts);
+}
+
+/** Pure form of {@link builtStructureReason}: only needs a name lookup. */
+export function builtReasonAt(nameAt: NameAt, block: { name: string; position: Vec3 }, verdicts?: Map<string, boolean>): string | null {
+  if (isCheapBreak(block.name)) return null;
+  if (isLogName(block.name)) {
+    if (!isTreeLog(nameAt, block.position, verdicts)) return `${block.name} is not part of a tree (log wall/pillar/stripped: looks player-built)`;
   }
   if (ALWAYS_PATTERNS.some((re) => re.test(block.name))) return `${block.name} is a door/window`;
   const crafted = isCraftedBlockName(block.name);
   let craftedNeighbours = 0;
   for (const off of NEIGHBOURS) {
-    const n = bot.blockAt(block.position.plus(off));
+    const n = nameAt(block.position.plus(off));
     if (n && isCraftedBlockName(n.name)) craftedNeighbours += 1;
   }
   if (crafted && craftedNeighbours >= 1) return `${block.name} is joined to other building blocks`;
   if (!crafted && craftedNeighbours >= 2) return `${block.name} is set into a built wall`;
   return null;
+}
+
+/** Is there a crafted (player-made) block within `r` blocks (cube) of `pos`? */
+export function craftedWithin(nameAt: NameAt, pos: Vec3, r: number): boolean {
+  for (let dx = -r; dx <= r; dx++) for (let dy = -r; dy <= r; dy++) for (let dz = -r; dz <= r; dz++) {
+    const n = nameAt(new Vec3(pos.x + dx, pos.y + dy, pos.z + dz));
+    if (n && isCraftedBlockName(n.name)) return true;
+  }
+  return false;
 }
 
 /**

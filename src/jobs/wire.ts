@@ -13,13 +13,14 @@ import { loadJson, memoryFileFor, saveJsonAtomic } from "../state/persist.js";
 import { clearReserved, reservedSnapshot, setReserved } from "../state/reservations.js";
 import { formatJobEvent } from "./describe.js";
 import { createExplorer } from "./explore.js";
-import { ledgerFor } from "./ledger.js";
+import { buildLedgerFor, ledgerFor } from "./ledger.js";
 import { registerJobRunner, unregisterJobRunner } from "./registry.js";
 import { JobRunner } from "./runner.js";
 import { createBuildDeps } from "./steps/build.js";
 import { createDeliver } from "./steps/deliver.js";
 import { createStepExecutor } from "./steps/index.js";
 import { itemCount, slotDump } from "./steps/util.js";
+import type { Facing } from "../build/types.js";
 import type { Job } from "./types.js";
 import { buildWorldView, DEFAULT_SCAN_RADIUS } from "./world-view.js";
 
@@ -86,12 +87,45 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     },
     load: () => loadJson<Job>(path),
     save: (job) => saveJsonAtomic(path, job),
+    // Slice 3 review M3: remember what every build left behind (also cancelled / interrupted), so a re-build resumes onto it.
+    buildHistory: {
+      refusal: (spec) => buildLedgerFor(username).refusal(spec.blueprint, spec.anchor),
+      partial: (spec) => {
+        const r = buildLedgerFor(username).partial(spec.blueprint, spec.anchor);
+        return r && r.origin && r.facing ? { origin: r.origin, facing: r.facing as Facing, params: r.params, placed: r.placed, total: r.total } : null;
+      },
+    },
+    onBuildEnd: (job) => {
+      const b = job.build;
+      if (!b) return;
+      const led = buildLedgerFor(username);
+      if (job.status === "done") {
+        led.success(b.blueprint, b.anchor);
+        return;
+      }
+      led.record({
+        jobId: job.id,
+        at: Date.now(),
+        blueprint: b.blueprint,
+        anchor: b.anchor,
+        origin: b.origin,
+        facing: b.facing,
+        params: b.params,
+        placed: b.placed,
+        total: b.total,
+        kind: job.failure?.kind ?? "cancelled",
+        // a player's stop or a restart is not "the build keeps failing"
+        failure: job.status === "failed" && job.failure?.kind !== "died",
+      });
+    },
     onEnd: (job) => {
       // Loop guard (H2): remember failures so `achieve` can refuse a goal that keeps failing.
       if (job.kind === "build") {
-        // builds are not goal-keyed; the synthetic-event cap is their loop guard
-      } else if (job.status === "failed") ledgerFor(username).recordFailure(job.goals, job.failure?.kind ?? "internal");
-      else if (job.status === "done") ledgerFor(username).recordSuccess(job.goals);
+        // builds are not goal-keyed: the build ledger (onBuildEnd) and the synthetic-event cap are their loop guards
+      } else if (job.status === "failed") {
+        // A player who walked away makes the hand-over fail even though the bot holds the items: not a goal failure.
+        if (!(job.handoverFailed && job.failure?.kind === "unreachable")) ledgerFor(username).recordFailure(job.goals, job.failure?.kind ?? "internal");
+      } else if (job.status === "done") ledgerFor(username).recordSuccess(job.goals);
       const text = formatJobEvent(job);
       if (text) getAgent(username)?.pushJobEvent(text);
     },
@@ -104,5 +138,11 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     void runner.dispose().catch((err) => console.warn(`[${username}] job runner dispose failed:`, err));
   });
   await registerJobRunner(username, runner);
+  // Scaffold blocks a previous run left standing (crash / restart / stop): take them down once the bot is in the world.
+  const reclaim = (): void => {
+    setTimeout(() => void runner.reclaimOrphans().catch(() => undefined), 5_000);
+  };
+  if (bot.entity) reclaim();
+  else bot.once("spawn", reclaim);
   return runner;
 }

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  BuildFailureLedger,
+  buildLedgerFor,
   GoalFailureLedger,
   JobEventLimiter,
   eventLimiterFor,
@@ -82,5 +84,78 @@ describe("per-bot registry", () => {
     expect(ledgerFor("a").refusal(g)).toBeNull();
     expect(eventLimiterFor("a").allow()).toBe(true);
     expect(ledgerFor("b").refusal(g)).not.toBeNull();
+  });
+});
+
+describe("BuildFailureLedger (M3)", () => {
+  const rec = (over: Partial<Parameters<BuildFailureLedger["record"]>[0]> = {}) => ({
+    jobId: "j1",
+    at: 1_000,
+    blueprint: "house",
+    anchor: { x: 100, y: 64, z: 100 },
+    origin: { x: 103, y: 64, z: 103 },
+    facing: "south",
+    params: { wall: "oak_planks" },
+    placed: 30,
+    total: 57,
+    kind: "build_incomplete" as const,
+    failure: true,
+    ...over,
+  });
+
+  it("remembers the unfinished structure near the same anchor (within 16 blocks), same blueprint only", () => {
+    const l = new BuildFailureLedger();
+    l.record(rec());
+    expect(l.partial("house", { x: 100, y: 64, z: 100 }, 2_000)).toMatchObject({ origin: { x: 103, y: 64, z: 103 }, facing: "south", placed: 30 });
+    expect(l.partial("house", { x: 112, y: 64, z: 105 }, 2_000)).not.toBeNull(); // 12 blocks off
+    expect(l.partial("house", { x: 140, y: 64, z: 100 }, 2_000)).toBeNull(); // another spot
+    expect(l.partial("portal", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+  });
+  it("nothing placed, or already complete: no structure to resume", () => {
+    const l = new BuildFailureLedger();
+    l.record(rec({ placed: 0 }));
+    expect(l.partial("house", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+    l.record(rec({ jobId: "j2", placed: 57 }));
+    expect(l.partial("house", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+  });
+  it("a later record for the same job replaces the earlier (final count after a stop)", () => {
+    const l = new BuildFailureLedger();
+    l.record(rec({ placed: 0, kind: "cancelled", failure: false }));
+    l.record(rec({ placed: 12, kind: "cancelled", failure: false }));
+    expect(l.partial("house", { x: 100, y: 64, z: 100 }, 2_000)).toMatchObject({ placed: 12 });
+  });
+  it("refuses after two failures near the place within the window, with the kinds and counts in the message", () => {
+    const l = new BuildFailureLedger();
+    l.record(rec({ jobId: "a" }));
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+    l.record(rec({ jobId: "b", at: 5_000, kind: "timeout" }));
+    const msg = l.refusal("house", { x: 105, y: 64, z: 95 }, 6_000)!;
+    expect(msg).toMatch(/failed 2 times/);
+    expect(msg).toMatch(/build_incomplete, timeout/);
+    expect(l.refusal("house", { x: 300, y: 64, z: 300 }, 6_000)).toBeNull(); // elsewhere
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 }, 40 * MIN)).toBeNull(); // window over
+  });
+  it("a player cancel does not count as a failure; success wipes the place; chat clears counts but keeps the structure", () => {
+    const l = new BuildFailureLedger();
+    l.record(rec({ jobId: "a", kind: "cancelled", failure: false }));
+    l.record(rec({ jobId: "b", kind: "cancelled", failure: false }));
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+    l.record(rec({ jobId: "c" }));
+    l.record(rec({ jobId: "d" }));
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 }, 2_000)).not.toBeNull();
+    l.clearFailures();
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+    expect(l.partial("house", { x: 100, y: 64, z: 100 }, 2_000)).not.toBeNull();
+    l.success("house", { x: 100, y: 64, z: 100 });
+    expect(l.partial("house", { x: 100, y: 64, z: 100 }, 2_000)).toBeNull();
+  });
+  it("per-bot registry; noteExternalChat clears failure counts only", () => {
+    const l = buildLedgerFor("ledger-test-bot");
+    l.record(rec({ jobId: "a", at: Date.now() }));
+    l.record(rec({ jobId: "b", at: Date.now() }));
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 })).not.toBeNull();
+    noteExternalChat("ledger-test-bot");
+    expect(l.refusal("house", { x: 100, y: 64, z: 100 })).toBeNull();
+    expect(l.partial("house", { x: 100, y: 64, z: 100 })).not.toBeNull();
   });
 });

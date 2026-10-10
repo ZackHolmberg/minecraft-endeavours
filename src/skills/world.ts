@@ -230,6 +230,8 @@ async function mineBlocksInner(
       .filter((s) => !s.startsWith("0 ") || mineable.length === 1)
       .join(", ");
   const baseline = inventoryCounts(bot);
+  /** Log gathering (tree felling): the only mode allowed to free items stuck on tree blocks. */
+  const felling = mineable.some((m) => isTreeLogName(m.name));
   let untrackedDug = 0;
   const collectedNow = (): number => {
     const gained = inventoryGain(baseline, inventoryCounts(bot));
@@ -280,7 +282,7 @@ async function mineBlocksInner(
     extra: Record<string, unknown> = {},
   ): Promise<SkillResult> => {
     if (mined > 0 && !creative && !cancellation?.isRequested() && collectedNow() < mined) {
-      await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS });
+      await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS }, { freeStuck: felling });
     }
     const collected = collectedNow();
     const target = types.length === 1 ? mineable[0]!.name : "blocks";
@@ -322,7 +324,7 @@ async function mineBlocksInner(
     const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, unreachable, fell);
     // Done with a trunk (the next target is another tree, or none): sweep its drops before moving on.
     if (fell.lastTree && !creative && (!block || !fell.lastTree.has(posKey(block.position)))) {
-      if (mined > 0 && collectedNow() < mined && !cancellation?.isRequested()) await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS });
+      if (mined > 0 && collectedNow() < mined && !cancellation?.isRequested()) await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS }, { freeStuck: felling });
     }
     fell.lastTree = fell.next;
     fell.next = null;
@@ -628,7 +630,7 @@ async function mineOneBlock(
   // away sees nothing. Wait for it to appear, then collect. The caller counts
   // success by inventory delta, so this result is advisory.
   await waitForDropNear(bot, block.position.offset(0.5, 0.5, 0.5), undefined, itemsBeforeDig);
-  await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS });
+  await pickUpNearby(bot, { maxDist: POST_DIG_PICKUP_RADIUS }, { freeStuck: isTreeLogName(block.name) });
   return { ok: true, message: `mined ${blockNameForMsg}` };
 }
 

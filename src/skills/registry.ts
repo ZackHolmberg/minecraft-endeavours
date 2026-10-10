@@ -602,7 +602,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "achieve",
     description:
-      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID. When the player wants the items themselves ('give me', 'get me', 'bring me'), add deliverTo: their name: the job then walks to them and hands the items over (creative: takes them with getItems first). After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. In creative it only works with deliverTo.",
+      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID. When the player wants the items themselves ('give me', 'get me', 'bring me'), add deliverTo: their name: the job then walks to them and hands the items over (creative: takes them with getItems first; capped at 2 stacks per item, 4 for unstackable items, and never operator items like command blocks). After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. In creative it only works with deliverTo.",
     schema: {
       goals: z
         .array(

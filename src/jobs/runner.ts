@@ -30,7 +30,7 @@ import {
 import type { FailureKind, Goal, PlanFn, Plan, Step, StepFailure, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import type { StopReason } from "../state/cancellation.js";
-import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, Job, JobStatus, StepResult } from "./types.js";
+import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, Job, JobStatus, ScaffoldCell, StepResult } from "./types.js";
 
 export interface StepRunContext {
   signal: AbortSignal;
@@ -54,6 +54,10 @@ export interface BuildRunContext extends StepRunContext {
   record: (e: TelemetryInput) => void;
   /** Live progress line + blocks placed so far (persisted with the job). */
   progress: (text: string, placed: number) => void;
+  /** Scaffold blocks left in the world by an earlier attempt/job: the builder removes them before anything else. */
+  scaffolds: ScaffoldCell[];
+  /** The builder's current scaffold list; persisted in job.json at once so a stop/crash can't orphan blocks. Empty clears. */
+  setScaffolds: (list: ScaffoldCell[]) => void;
 }
 
 /** Bot-bound half of a build job (src/jobs/steps/build.ts); injected so the runner stays testable. */
@@ -62,9 +66,22 @@ export interface BuildDeps {
    * Choose the site (or reuse `existing`), orient the blueprint and compute the materials gap.
    * Cheap and side-effect free apart from reading the world.
    */
-  prepare: (spec: BuildSpec, existing: { origin: { x: number; y: number; z: number }; facing: Facing } | null) => Promise<BuildPrep>;
-  /** Place the blueprint (idempotent: cells already done count). */
+  prepare: (
+    spec: BuildSpec,
+    existing: { origin: { x: number; y: number; z: number }; facing: Facing } | null,
+    /** Leftover scaffold blocks: not terrain (the world is read as if they were air). */
+    scaffolds?: ScaffoldCell[],
+  ) => Promise<BuildPrep>;
+  /** Place the blueprint (idempotent: cells already done count). Removes its scaffolds in a `finally` (best effort). */
   run: (prep: Extract<BuildPrep, { ok: true }>, ctx: BuildRunContext) => Promise<BuildOutcome>;
+  /** Remove leftover scaffolds (boot / next job); returns those still standing (failed, or skipped because the bot is dead / gone). */
+  reclaim?: (scaffolds: ScaffoldCell[], signal: AbortSignal) => Promise<ScaffoldCell[]>;
+}
+
+/** Remembered builds (failure ledger): unfinished structures to resume onto, and "this keeps failing here" refusals. */
+export interface BuildHistory {
+  refusal: (spec: BuildSpec) => string | null;
+  partial: (spec: BuildSpec) => { origin: { x: number; y: number; z: number }; facing: Facing; params: Record<string, unknown>; placed: number; total: number } | null;
 }
 
 /** Hand `goals` to player `to`; verifies the hand-over. */
@@ -94,6 +111,10 @@ export interface RunnerDeps {
   reserve?: (items: Record<string, number> | null) => void;
   /** Called once when a job ends done or failed. */
   onEnd?: (job: Job) => void;
+  /** Slice 3 review M3: called when a BUILD job ends in any state (also cancelled / interrupted), to record what it left behind. */
+  onBuildEnd?: (job: Job) => void;
+  /** Slice 3 review M3: ledger view used by `startBuild`. */
+  buildHistory?: BuildHistory;
   /** Called by `dispose()` (unsubscribe listeners). */
   onDispose?: () => void;
   now?: () => number;
@@ -104,6 +125,12 @@ export const JOB_MAX_MS = 30 * 60_000;
 export const BUILD_TIMEOUT_MS = 14 * 60_000;
 export const DELIVER_TIMEOUT_MS = 2 * 60_000;
 export const BUILD_MAX_ATTEMPTS = 3;
+/** Don't start another build attempt with less than this left of the job's time cap. */
+export const MIN_BUILD_ATTEMPT_MS = 60_000;
+/** After an attempt is abandoned/aborted, how long the old Builder gets to wind down (and strip scaffolds) before the job fails. */
+export const BUILDER_WIND_DOWN_MS = 30_000;
+/** Boot-time scaffold reclaim budget. */
+const RECLAIM_WAIT_MS = 30_000;
 /** Placeholder for failures that belong to a phase rather than a planner step (build / deliver). */
 const PHASE_STEP: Step = { op: "place_station", block: "crafting_table" };
 const CANCEL_WAIT_MS = 35_000;
@@ -151,6 +178,10 @@ export class JobRunner {
   /** Bumped by every external stop; `startInner` aborts if one landed while it was planning. */
   private stopEpoch = 0;
   private readonly now: () => number;
+  /** Items the active BUILD job needs beyond its plan (blocks, scaffold, tools, seeds...): merged into every reservation. */
+  private buildReserve: Record<string, number> = {};
+  private reclaiming: Promise<void> | null = null;
+  private reclaimCtrl: AbortController | null = null;
 
   constructor(private readonly deps: RunnerDeps) {
     this.now = deps.now ?? Date.now;
@@ -191,6 +222,7 @@ export class JobRunner {
   private async startInner(goals: Goal[], requestedBy: string | null, deliverTo: string | null): Promise<AchieveResult> {
     if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
     if (this.isRunning()) await this.cancel("replaced by a new job");
+    await this.settleReclaim();
     const epoch = this.stopEpoch;
     const view = await this.deps.buildView(goals, SCAN_RADII[0]);
     if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
@@ -231,12 +263,24 @@ export class JobRunner {
     if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
     const builder = this.deps.build;
     if (!builder) return { ok: false, jobId: null, message: "building isn't available right now" };
+    const refusal = this.deps.buildHistory?.refusal(spec) ?? null;
+    if (refusal) {
+      console.log(`[${this.deps.username}] build refused by the failure ledger: ${spec.blueprint}`);
+      return { ok: false, jobId: null, message: refusal };
+    }
     if (this.isRunning()) await this.cancel("replaced by a new job");
+    await this.settleReclaim();
     const epoch = this.stopEpoch;
-    const prep = await builder.prepare(spec, null);
+    // An unfinished structure of this kind nearby: continue it at its stored origin, never start a second one beside it.
+    const resume = this.deps.buildHistory?.partial(spec) ?? this.partialFromLastJob(spec);
+    if (resume) spec = { ...spec, params: { ...resume.params } };
+    const prep = await builder.prepare(spec, resume ? { origin: resume.origin, facing: resume.facing } : null, this.job?.scaffolds);
     if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
     if (this.stopEpoch !== epoch) return { ok: false, jobId: null, message: "not started: a stop request arrived while the build was being planned" };
-    if (!prep.ok) return { ok: false, jobId: null, message: prep.detail };
+    if (!prep.ok) {
+      const where = resume ? `${resume.origin.x}, ${resume.origin.y}, ${resume.origin.z}` : "";
+      return { ok: false, jobId: null, message: resume ? `there is an unfinished ${spec.blueprint} (${resume.placed}/${resume.total}) at ${where} and I can't continue it: ${prep.detail}. I won't start a second one next to it.` : prep.detail };
+    }
     let plan: Plan = { goals: prep.missing, steps: [], rawNeeds: {}, unresolved: [], summary: "" };
     if (prep.missing.length > 0) {
       const view = await this.deps.buildView(prep.missing, SCAN_RADII[0]);
@@ -248,6 +292,7 @@ export class JobRunner {
       }
     }
     const now = this.now();
+    const summaryText = resume ? `continuing the unfinished ${spec.blueprint} at ${prep.origin.x}, ${prep.origin.y}, ${prep.origin.z} (${resume.placed}/${resume.total} placed): ${prep.summary}` : prep.summary;
     const job: Job = {
       id: newJobId(now),
       kind: "build",
@@ -267,20 +312,64 @@ export class JobRunner {
         params: prep.params,
         origin: prep.origin,
         facing: prep.facing,
-        summary: prep.summary,
+        summary: summaryText,
         total: prep.total,
-        placed: 0,
+        placed: resume?.placed ?? 0,
+        ...(resume ? { resumed: true } : {}),
       },
     };
-    const summary = plan.steps.length > 0 ? `${prep.summary}. First get materials: ${plan.summary}` : prep.summary;
+    const summary = plan.steps.length > 0 ? `${summaryText}. First get materials: ${plan.summary}` : summaryText;
+    this.buildReserve = Object.fromEntries((prep.reserve ?? []).map((i) => [i, Number.POSITIVE_INFINITY]));
     return this.launch(job, summary, plan.rawNeeds, (j, c) => this.runBuildJob(j, c));
+  }
+
+  /** The previous job, when it was an unfinished build of this blueprint near `spec.anchor` (job.json survives restarts). */
+  private partialFromLastJob(spec: BuildSpec): ReturnType<BuildHistory["partial"]> {
+    const prev = this.job;
+    const b = prev?.build;
+    if (!prev || !b || prev.kind !== "build" || prev.status === "running" || prev.status === "done") return null;
+    if (b.blueprint !== spec.blueprint || !b.origin || !b.facing || b.placed <= 0 || b.placed >= b.total) return null;
+    if (this.now() - (prev.endedAt ?? 0) > 2 * 60 * 60_000) return null;
+    const d = (p: { x: number; z: number }): number => Math.hypot(p.x - spec.anchor.x, p.z - spec.anchor.z);
+    if (d(b.origin) > 16 && d(b.anchor) > 16) return null;
+    return { origin: b.origin, facing: b.facing, params: b.params, placed: b.placed, total: b.total };
+  }
+
+  /** Boot / next start: remove scaffold blocks an earlier run left standing (persisted in job.json). Best effort, bounded. */
+  reclaimOrphans(): Promise<void> {
+    const job = this.job;
+    const build = this.deps.build;
+    if (this.disposed || this.reclaiming || !job?.scaffolds?.length || this.isRunning() || !build?.reclaim) return this.reclaiming ?? Promise.resolve();
+    const ctrl = new AbortController();
+    this.reclaimCtrl = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), RECLAIM_WAIT_MS);
+    this.reclaiming = (async () => {
+      try {
+        const left = await build.reclaim!(job.scaffolds!, ctrl.signal);
+        job.scaffolds = left.length > 0 ? left : undefined;
+        this.persist(job);
+      } catch (err) {
+        console.warn(`[${this.deps.username}] scaffold reclaim failed:`, err);
+      } finally {
+        clearTimeout(timer);
+        this.reclaimCtrl = null;
+        this.reclaiming = null;
+      }
+    })();
+    return this.reclaiming;
+  }
+
+  private async settleReclaim(): Promise<void> {
+    if (this.reclaiming) await waitUpTo(this.reclaiming, RECLAIM_WAIT_MS + 2_000);
   }
 
   /** Persist, announce and start the background loop for a freshly built job. */
   private launch(job: Job, message: string, rawNeeds: Record<string, number>, body: (j: Job, c: AbortController) => Promise<void>): AchieveResult {
+    // Scaffold blocks an earlier job left standing stay on the books (the next build removes them).
+    if (!job.scaffolds && this.job?.scaffolds?.length) job.scaffolds = this.job.scaffolds.map((c) => ({ ...c }));
     this.job = job;
     this.persist(job);
-    this.setReservations(planReservations(job.plan));
+    this.reservePlan(job.plan);
     this.deps.record({ kind: "job_start", jobId: job.id, goals: job.kind === "build" ? [{ item: `build:${job.build!.blueprint}`, count: 1 }, ...job.goals] : job.goals, steps: job.plan.steps.length + (job.kind === "build" ? 1 : 0) });
     const ctrl = new AbortController();
     this.ctrl = ctrl;
@@ -341,6 +430,7 @@ export class JobRunner {
   /** Shutdown / reconnect: end the running job as interrupted. */
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.reclaimCtrl?.abort();
     try {
       this.deps.onDispose?.();
     } catch {
@@ -367,6 +457,16 @@ export class JobRunner {
     } finally {
       this.internalStop -= 1;
     }
+  }
+
+  /** Reserve the plan's inputs plus (build jobs) everything the build itself consumes or needs in hand. */
+  private reservePlan(plan: Plan): void {
+    this.setReservations({ ...planReservations(plan), ...this.buildReserve });
+  }
+
+  private setBuildReserve(items: readonly string[] | undefined, plan: Plan): void {
+    this.buildReserve = Object.fromEntries((items ?? []).map((i) => [i, Number.POSITIVE_INFINITY]));
+    this.reservePlan(plan);
   }
 
   private setReservations(items: Record<string, number> | null): void {
@@ -402,6 +502,7 @@ export class JobRunner {
   private finish(job: Job, status: Exclude<JobStatus, "running">, failure: StepFailure | null): void {
     if (job.status !== "running") return;
     job.status = status;
+    this.buildReserve = {};
     this.setReservations(null);
     job.endedAt = this.now();
     job.failure = status === "failed" ? failure : null;
@@ -409,6 +510,7 @@ export class JobRunner {
     if (status === "failed" && failure) job.progress = `failed: ${failure.kind} — ${failure.detail}`;
     this.persist(job);
     this.recordEnd(job);
+    if (job.kind === "build") this.noteBuildEnd(job);
     // A disposed runner (reconnect / shutdown) belongs to a dead bot or agent: no event.
     if ((status === "done" || status === "failed") && !this.disposed) {
       try {
@@ -416,6 +518,14 @@ export class JobRunner {
       } catch (err) {
         console.warn(`[${this.deps.username}] job onEnd failed:`, err);
       }
+    }
+  }
+
+  private noteBuildEnd(job: Job): void {
+    try {
+      this.deps.onBuildEnd?.(job);
+    } catch (err) {
+      console.warn(`[${this.deps.username}] job onBuildEnd failed:`, err);
     }
   }
 
@@ -442,7 +552,7 @@ export class JobRunner {
     const episodes = new Map<string, Episode>();
     // Block types gathers could not reach during this job; fed to the planner on every re-plan.
     const avoid = new Set<string>();
-    const deadline = this.now() + JOB_MAX_MS;
+    const deadline = job.startedAt + JOB_MAX_MS; // one cap for the whole job, also across a build's phases
     let scanRadius: number = SCAN_RADII[0];
     const live = (): boolean => job.status === "running" && !ctrl.signal.aborted;
 
@@ -575,7 +685,7 @@ export class JobRunner {
     job.replans += 1;
     job.plan = plan;
     job.stepIndex = 0;
-    this.setReservations(planReservations(plan));
+    this.reservePlan(plan);
     this.deps.record({ kind: "recovery", jobId: job.id, rung: "replan", detail: `#${job.replans} ${why}: ${plan.summary}`.slice(0, 200) });
     this.setProgress(job, `step 1/${plan.steps.length}: ${describeStep(plan.steps[0]!)} (replanned)`);
     return "continue";
@@ -668,6 +778,7 @@ export class JobRunner {
       job.progress = "cancelled during hand-over";
       this.finish(job, "cancelled", null);
     } else {
+      job.handoverFailed = true;
       this.finish(job, "failed", { ...res.failure, step: res.failure.step });
     }
     return false;
@@ -682,6 +793,7 @@ export class JobRunner {
       return;
     }
     const live = (): boolean => job.status === "running" && !ctrl.signal.aborted;
+    const deadline = job.startedAt + JOB_MAX_MS;
     if (job.plan.steps.length > 0) {
       if ((await this.runGoals(job, ctrl)) === "ended") return;
     }
@@ -690,20 +802,35 @@ export class JobRunner {
     this.setProgress(job, `building ${state.summary}`);
     let last: BuildOutcome | null = null;
     // The gather phase may have dug into the planned footprint: re-pick the site once, as long as nothing is built yet.
-    let resite = job.plan.steps.length > 0;
+    // A resumed build keeps its stored origin: that is the structure it continues.
+    let resite = job.plan.steps.length > 0 && !state.resumed;
     for (let attempt = 1; attempt <= BUILD_MAX_ATTEMPTS && live(); attempt++) {
+      // Retries must fit inside the job's time cap (M7): a shorter last attempt, or none.
+      const budget = Math.min(BUILD_TIMEOUT_MS, deadline - this.now() - BUILDER_WIND_DOWN_MS);
+      if (budget < MIN_BUILD_ATTEMPT_MS) {
+        this.finish(job, "failed", {
+          kind: "timeout",
+          step: PHASE_STEP,
+          detail: `no time left for another build attempt within the ${JOB_MAX_MS / 60_000}-minute job cap${last && !last.ok ? ` (last: ${last.detail}, placed ${last.placed}/${last.total})` : ""}${this.leftoverNote(job)}`,
+          attempts: attempt - 1 || 1,
+        });
+        return;
+      }
       const reuse = !resite && state.origin && state.facing ? { origin: state.origin, facing: state.facing } : null;
       resite = false;
-      const prep = await builder.prepare(state, reuse);
+      const prep = await builder.prepare(state, reuse, job.scaffolds);
       if (!live()) return;
       if (!prep.ok) {
-        this.finish(job, "failed", { kind: prep.kind, step: PHASE_STEP, detail: prep.detail, attempts: attempt });
+        this.finish(job, "failed", { kind: prep.kind, step: PHASE_STEP, detail: prep.detail + this.leftoverNote(job), attempts: attempt });
         return;
       }
       state.origin = prep.origin;
       state.facing = prep.facing;
       state.params = prep.params;
+      if (!state.resumed) state.summary = prep.summary; // a re-sited build must not keep reporting the old location
       state.total = prep.total;
+      this.buildReserve = Object.fromEntries((prep.reserve ?? []).map((i) => [i, Number.POSITIVE_INFINITY]));
+      this.reservePlan(job.plan);
       if (prep.missing.length > 0) {
         // materials still short after the gather phase (or consumed by a failed attempt): one more planned round
         const view = await this.deps.buildView(prep.missing, SCAN_RADII[0]);
@@ -723,15 +850,19 @@ export class JobRunner {
         job.stepIndex = 0;
         job.replans += 1;
         state.phase = "materials";
-        this.setReservations(planReservations(plan));
+        this.setBuildReserve(prep.reserve, plan);
         if ((await this.runGoals(job, ctrl)) === "ended") return;
         state.phase = "building";
-        resite = state.placed === 0;
+        resite = state.placed === 0 && !state.resumed;
         continue; // re-prepare with the new inventory
       }
       const t0 = this.now();
+      // One Builder at a time (M7): each attempt has its own abort signal, tripped when the attempt is abandoned.
+      const attemptCtrl = new AbortController();
+      const onJobAbort = (): void => attemptCtrl.abort();
+      ctrl.signal.addEventListener("abort", onJobAbort);
       const bctx: BuildRunContext = {
-        signal: ctrl.signal,
+        signal: attemptCtrl.signal,
         radius: SCAN_RADII[0],
         baseline: 0,
         jobId: job.id,
@@ -740,18 +871,50 @@ export class JobRunner {
           state.placed = placed;
           this.setProgress(job, text);
         },
+        scaffolds: (job.scaffolds ?? []).map((c) => ({ ...c })),
+        setScaffolds: (list) => {
+          job.scaffolds = list.length > 0 ? list.map((c) => ({ ...c })) : undefined;
+          this.persist(job);
+        },
       };
       let outcome: BuildOutcome | null = null;
-      const res = await this.timed(PHASE_STEP, `building the ${state.blueprint}`, BUILD_TIMEOUT_MS, async () => {
-        outcome = await builder.run(prep, bctx);
-        return outcome.ok
-          ? { ok: true, detail: outcome.detail }
-          : { ok: false, failure: { kind: outcome.kind, step: PHASE_STEP, detail: outcome.detail, attempts: attempt } };
+      let builderRun: Promise<unknown> = Promise.resolve();
+      let builderSettled = false;
+      const res = await this.timed(PHASE_STEP, `building the ${state.blueprint}`, budget, async () => {
+        builderRun = builder.run(prep, bctx).then(
+          (o) => {
+            outcome = o;
+            builderSettled = true;
+          },
+          (err) => {
+            builderSettled = true;
+            throw err;
+          },
+        );
+        await builderRun;
+        builderSettled = true;
+        const o = outcome as BuildOutcome | null;
+        if (!o) return { ok: false, failure: { kind: "internal", step: PHASE_STEP, detail: "build did not run", attempts: attempt } };
+        return o.ok
+          ? { ok: true, detail: o.detail }
+          : { ok: false, failure: { kind: o.kind, step: PHASE_STEP, detail: o.detail, attempts: attempt } };
       });
+      ctrl.signal.removeEventListener("abort", onJobAbort);
+      if (!builderSettled) {
+        // The step was abandoned while the Builder is still going: stop it (it strips its scaffolds on the way out) and wait.
+        attemptCtrl.abort();
+        await waitUpTo(builderRun.catch(() => undefined), BUILDER_WIND_DOWN_MS);
+        if (!builderSettled && job.status === "running") {
+          this.finish(job, "failed", { kind: "timeout", step: PHASE_STEP, detail: `the builder did not stop after its time limit; not starting a second one${this.leftoverNote(job)}`, attempts: attempt });
+          return;
+        }
+      }
       const out = outcome as BuildOutcome | null;
       if (out) {
         state.placed = out.placed;
         state.total = out.total;
+        // A stop/cancel ended the job before the final block count was known: update what the ledger remembers.
+        if (job.status !== "running") this.noteBuildEnd(job);
       }
       last = out ?? (res.ok ? null : { ok: false, kind: res.failure.kind, detail: res.failure.detail, placed: state.placed, total: state.total });
       this.deps.record({
@@ -782,9 +945,19 @@ export class JobRunner {
     this.finish(job, "failed", {
       kind: f?.kind ?? "internal",
       step: PHASE_STEP,
-      detail: f ? `${f.detail} (placed ${f.placed}/${f.total})` : "build did not complete",
+      detail: (f ? `${f.detail} (placed ${f.placed}/${f.total})` : "build did not complete") + this.leftoverNote(job),
       attempts: BUILD_MAX_ATTEMPTS,
     });
+  }
+
+  /** " (left 2 dirt at (1,64,2), ...)" when scaffold blocks are still standing, else "". */
+  private leftoverNote(job: Job): string {
+    const left = job.scaffolds ?? [];
+    if (left.length === 0) return "";
+    const byItem = new Map<string, ScaffoldCell[]>();
+    for (const c of left) byItem.set(c.item, [...(byItem.get(c.item) ?? []), c]);
+    const parts = [...byItem.entries()].map(([item, cs]) => `${cs.length} ${item} at ${cs.slice(0, 3).map((c) => `(${c.x}, ${c.y}, ${c.z})`).join(", ")}${cs.length > 3 ? ", ..." : ""}`);
+    return ` (left ${parts.join("; ")}; will be removed on the next build)`;
   }
 }
 

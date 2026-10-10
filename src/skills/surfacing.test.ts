@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Vec3 } from "vec3";
-import { findAirRoute, findRoofDig, suffocatingBlock, type CellAt } from "./surfacing.js";
+import { findAirRoute, findFallbackSwim, findRoofDig, roofCellDiggable, suffocatingBlock, type CellAt } from "./surfacing.js";
+import { SURFACE_BACKOFF_CAP_MS, surfaceBackoffMs } from "./auto-behaviors.js";
 import { fallsOnBot } from "./structure-guard.js";
 
 type W = Map<string, string>;
@@ -77,5 +78,70 @@ describe("suffocatingBlock", () => {
     expect(suffocatingBlock({ name: "oak_leaves", boundingBox: "block", shapes: cube } as never)).toBe(false);
     expect(suffocatingBlock({ name: "oak_slab", boundingBox: "block", shapes: [[0, 0, 0, 1, 0.5, 1]] } as never)).toBe(false);
     expect(suffocatingBlock({ name: "water", boundingBox: "empty", shapes: [] } as never)).toBe(false);
+  });
+});
+
+describe("findRoofDig player-build guard (M1)", () => {
+  /** A sealed pool y 60..62 with a 1-thick `stone` floor of a player's room at y=63 and the room above. */
+  function pool(): W {
+    const w: W = new Map();
+    fill(w, -10, 55, -3, 20, 59, 3, "stone");
+    fill(w, -10, 60, -3, 20, 63, 3, "stone");
+    fill(w, 0, 60, 0, 12, 62, 0, "water");
+    fill(w, 0, 64, 0, 12, 66, 0, "air"); // the room above the floor
+    return w;
+  }
+  it("digs a plain natural roof with open space above (no crafted blocks around)", () => {
+    expect(findRoofDig(at(pool()), new Vec3(10, 62, 0))).not.toBeNull();
+  });
+  it("refuses to dig a stone floor with the player's planks walls/furniture within 2 blocks", () => {
+    const w = pool();
+    fill(w, 0, 64, -1, 12, 65, -1, "oak_planks"); // the room's wall
+    expect(findRoofDig(at(w), new Vec3(10, 62, 0))).toBeNull();
+  });
+  it("refuses when a crafted block sits next to the free cell above the roof", () => {
+    const w = pool();
+    fill(w, 0, 65, 1, 12, 65, 1, "oak_planks"); // within 2 of the space above y=63 only
+    w.set(key(0, 66, 0), "glass");
+    expect(findRoofDig(at(w), new Vec3(10, 62, 0))).toBeNull();
+  });
+  it("roofCellDiggable: natural only, never cobblestone, glass, logs", () => {
+    const w: W = new Map([[key(0, 0, 0), "cobblestone"], [key(1, 0, 0), "stone"], [key(2, 0, 0), "glass"]]);
+    expect(roofCellDiggable(at(w), new Vec3(0, 0, 0))).toBe(false);
+    expect(roofCellDiggable(at(w), new Vec3(1, 0, 0))).toBe(false); // glass within 2
+    expect(roofCellDiggable(at(new Map([[key(1, 0, 0), "stone"]])), new Vec3(1, 0, 0))).toBe(true);
+  });
+});
+
+describe("findFallbackSwim (M1: when the roof can't be dug)", () => {
+  it("heads for open air beyond the normal search radius", () => {
+    const w: W = new Map();
+    fill(w, -5, 50, -3, 60, 58, 3, "stone");
+    fill(w, -5, 59, -3, 60, 70, 3, "stone");
+    fill(w, 0, 60, 0, 40, 62, 0, "water"); // 40-long tunnel
+    fill(w, 40, 63, 0, 40, 66, 0, "air"); // shaft at the far end
+    expect(findAirRoute(at(w), new Vec3(0, 62, 0))).toBeNull(); // beyond radius 20
+    const f = findFallbackSwim(at(w), new Vec3(0, 62, 0))!;
+    expect(f.kind).toBe("air");
+    expect(f.path.length).toBeGreaterThan(30);
+  });
+  it("sealed pool with nothing better: swims toward the highest water; null on a flat pool", () => {
+    const w: W = new Map();
+    fill(w, -5, 50, -3, 20, 70, 3, "stone");
+    fill(w, 0, 60, 0, 6, 61, 0, "water");
+    fill(w, 6, 62, 0, 6, 64, 0, "water"); // a chimney of water
+    const f = findFallbackSwim(at(w), new Vec3(0, 61, 0))!;
+    expect(f.kind).toBe("high");
+    expect(f.path[f.path.length - 1]!.y).toBe(64);
+    const flat: W = new Map();
+    fill(flat, -5, 50, -3, 20, 70, 3, "stone");
+    fill(flat, 0, 60, 0, 6, 61, 0, "water");
+    expect(findFallbackSwim(at(flat), new Vec3(0, 61, 0))).toBeNull();
+  });
+});
+
+describe("surfaceBackoffMs (M4)", () => {
+  it("doubles from 1 s up to the 10 s cap", () => {
+    expect([1, 2, 3, 4, 5, 9].map(surfaceBackoffMs)).toEqual([1_000, 2_000, 4_000, 8_000, SURFACE_BACKOFF_CAP_MS, SURFACE_BACKOFF_CAP_MS]);
   });
 });

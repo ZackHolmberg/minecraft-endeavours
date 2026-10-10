@@ -33,6 +33,25 @@ const FILL_ORDER = [...HOTBAR_SLOTS, ...MAIN_SLOTS];
 const SLOT_WRITE_GAP_MS = 60;
 export const GET_ITEMS_MAX_TYPES = 36;
 
+/**
+ * Operator / technical items the creative inventory can produce but that nobody should be handed
+ * (review M5: `getItems` / `deliverTo` would otherwise give a survival player a command block).
+ * Refused by `getItems`, `creativeGive` (every auto-supply path) and the hand-over.
+ */
+const OPERATOR_ITEM_EXACT: ReadonlySet<string> = new Set([
+  "command_block", "chain_command_block", "repeating_command_block", "command_block_minecart",
+  "structure_block", "structure_void", "jigsaw", "test_block", "test_instance_block",
+  "barrier", "light", "bedrock", "debug_stick", "knowledge_book", "end_portal_frame",
+  "spawner", "trial_spawner", "reinforced_deepslate", "allow", "deny", "border_block",
+  // Griefing tools a friend could ask a creative bot for (lead addition to M5).
+  "tnt", "tnt_minecart", "lava_bucket", "end_crystal", "respawn_anchor", "wither_skeleton_skull",
+]);
+
+/** True for operator/technical items that must never be taken from the creative inventory. */
+export function isOperatorItem(name: string): boolean {
+  return OPERATOR_ITEM_EXACT.has(name) || /_spawn_egg$/.test(name) || /^(command_block|structure_)/.test(name);
+}
+
 type ItemCtor = typeof Item;
 type ItemLoader = (registry: object) => ItemCtor;
 // CJS `module.exports = loader` under NodeNext: at runtime the default import
@@ -90,6 +109,8 @@ export interface CreativeGiveResult {
  */
 export async function creativeGive(bot: Bot, itemId: number, want: number): Promise<CreativeGiveResult> {
   if (!isCreative(bot)) throw new Error(`not in creative mode (${currentGameMode(bot)})`);
+  const itemName = bot.registry.items[itemId]?.name;
+  if (itemName && isOperatorItem(itemName)) throw new Error(`${itemName} is an operator/technical item; I don't hand those out`);
   const stackSize = stackSizeOf(bot, itemId);
   const before = bot.inventory.count(itemId, null);
   let need = want - before;
@@ -151,6 +172,7 @@ export async function getItems(bot: Bot, { items }: GetItemsParams): Promise<Ski
     const r = resolveItem(bot, entry.name);
     if (!r.ok) return { ok: false, message: `items[${i}] ${r.message}` };
     if (r.normalized === "air") return { ok: false, message: `items[${i}] "air" isn't an item` };
+    if (isOperatorItem(r.normalized)) return { ok: false, message: `items[${i}] ${r.normalized} is an operator/technical item; I don't take or hand out those` };
     const want = entry.count ?? stackSizeOf(bot, r.data.id);
     if (want < 1) return { ok: false, message: `items[${i}] count must be >= 1, got ${want}` };
     resolved.push({ name: r.normalized, id: r.data.id, want });

@@ -20,7 +20,7 @@ import { Vec3 } from "vec3";
 import { pickDoor, pickHoe, pickScaffold } from "../../build/materials.js";
 import { placementDone, prepare, solidName, type Prepared } from "../../build/prepare.js";
 import { isAir, isReplaceable, isWaterName, type WorldGrid } from "../../build/site.js";
-import { isCraftedBlockName } from "../../skills/structure-guard.js";
+import { isCraftedBlockName, isFallingBlockName } from "../../skills/structure-guard.js";
 import { planOrder, type AbsPlacement, type BuildAction } from "../../build/support.js";
 import { cellKey, dirVec, type Cell } from "../../build/types.js";
 import type { FailureKind } from "../../planner/types.js";
@@ -34,7 +34,7 @@ import { ensureMovements, type BotWithPathfinder } from "../../skills/pathfinder
 import { placeBlock } from "../../skills/world.js";
 import { getBotState } from "../../state/index.js";
 import type { BuildDeps, BuildRunContext } from "../runner.js";
-import type { BuildOutcome, BuildPrep } from "../types.js";
+import type { BuildOutcome, BuildPrep, ScaffoldCell } from "../types.js";
 import { inventoryTotals } from "../world-view.js";
 import { tracked } from "./util.js";
 
@@ -45,6 +45,8 @@ const REACH = 4.0;
 const SETTLE_MS = 1500;
 const MAX_FAIL_STREAK = 5;
 const DIG_TIMEOUT_MS = 15_000;
+/** Total time the scaffold clean-up (stop / failure / boot) may take before it gives up and leaves the rest on the books. */
+export const CLEANUP_BUDGET_MS = 20_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const v = (c: Cell): Vec3 => new Vec3(c.x, c.y, c.z);
@@ -53,9 +55,46 @@ export function gridOf(bot: Bot): WorldGrid {
   return { blockAt: (x, y, z) => bot.blockAt(new Vec3(x, y, z))?.name ?? null };
 }
 
+/**
+ * The world as if known scaffold blocks were air: a leftover dirt block from an earlier attempt is
+ * not terrain (it must not count as ground, support or a footprint obstacle). Only cells that
+ * still hold the recorded item are masked, so an unrelated block placed there later stays real.
+ */
+export function maskScaffolds(grid: WorldGrid, cells: readonly ScaffoldCell[]): WorldGrid {
+  if (cells.length === 0) return grid;
+  const at = new Map(cells.map((c) => [cellKey(c), c.item]));
+  return {
+    blockAt: (x, y, z) => {
+      const n = grid.blockAt(x, y, z);
+      return n !== null && at.get(cellKey({ x, y, z })) === n ? "air" : n;
+    },
+  };
+}
+
+/** Items a build needs to keep for its whole duration (reserved so the pillar filler never spends them). */
+export function buildReserve(res: Prepared, inv: Record<string, number>): string[] {
+  const out = new Set<string>(Object.keys(res.needs.consumed));
+  if (res.needs.scaffoldItem) out.add(res.needs.scaffoldItem);
+  if (res.needs.selfSupply) out.add(res.needs.selfSupply.item);
+  for (const tool of res.needs.tools) for (const t of tool) out.add(t);
+  for (const p of res.bp.placements) if (p.role === "door" && !p.derived) out.add(p.block);
+  if (res.bp.placements.some((p) => p.role === "door")) for (const k of Object.keys(inv)) if (/_door$/.test(k) && k !== "iron_door") out.add(k);
+  return [...out];
+}
+
 export function createBuildDeps(bot: Bot): BuildDeps {
   return {
-    prepare: async (spec, existing) => {
+    reclaim: async (cells, signal) => {
+      if (cells.length === 0) return [];
+      const b = Builder.forReclaim(bot, cells, signal);
+      try {
+        await b.cleanupScaffolds();
+      } finally {
+        b.dispose();
+      }
+      return b.leftovers();
+    },
+    prepare: async (spec, existing, scaffolds) => {
       const creative = isCreative(bot);
       // unknown materials fail before any walking
       for (const key of ["wall", "roof", "floor"] as const) {
@@ -63,13 +102,20 @@ export function createBuildDeps(bot: Bot): BuildDeps {
         if (typeof name === "string" && !bot.registry.itemsByName[name]) {
           return { ok: false, kind: "unknown_item", detail: `${key} "${name}" isn't a block I know (use a snake_case id like oak_planks or cobblestone)` };
         }
+        // must be a full solid, non-falling block (water_bucket / torch / sand would pass the item check and then fail every placement)
+        const blocks = (bot.registry as { blocksByName?: Record<string, { boundingBox?: string }> }).blocksByName;
+        if (typeof name === "string" && blocks && (blocks[name]?.boundingBox !== "block" || isFallingBlockName(name))) {
+          return { ok: false, kind: "unknown_item", detail: `${key} "${name}" isn't a full solid block I can build with (try planks, cobblestone, stone_bricks, ...)` };
+        }
       }
       const pos = bot.entity.position;
+      // Players who walked into the area since the request (gathering can take minutes) are avoided too.
+      const spec2 = existing ? spec : { ...spec, avoid: [...spec.avoid, ...nearbyPlayers(bot)] };
       const res = prepare({
-        grid: gridOf(bot),
+        grid: maskScaffolds(gridOf(bot), scaffolds ?? []),
         inv: inventoryTotals(bot.inventory.slots),
         creative,
-        spec,
+        spec: spec2,
         existing,
         botPos: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
       });
@@ -84,11 +130,21 @@ export function createBuildDeps(bot: Bot): BuildDeps {
         total: res.total,
         missing: res.missing,
         payload: res,
+        reserve: buildReserve(res, inventoryTotals(bot.inventory.slots)),
       };
       return prep;
     },
     run: (prep, ctx) => runBuild(bot, prep.payload as Prepared, ctx),
   };
+}
+
+function nearbyPlayers(bot: Bot): Cell[] {
+  const out: Cell[] = [];
+  for (const [name, p] of Object.entries(bot.players ?? {})) {
+    if (name === bot.username || !p.entity) continue;
+    if (p.entity.position.distanceTo(bot.entity.position) <= 48) out.push({ x: Math.floor(p.entity.position.x), y: Math.floor(p.entity.position.y), z: Math.floor(p.entity.position.z) });
+  }
+  return out;
 }
 
 async function runBuild(bot: Bot, prepd: Prepared, ctx: BuildRunContext): Promise<BuildOutcome> {
@@ -107,9 +163,17 @@ class Builder {
   private readonly dims: { x: number; z: number };
   /** Cells that will hold (or temporarily hold) a block: never stand in them. */
   private readonly reserved = new Set<string>();
-  private readonly scaffolds: Cell[] = [];
+  /** Every scaffold block this builder (or an earlier attempt/job) placed and has not confirmed removed. Mirrored to job.json. */
+  private scaffolds: ScaffoldCell[];
   private scaffoldItem = "dirt";
   private lastError = "";
+  private ended = false;
+  private readonly onEnd = (): void => {
+    this.ended = true;
+  };
+  /** Clean-up mode: the stop flag / abort signal that ended the run no longer stop us, only a NEW stop, the clock or death do. */
+  private cleaning = false;
+  private cleanupUntil = 0;
 
   constructor(
     private readonly bot: Bot,
@@ -121,6 +185,38 @@ class Builder {
     this.origin = prepd.origin;
     this.dims = { x: prepd.bp.size.x, z: prepd.bp.size.z };
     for (const p of prepd.remaining) this.reserved.add(cellKey(p));
+    this.scaffolds = (ctx.scaffolds ?? []).map((c) => ({ ...c }));
+    if (this.scaffolds.length > 0) this.scaffoldItem = this.scaffolds[this.scaffolds.length - 1]!.item;
+    (bot as { once?: (ev: string, fn: () => void) => void }).once?.("end", this.onEnd);
+  }
+
+  /** A Builder with nothing to build, only a scaffold list to clear (boot-time reclaim). */
+  static forReclaim(bot: Bot, cells: readonly ScaffoldCell[], signal: AbortSignal): Builder {
+    const empty = { ok: true, origin: { x: 0, y: 0, z: 0 }, facing: "south", bp: { kind: "house", size: { x: 0, y: 0, z: 0 }, placements: [], clear: [] }, remaining: [], doneCount: 0, total: 0 } as unknown as Prepared;
+    const ctx = { signal, radius: 0, baseline: 0, jobId: "reclaim", record: () => {}, progress: () => {}, scaffolds: [...cells], setScaffolds: () => {} } as BuildRunContext;
+    return new Builder(bot, empty, ctx);
+  }
+
+  dispose(): void {
+    (this.bot as { removeListener?: (ev: string, fn: () => void) => void }).removeListener?.("end", this.onEnd);
+  }
+
+  leftovers(): ScaffoldCell[] {
+    return this.scaffolds.map((c) => ({ ...c }));
+  }
+
+  /** False once the bot is dead or its connection ended: nothing in the world can be done then. */
+  private alive(): boolean {
+    const { bot } = this;
+    return !this.ended && !!bot.entity && !(typeof bot.health === "number" && bot.health <= 0);
+  }
+
+  private syncScaffolds(): void {
+    try {
+      this.ctx.setScaffolds(this.scaffolds);
+    } catch {
+      // persistence is best-effort
+    }
   }
 
   private log(msg: string): void {
@@ -128,7 +224,9 @@ class Builder {
   }
 
   private stopped(): boolean {
-    return this.ctx.signal.aborted || getBotState(this.bot.username)?.cancellation.isRequested() === true;
+    const flag = getBotState(this.bot.username)?.cancellation.isRequested() === true;
+    if (this.cleaning) return !this.alive() || Date.now() > this.cleanupUntil || flag;
+    return this.ctx.signal.aborted || flag;
   }
 
   private inv(): Record<string, number> {
@@ -144,10 +242,32 @@ class Builder {
     return this.prepd.doneCount + this.prepd.remaining.filter((p) => placementDone(this.grid, p)).length;
   }
 
+  /**
+   * Build, then ALWAYS take the scaffolds down again (stop, failure, timeout, thrown error): the list is
+   * persisted as it changes, and whatever cannot be removed now (dead bot, no route, out of time) stays on
+   * the books for the next build / boot to retry.
+   */
   async run(): Promise<BuildOutcome> {
+    try {
+      return await this.runInner();
+    } finally {
+      try {
+        await this.cleanupScaffolds();
+      } catch (err) {
+        this.log(`scaffold clean-up crashed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      this.dispose();
+    }
+  }
+
+  private async runInner(): Promise<BuildOutcome> {
     const { bot, prepd, ctx } = this;
     ensureMovements(bot as BotWithPathfinder);
     const kind = prepd.bp.kind;
+
+    // 0. leftovers from an earlier attempt / job / crash: take them down before anything else
+    if (this.scaffolds.length > 0) await this.cleanupScaffolds();
+    const stale = this.leftovers();
 
     // 1. materials (creative: take them from the creative inventory in one call)
     if (this.creative && prepd.creativeItems.length > 0) {
@@ -176,8 +296,9 @@ class Builder {
     // 3. order against the live world (clearing changed it)
     this.scaffoldItem = prepd.needs.scaffoldItem ?? pickScaffold(this.inv());
     const pos = bot.entity.position;
+    const terrain = maskScaffolds(this.grid, stale); // a leftover we could not remove is not ground
     const order = planOrder(prepd.remaining.filter((p) => !p.derived), {
-      isSolidWorld: (c) => solidName(this.grid.blockAt(c.x, c.y, c.z)),
+      isSolidWorld: (c) => solidName(terrain.blockAt(c.x, c.y, c.z)),
       start: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
       keepClear: prepd.bp.clear.map((c) => ({ x: c.x + this.origin.x, y: c.y + this.origin.y, z: c.z + this.origin.z })),
     });
@@ -202,11 +323,9 @@ class Builder {
       layerY = null;
     };
     let sinceProgress = 0;
+    let reportedFirst = false; // the first block is reported at once: a stop right after it must still leave a resumable record
     for (const a of order.actions) {
-      if (this.stopped()) {
-        await this.removeScaffolds();
-        return this.outcome(false, "cancelled", "build cancelled");
-      }
+      if (this.stopped()) return this.outcome(false, "cancelled", "build cancelled"); // `run` strips the scaffolds
       if (a.op === "place") {
         if (layerY !== a.p.y) {
           flushLayer();
@@ -223,11 +342,11 @@ class Builder {
         failStreak += 1;
         if (failStreak >= MAX_FAIL_STREAK) {
           flushLayer();
-          await this.removeScaffolds();
           return this.outcome(false, "build_incomplete", `${failStreak} placements in a row failed; last: ${this.lastError}`);
         }
       }
-      if (++sinceProgress >= 4) {
+      if (++sinceProgress >= 4 || (ok && a.op === "place" && !reportedFirst)) {
+        reportedFirst = true;
         sinceProgress = 0;
         ctx.progress(`building ${kind}: ${this.countDone()}/${prepd.total}`, this.countDone());
       }
@@ -272,12 +391,16 @@ class Builder {
       case "place":
         return this.placeCell(a.p);
       case "scaffold": {
-        const ok = await this.placeCell({ ...a.pos, block: this.scaffoldItem, role: "foundation" }, this.scaffoldItem);
-        if (ok) this.scaffolds.push(a.pos);
+        // Record the intent BEFORE placing: a block that shows up after the settle timeout is still ours to remove.
+        this.scaffolds.push({ ...a.pos, item: this.scaffoldItem });
+        this.syncScaffolds();
+        return this.placeCell({ ...a.pos, block: this.scaffoldItem, role: "foundation" }, this.scaffoldItem);
+      }
+      case "unscaffold": {
+        const ok = await this.removeScaffold(a.pos);
+        if (ok) this.forget(a.pos);
         return ok;
       }
-      case "unscaffold":
-        return this.removeScaffold(a.pos);
       case "act":
         return this.act(a.p);
     }
@@ -445,7 +568,7 @@ class Builder {
       // dig by hand
     }
     try {
-      await Promise.race([bot.dig(b, true), sleep(DIG_TIMEOUT_MS).then(() => Promise.reject(new Error("dig timed out")))]);
+      await Promise.race([bot.dig(b, true), sleep(this.cleaning ? Math.max(1_000, Math.min(DIG_TIMEOUT_MS, this.cleanupUntil - Date.now())) : DIG_TIMEOUT_MS).then(() => Promise.reject(new Error("dig timed out")))]);
     } catch (err) {
       this.lastError = `dig ${b.name}: ${err instanceof Error ? err.message : String(err)}`;
       return false;
@@ -462,10 +585,19 @@ class Builder {
     return undefined;
   }
 
+  /** Drop `c` from the scaffold list (removed, or no longer ours). */
+  private forget(c: Cell): void {
+    const i = this.scaffolds.findIndex((x) => x.x === c.x && x.y === c.y && x.z === c.z);
+    if (i < 0) return;
+    this.scaffolds.splice(i, 1);
+    this.syncScaffolds();
+  }
+
   private async removeScaffold(c: Cell): Promise<boolean> {
+    const item = this.scaffolds.find((x) => x.x === c.x && x.y === c.y && x.z === c.z)?.item ?? this.scaffoldItem;
     const n = this.blockName(c);
     if (n === null || isAir(n)) return true;
-    if (n !== this.scaffoldItem) return true; // not ours any more
+    if (n !== item) return true; // not ours any more
     if (this.overlapsBot(c)) await this.ensureReach(c, true);
     const before = this.inv()[n] ?? 0;
     const ok = await this.dig(c);
@@ -530,16 +662,51 @@ class Builder {
     return best?.c ?? null;
   }
 
+  /** Normal end of a build: remove what is still standing. Failures stay on the list (never forgotten). */
   private async removeScaffolds(): Promise<void> {
     const t0 = Date.now();
     const list = [...this.scaffolds].reverse();
     if (list.length === 0) return;
     let ok = true;
     for (const c of list) {
-      if (!(await this.removeScaffold(c))) ok = false;
+      if (await this.removeScaffold(c)) this.forget(c);
+      else ok = false;
     }
-    this.scaffolds.length = 0;
     this.ctx.record({ kind: "step", jobId: this.ctx.jobId, op: "scaffold", item: this.scaffoldItem, ok, durationMs: Date.now() - t0, failureKind: ok ? null : "unreachable" });
+  }
+
+  /**
+   * Remove every scaffold still on the books, even though the stop flag / abort signal that ended the run is
+   * still set (those were consumed by ending the run; a NEW stop, death, a dropped connection or
+   * {@link CLEANUP_BUDGET_MS} do stop it). Walks back to each block if needed. Entries whose removal fails
+   * stay on the list (and in job.json) for the next build or boot.
+   */
+  async cleanupScaffolds(budgetMs: number = CLEANUP_BUDGET_MS): Promise<void> {
+    if (this.scaffolds.length === 0) return;
+    if (!this.alive()) {
+      this.log(`not removing ${this.scaffolds.length} scaffold block(s): bot is dead or disconnected (kept for the next build/boot)`);
+      return;
+    }
+    const t0 = Date.now();
+    getBotState(this.bot.username)?.cancellation.begin();
+    this.cleaning = true;
+    this.cleanupUntil = t0 + budgetMs;
+    let failed = 0;
+    try {
+      if (isCreative(this.bot) && isFlying(this.bot)) await land(this.bot).catch(() => {});
+      for (const c of [...this.scaffolds].reverse()) {
+        if (this.stopped()) {
+          failed += 1;
+          continue;
+        }
+        if (await this.removeScaffold(c)) this.forget(c);
+        else failed += 1;
+      }
+    } finally {
+      this.cleaning = false;
+    }
+    this.log(`scaffold clean-up: ${failed === 0 ? "done" : `${failed} block(s) left standing: ${this.scaffolds.map((c) => `${c.item}@${c.x},${c.y},${c.z}`).join(" ")}`}`);
+    this.ctx.record({ kind: "step", jobId: this.ctx.jobId, op: "scaffold", item: this.scaffoldItem, ok: failed === 0, durationMs: Date.now() - t0, failureKind: failed === 0 ? null : "unreachable" });
   }
 
   // ── farm / portal actions ──────────────────────────────────────────────

@@ -3,7 +3,7 @@ import type { Bot } from "mineflayer";
 import type { FailureKind, Goal, Plan, Step, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import { formatJobEvent, jobContextLines } from "./describe.js";
-import { JobRunner, type BuildDeps, type DeliverFn, type RunnerDeps } from "./runner.js";
+import { JobRunner, type BuildDeps, type BuildHistory, type BuildRunContext, type DeliverFn, type RunnerDeps } from "./runner.js";
 import type { BuildOutcome, BuildPrep, BuildSpec, Job, StepResult } from "./types.js";
 
 const gather = (item: string, count: number): Step => ({ op: "gather", item, count, blocks: [item], tool: null });
@@ -32,7 +32,9 @@ interface H {
   runner: JobRunner;
   events: TelemetryInput[];
   ended: Job[];
-  prepares: Array<{ existing: unknown }>;
+  prepares: Array<{ existing: unknown; scaffolds?: unknown; spec?: BuildSpec }>;
+  reserved: Array<Record<string, number> | null>;
+  ctxs: BuildRunContext[];
   runs: number;
   delivered: Array<{ to: string; goals: Goal[] }>;
 }
@@ -43,15 +45,18 @@ function harness(o: {
   run?: (n: number) => BuildOutcome | Promise<BuildOutcome>;
   deliver?: (to: string, goals: Goal[]) => StepResult | Promise<StepResult>;
   step?: () => StepResult;
+  history?: BuildHistory;
+  onBuildEnd?: (j: Job) => void;
 }): H {
-  const h: H = { events: [], ended: [], prepares: [], runs: 0, delivered: [], runner: null as never };
+  const h: H = { events: [], ended: [], prepares: [], reserved: [], ctxs: [], runs: 0, delivered: [], runner: null as never };
   const plans = [...(o.plans ?? [mkPlan([])])];
   const build: BuildDeps = {
-    prepare: async (_spec, existing) => {
-      h.prepares.push({ existing });
+    prepare: async (spec, existing, scaffolds) => {
+      h.prepares.push({ existing, scaffolds, spec });
       return o.prepare ? o.prepare(h.prepares.length - 1) : prepOk();
     },
-    run: async () => {
+    run: async (_prep, ctx) => {
+      h.ctxs.push(ctx);
       const n = h.runs++;
       return o.run ? o.run(n) : { ok: true, placed: 55, total: 55, detail: "built" };
     },
@@ -72,6 +77,9 @@ function harness(o: {
     load: () => null,
     save: () => {},
     onEnd: (j) => h.ended.push(JSON.parse(JSON.stringify(j)) as Job),
+    reserve: (items) => h.reserved.push(items),
+    buildHistory: o.history,
+    onBuildEnd: o.onBuildEnd,
     build,
     deliver,
   };
@@ -220,6 +228,199 @@ describe("build job", () => {
   });
 });
 
+describe("build job: reservations, resume, scaffolds, lifecycle (slice 3 review M2/M3/M7/H2)", () => {
+  const PARTIAL = { origin: { x: 10, y: 64, z: 10 }, facing: "east" as const, params: { wall: "spruce_planks" }, placed: 30, total: 57 };
+
+  it("M2: reserves the build's materials for the whole job (also across a materials replan) and releases at the end", async () => {
+    const missing = [{ item: "oak_planks", count: 20 }];
+    let prep = 0;
+    const h = harness({
+      plans: [mkPlan([gather("oak_log", 5)], missing), mkPlan([])],
+      prepare: () => (prep++ < 1 ? prepOk(missing, { reserve: ["oak_planks", "glass", "oak_door"] }) : prepOk([], { reserve: ["oak_planks", "glass", "oak_door"] })),
+    });
+    await h.runner.startBuild(SPEC, null);
+    await until(() => h.ended.length === 1);
+    const nonNull = h.reserved.filter((r): r is Record<string, number> => r !== null);
+    expect(nonNull.length).toBeGreaterThan(1);
+    for (const r of nonNull) expect(Object.keys(r)).toEqual(expect.arrayContaining(["oak_planks", "glass", "oak_door"]));
+    expect(nonNull[0]!["oak_planks"]).toBe(Number.POSITIVE_INFINITY);
+    expect(h.reserved.at(-1)).toBeNull();
+  });
+
+  it("M2: reserves even when nothing is missing (stocked / creative)", async () => {
+    const h = harness({ prepare: () => prepOk([], { reserve: ["cobblestone", "dirt"] }) });
+    await h.runner.startBuild(SPEC, null);
+    await until(() => h.ended.length === 1);
+    expect(h.reserved.find((r) => r !== null)).toMatchObject({ cobblestone: Number.POSITIVE_INFINITY, dirt: Number.POSITIVE_INFINITY });
+  });
+
+  it("M3: a re-build near an unfinished one resumes at its stored origin/facing/params instead of siting a second house", async () => {
+    const h = harness({
+      history: { refusal: () => null, partial: () => PARTIAL },
+      prepare: () => prepOk([], { origin: PARTIAL.origin, facing: "east", params: PARTIAL.params, summary: "7x6 spruce house" }),
+    });
+    const r = await h.runner.startBuild(SPEC, "Alex");
+    expect(r.ok).toBe(true);
+    expect(r.message).toMatch(/continuing the unfinished house at 10, 64, 10 \(30\/57/);
+    await until(() => h.ended.length === 1);
+    expect(h.prepares[0]!.existing).toEqual({ origin: PARTIAL.origin, facing: "east" });
+    expect(h.prepares[0]!.spec!.params).toEqual(PARTIAL.params); // the old structure's blueprint params, not the new request's
+    expect(h.runner.current()!.build).toMatchObject({ resumed: true, placed: 55 });
+    expect(h.prepares.every((p) => p.existing !== null)).toBe(true); // never re-sited
+  });
+
+  it("M3: a resumed build is not re-sited after a materials round either", async () => {
+    const missing = [{ item: "oak_planks", count: 5 }];
+    let n = 0;
+    const h = harness({
+      history: { refusal: () => null, partial: () => PARTIAL },
+      plans: [mkPlan([gather("oak_log", 2)], missing), mkPlan([])],
+      prepare: () => (n++ < 1 ? prepOk(missing, { origin: PARTIAL.origin }) : prepOk([], { origin: PARTIAL.origin })),
+    });
+    await h.runner.startBuild(SPEC, null);
+    await until(() => h.ended.length === 1);
+    expect(h.prepares.filter((p) => p.existing === null)).toHaveLength(0);
+  });
+
+  it("M3: if the unfinished structure cannot be continued, refuses with a message (no second house)", async () => {
+    const h = harness({
+      history: { refusal: () => null, partial: () => PARTIAL },
+      prepare: () => ({ ok: false, kind: "no_site", detail: "the player's wall is in the way" }),
+    });
+    const r = await h.runner.startBuild(SPEC, null);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/unfinished house \(30\/57\) at 10, 64, 10 and I can't continue it.*won't start a second one/);
+    expect(h.runner.isRunning()).toBe(false);
+  });
+
+  it("M3: the ledger refusal stops a build that keeps failing at the same place", async () => {
+    const h = harness({ history: { refusal: () => "not started: the house already failed 2 times near here", partial: () => null } });
+    const r = await h.runner.startBuild(SPEC, null);
+    expect(r).toMatchObject({ ok: false, jobId: null });
+    expect(r.message).toMatch(/already failed 2 times/);
+    expect(h.prepares).toHaveLength(0);
+  });
+
+  it("M3: onBuildEnd fires for failed, cancelled and done builds; a stop's final count updates the record", async () => {
+    const seen: Array<{ status: string; placed: number }> = [];
+    const f = harness({ run: () => ({ ok: false, kind: "build_incomplete", detail: "x", placed: 40, total: 55 }), onBuildEnd: (j) => seen.push({ status: j.status, placed: j.build!.placed }) });
+    await f.runner.startBuild(SPEC, null);
+    await until(() => f.ended.length === 1);
+    expect(seen.at(-1)).toEqual({ status: "failed", placed: 40 });
+
+    seen.length = 0;
+    const ok = harness({ onBuildEnd: (j) => seen.push({ status: j.status, placed: j.build!.placed }) });
+    await ok.runner.startBuild(SPEC, null);
+    await until(() => ok.ended.length === 1);
+    expect(seen.at(-1)).toMatchObject({ status: "done" });
+
+    seen.length = 0;
+    let release: (o: BuildOutcome) => void = () => {};
+    const c = harness({ run: () => new Promise<BuildOutcome>((r) => (release = r)), onBuildEnd: (j) => seen.push({ status: j.status, placed: j.build!.placed }) });
+    await c.runner.startBuild(SPEC, null);
+    await until(() => c.runs === 1);
+    c.runner.notifyStop("player");
+    await until(() => seen.length > 0);
+    expect(seen[0]).toEqual({ status: "cancelled", placed: 0 });
+    release({ ok: false, kind: "cancelled", detail: "stopped", placed: 12, total: 55 });
+    await until(() => seen.length > 1);
+    expect(seen[1]).toEqual({ status: "cancelled", placed: 12 });
+  });
+
+  it("H2: scaffold positions the builder reports are persisted on the job, named in the failure, and handed to the next prepare/run", async () => {
+    const cell = { x: 4, y: 65, z: 4, item: "dirt" };
+    const h = harness({
+      run: (n) => {
+        if (n < 3) h.ctxs[n]!.setScaffolds([cell]);
+        return { ok: false, kind: "build_incomplete", detail: "stuck", placed: 20, total: 55 };
+      },
+    });
+    await h.runner.startBuild(SPEC, null);
+    await until(() => h.ended.length === 1);
+    const job = h.runner.current()!;
+    expect(job.scaffolds).toEqual([cell]);
+    expect(job.failure!.detail).toMatch(/left 1 dirt at \(4, 65, 4\)/);
+    expect(h.ctxs[1]!.scaffolds).toEqual([cell]); // retry attempt sees the leftover
+    expect(h.prepares.at(-1)!.scaffolds).toEqual([cell]);
+
+    // the next job (any kind) inherits what is still standing
+    await h.runner.startBuild(SPEC, null);
+    expect(h.prepares.at(-1)!.scaffolds).toEqual([cell]);
+    await until(() => h.runner.current()!.status !== "running");
+    expect(h.ctxs.at(-1)!.scaffolds).toEqual([cell]);
+  });
+
+  it("H2: an empty report clears the persisted list", async () => {
+    const h = harness({
+      run: () => {
+        h.ctxs[0]!.setScaffolds([{ x: 1, y: 2, z: 3, item: "dirt" }]);
+        h.ctxs[0]!.setScaffolds([]);
+        return { ok: true, placed: 55, total: 55, detail: "built" };
+      },
+    });
+    await h.runner.startBuild(SPEC, null);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.scaffolds).toBeUndefined();
+  });
+
+  it("H2: reclaimOrphans removes leftovers from job.json at boot and keeps those that could not be removed", async () => {
+    const stored: Job = {
+      id: "old", kind: "build", goals: [], requestedBy: null, status: "failed", startedAt: 1, endedAt: 2, plan: mkPlan([]), stepIndex: 0, replans: 0, progress: "", failure: null,
+      scaffolds: [{ x: 1, y: 64, z: 1, item: "dirt" }, { x: 2, y: 64, z: 2, item: "dirt" }],
+    };
+    const saved: Job[] = [];
+    const reclaim = vi.fn(async (cells: Array<{ x: number; y: number; z: number; item: string }>) => cells.slice(1));
+    const runner = new JobRunner({
+      username: "bot", plan: () => mkPlan([]), buildView: async () => ({}) as WorldView, execute: async () => ({ ok: true, detail: "" }),
+      explore: async () => ({ found: false, detail: "" }), countItem: () => 0, requestStop: () => {}, record: () => {},
+      load: () => stored, save: (j) => saved.push(JSON.parse(JSON.stringify(j)) as Job),
+      build: { prepare: async () => prepOk(), run: async () => ({ ok: true, placed: 1, total: 1, detail: "" }), reclaim },
+    });
+    await runner.reclaimOrphans();
+    expect(reclaim).toHaveBeenCalledTimes(1);
+    expect(runner.current()!.scaffolds).toEqual([{ x: 2, y: 64, z: 2, item: "dirt" }]);
+    expect(saved.at(-1)!.scaffolds).toEqual([{ x: 2, y: 64, z: 2, item: "dirt" }]);
+  });
+
+  it("M7: an abandoned build attempt is aborted and finished before the next one starts; retries fit the job time cap", async () => {
+    vi.useFakeTimers();
+    try {
+      let active = 0;
+      let maxActive = 0;
+      const h = harness({
+        run: (n) =>
+          new Promise<BuildOutcome>((resolve) => {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            const ctx = h.ctxs[n]!;
+            // ignores the cooperative stop; only the attempt's abort signal ends it (after a 3 s clean-up)
+            ctx.signal.addEventListener("abort", () => {
+              setTimeout(() => {
+                active -= 1;
+                resolve({ ok: false, kind: "cancelled", detail: "aborted", placed: 5, total: 55 });
+              }, 3_000);
+            });
+          }),
+      });
+      await h.runner.startBuild(SPEC, null);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.runs).toBe(1);
+      await vi.advanceTimersByTimeAsync(14 * 60_000 + 25_000); // limit + grace -> abandoned, then aborted
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.ctxs[0]!.signal.aborted).toBe(true);
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + 60_000); // second attempt abandoned too
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(maxActive).toBe(1);
+      const job = h.runner.current()!;
+      expect(job.status).toBe("failed");
+      expect(job.failure!.detail).toMatch(/no time left for another build attempt/);
+      expect(h.runs).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("deliver", () => {
   const BREAD: Goal[] = [{ item: "bread", count: 3 }];
 
@@ -321,7 +522,7 @@ describe("createDeliver (fake bot)", () => {
         return { ok: true, message: "gave" };
       });
       const p = createDeliver(bot as unknown as Bot)("Tester", [{ item: "torch", count: 64 }], ctx());
-      await vi.advanceTimersByTimeAsync(9_000);
+      await vi.advanceTimersByTimeAsync(11_000);
       const res = await p;
       expect(res).toMatchObject({ ok: false, failure: { kind: "unreachable" } });
       expect((res as { failure: { detail: string } }).failure.detail).toMatch(/still on the ground/);

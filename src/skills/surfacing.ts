@@ -12,7 +12,7 @@
  */
 
 import { Vec3 } from "vec3";
-import { isCheapBreak, isFallingBlockName, isNaturalTerrain } from "./structure-guard.js";
+import { builtReasonAt, craftedWithin, isFallingBlockName, isNaturalTerrain } from "./structure-guard.js";
 
 export type CellBlock = { name: string; boundingBox?: string } | null | undefined;
 export type CellAt = (p: Vec3) => CellBlock;
@@ -106,17 +106,41 @@ export interface RoofDig {
 
 const ROOF_MAX_THICKNESS = 3;
 const ROOF_AIR_SCAN = 8;
+/** A crafted block this close to a dug cell (or to the free space above the roof) means a player's build: never dig there. */
+export const ROOF_CRAFTED_RADIUS = 2;
+/** At most this many candidate roofs are guard-checked (each check reads ~120 blocks). */
+const ROOF_GUARD_CANDIDATES = 40;
+
+/**
+ * May the reflex dig `cell`? Natural terrain only (no cobblestone/logs/planks...), not part of
+ * anything {@link builtReasonAt} calls player-built, and no crafted block within
+ * {@link ROOF_CRAFTED_RADIUS}. Plain stone/dirt/sandstone ARE what players build floors with, so the
+ * neighbourhood check is what protects them (review M1).
+ */
+export function roofCellDiggable(at: CellAt, cell: Vec3): boolean {
+  const b = at(cell);
+  if (!b || !isNaturalTerrain(b.name) || isFallingBlockName(b.name)) return false;
+  if (builtReasonAt(at, { name: b.name, position: cell }) !== null) return false;
+  return !craftedWithin(at, cell, ROOF_CRAFTED_RADIUS);
+}
+
+export interface RoofDigOptions extends SwimSearchOptions {
+  /** Apply the player-build guard (default true). Off only for geometry tests. */
+  guard?: boolean;
+}
 
 /**
  * Sealed water: the cheapest natural ceiling to dig through. Candidate = a
  * reachable water head cell with 1..{@link ROOF_MAX_THICKNESS} natural solid blocks
  * above it followed by free space that leads to air. Never a column that has a
  * falling block (sand/gravel) in or directly above the dug cells, which would drop on
- * the bot's head.
+ * the bot's head. Every dug cell must pass {@link roofCellDiggable} and the free cell above the
+ * roof must not sit next to a crafted block (that is a player's room); candidates are tried
+ * cheapest first, a bounded number of times.
  */
-export function findRoofDig(at: CellAt, head: Vec3, opts: SwimSearchOptions = {}): RoofDig | null {
+export function findRoofDig(at: CellAt, head: Vec3, opts: RoofDigOptions = {}): RoofDig | null {
   const r = flood(at, head, opts);
-  let best: { cell: Vec3; dig: Vec3[]; score: number } | null = null;
+  const cands: Array<{ cell: Vec3; dig: Vec3[]; above: Vec3; score: number }> = [];
   for (const [key, cell] of r.cells) {
     const dig: Vec3[] = [];
     let y = cell.y + 1;
@@ -125,7 +149,7 @@ export function findRoofDig(at: CellAt, head: Vec3, opts: SwimSearchOptions = {}
       const b = at(new Vec3(cell.x, y, cell.z));
       if (!b) { ok = false; break; }
       if (b.boundingBox === "block") {
-        if (!(isNaturalTerrain(b.name) || isCheapBreak(b.name)) || isFallingBlockName(b.name)) { ok = false; break; }
+        if (!isNaturalTerrain(b.name) || isFallingBlockName(b.name)) { ok = false; break; }
         dig.push(new Vec3(cell.x, y, cell.z));
         continue;
       }
@@ -133,7 +157,8 @@ export function findRoofDig(at: CellAt, head: Vec3, opts: SwimSearchOptions = {}
     }
     if (!ok || dig.length === 0 || dig.length > ROOF_MAX_THICKNESS) continue;
     // free space above the roof, with a falling block never directly over the last dug cell
-    const above = at(new Vec3(cell.x, y, cell.z));
+    const aboveCell = new Vec3(cell.x, y, cell.z);
+    const above = at(aboveCell);
     if (!isPassable(above) || (above && isFallingBlockName(above.name))) continue;
     let air = false;
     for (let j = 0; j < ROOF_AIR_SCAN; j++) {
@@ -142,10 +167,41 @@ export function findRoofDig(at: CellAt, head: Vec3, opts: SwimSearchOptions = {}
       if (!isWet(b)) { air = true; break; }
     }
     if (!air) continue;
-    const score = (r.dist.get(key) ?? 0) + 3 * dig.length;
-    if (!best || score < best.score) best = { cell, dig, score };
+    cands.push({ cell, dig, above: aboveCell, score: (r.dist.get(key) ?? 0) + 3 * dig.length });
   }
-  return best ? { stand: best.cell, swim: pathTo(r, best.cell), dig: best.dig } : null;
+  cands.sort((a, b) => a.score - b.score);
+  let tried = 0;
+  for (const c of cands) {
+    if (opts.guard !== false) {
+      if (++tried > ROOF_GUARD_CANDIDATES) return null;
+      if (!c.dig.every((d) => roofCellDiggable(at, d)) || craftedWithin(at, c.above, ROOF_CRAFTED_RADIUS)) continue;
+    }
+    return { stand: c.cell, swim: pathTo(r, c.cell), dig: c.dig };
+  }
+  return null;
+}
+
+export interface SwimFallback {
+  path: Vec3[];
+  /** `air`: open air farther away than the normal search radius; `high`: the highest reachable water (no air at all). */
+  kind: "air" | "high";
+}
+
+/**
+ * Nothing to dig and no air within the normal radius: swim horizontally/up toward the nearest open air in
+ * a wider search, else toward the highest reachable water cell (the shore side of the sealed pool).
+ * null when there is nowhere better than here.
+ */
+export function findFallbackSwim(at: CellAt, head: Vec3): SwimFallback | null {
+  const r = flood(at, head, { radius: 40, maxCells: 15000 });
+  if (r.firstAir) return { path: pathTo(r, r.firstAir), kind: "air" };
+  let best: { cell: Vec3; d: number } | null = null;
+  for (const [key, cell] of r.cells) {
+    if (cell.y <= head.y) continue;
+    const d = r.dist.get(key) ?? 0;
+    if (!best || cell.y > best.cell.y || (cell.y === best.cell.y && d < best.d)) best = { cell, d };
+  }
+  return best ? { path: pathTo(r, best.cell), kind: "high" } : null;
 }
 
 /**

@@ -8,6 +8,7 @@ import { getCurrentConversationPartner } from "../orchestrator/chat-router.js";
 import type { Goal } from "../planner/types.js";
 import { resolveItem } from "../skills/item-naming.js";
 import type { SkillResult } from "../skills/types.js";
+import { isOperatorItem } from "../skills/creative.js";
 import { isCreative } from "../skills/game-mode.js";
 import { goalsText } from "./describe.js";
 import { findPlayer } from "./steps/deliver.js";
@@ -35,6 +36,14 @@ export function shouldCancelJobFor(tool: string, jobRunning: boolean): boolean {
   return jobRunning && !JOB_EXEMPT_TOOLS.has(tool);
 }
 
+/** Hand-over size limits per goal item: 2 stacks of a stackable (128 of a 64-stack), 4 of an unstackable. */
+export const DELIVER_MAX_STACKS = 2;
+export const DELIVER_MAX_UNSTACKABLE = 4;
+
+export function deliverCap(stackSize: number): number {
+  return stackSize <= 1 ? DELIVER_MAX_UNSTACKABLE : DELIVER_MAX_STACKS * stackSize;
+}
+
 export interface AchieveParams {
   goals: Array<{ item: string; count: number }>;
   /** Hand the goal items to this player once they're in hand ("give me / get me X"). */
@@ -58,13 +67,30 @@ export async function achieve(bot: Bot, { goals, deliverTo }: AchieveParams): Pr
   }
   const merged = new Map<string, number>();
   const errors: string[] = [];
+  const stackSizes = new Map<string, number>();
   for (const g of goals) {
     const r = resolveItem(bot, g.item);
     if (!r.ok) {
       errors.push(`goals item ${r.message}`);
       continue;
     }
+    if (recipient && isOperatorItem(r.normalized)) {
+      errors.push(`${r.normalized} is an operator/technical item; I don't hand those out`);
+      continue;
+    }
+    stackSizes.set(r.normalized, bot.registry.items[r.data.id]?.stackSize ?? 64);
     merged.set(r.normalized, (merged.get(r.normalized) ?? 0) + Math.max(1, Math.floor(g.count)));
+  }
+  // A hand-over is capped per item (abuse / runaway gathers): clamp and tell the model.
+  const capNotes: string[] = [];
+  if (recipient) {
+    for (const [item, n] of merged) {
+      const cap = deliverCap(stackSizes.get(item) ?? 64);
+      if (n > cap) {
+        merged.set(item, cap);
+        capNotes.push(`${item} ${n} -> ${cap}`);
+      }
+    }
   }
   if (errors.length > 0) {
     const res: AchieveResult = { ok: false, jobId: null, message: errors.join("; ") };
@@ -80,7 +106,7 @@ export async function achieve(bot: Bot, { goals, deliverTo }: AchieveParams): Pr
   return {
     ok: res.ok,
     message: res.ok
-      ? `job started: ${goalsText(list)}${recipient ? ` → give to ${recipient}` : ""}. Plan: ${res.message}. It runs in the background; reply briefly and end your turn — you'll get a [job finished]/[job failed] message.`
+      ? `job started: ${goalsText(list)}${recipient ? ` → give to ${recipient}` : ""}${capNotes.length > 0 ? ` (capped at 2 stacks / 4 unstackable per hand-over: ${capNotes.join(", ")}; tell the player)` : ""}. Plan: ${res.message}. It runs in the background; reply briefly and end your turn — you'll get a [job finished]/[job failed] message.`
       : res.message,
     state: res,
   };
