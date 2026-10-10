@@ -11,15 +11,15 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## In flight (2026-10-09 ~22:30)
-- **R5/R6 agent** in `../mcv2-dev` (branch `v2-fixes`): bottom-up tree felling + short-tree preference (jungle drops), drowning/suffocation reflex + no digging under falling blocks → `v2/reports/regressions-2.md`. May run evals (from the v2 worktree, `--bot-dir ../mcv2-dev`, out `v2/runs/dev-r5`).
-- **Slice 3 builder agent** in `../mcv2-build` (branch `v2-build`, D14): blueprints (house/portal/farm) as jobs + `achieve` `deliverTo` → `v2/reports/slice3-build.md`. Live tests only when no eval is running.
-- Only one eval at a time on the test server (agents check `pgrep -f src/eval/runner.ts`).
-- Worktrees: `../mcv2-bench` frozen @ `3480223`; `../minecraft-endeavours-v1base` frozen v1.
-If a session died mid-flight: `git -C ../mcv2-dev status`, `git -C ../mcv2-build status`, typecheck there, read the reports; whatever exists is the progress.
+## In flight (2026-10-10 ~00:30)
+- Merged into `v2` @ `110e060`: R5/R6 (`c80abf4`: tree felling, drowning reflex; chop_logs 10/10) + slice 3 (`1d12eba`: blueprint builder + deliverTo; 5/5 build/farm/portal/give live). 193 tests.
+- **Milestone run** `v2/runs/v2-s3` (core, `--repeat 2`, bench `../mcv2-bench` @ `110e060`), log `v2/runs/v2-s3.out` ends CHAIN_DONE. ~2–3 h.
+- Reviewer → `v2/reports/slice3-review.md` (R5/R6 + slice 3).
+- Eval busy check: `pgrep -f "[b]in/tsx src/eval/runner.ts"` (plain pattern matches waiting shells).
+If a session died mid-flight: check the run dir + reports; whatever exists is the progress.
 
 ## Next steps
-1. When R5/R6 + slice 3 land: commit on their branches, merge both into `v2`, new frozen bench, full core run with `--repeat 2` (noise, see v1 cr.build_house flip) → `v2-s3`. (Done: targeted re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
+1. Read `v2-s3` (compare vs v1-baseline; v1 is 1 repeat — consider a 2nd v1 repeat for fairness), apply slice-3 review fixes, update Benchmark scores, **milestone check-in with the owner**. Known open: t2.coal (explore-elsewhere recovery), survive_night, int.stop latch (pathfinder master pin). (Done: targeted re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
 2. Re-run v1 on `t3.build_house,cr.build_house,t3.wheat_farm,t3.portal` with the D13 confirm policy (fair baseline).
 3. Milestone check-in with the owner once v2 clearly beats v1.
 4. Next slices: builder (blueprints + scaffolding: houses, portal), farming, night survival/combat, creative give/deliver (`cr.give_torches`: fetched but never handed over), pathfinder master pin, prompt/tool-surface trim.
