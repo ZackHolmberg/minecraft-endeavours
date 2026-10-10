@@ -16,7 +16,7 @@
 - **Milestone run** `v2/runs/v2-s3` (core, `--repeat 2`, bench `../mcv2-bench` @ `110e060`), log `v2/runs/v2-s3.out` ends CHAIN_DONE. ~2–3 h.
 - Slice 3 review fixes merged (`c490b54` + `1b5e6b1`, 248 tests). NOT in the milestone run (bench @ `110e060`); re-verify live in the next run.
 - Queued after v2-s3: second v1 pass → `v2/runs/v1-baseline-r2`.
-- Eval busy check: `pgrep -f "[b]in/tsx src/eval/runner.ts"` (plain pattern matches waiting shells).
+- Evals serialize via the runner lock `v2/runs/.eval-lock` (`f-lock` commit); just start them, later ones wait.
 If a session died mid-flight: check the run dir + reports; whatever exists is the progress.
 
 ## Next steps
