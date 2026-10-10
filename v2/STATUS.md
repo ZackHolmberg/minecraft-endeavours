@@ -11,18 +11,16 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## In flight (2026-10-09 ~17:30)
-- Eval chain (background shell): v1 re-run of `t1.eat`,`conv.followup_chest` into `v2/runs/v1-baseline`, then **v2 core run** `v2/runs/v2-s2b` (bot = live worktree @ `4e290f7`-equivalent src `ff27f8d`). Log: `v2/runs/v2-s2b.out` ends with CHAIN_DONE. **Don't edit `src/` until it finishes** (D11).
-- Slice 2b review done (`b7bbdda`); fix agent works in worktree `../mcv2-dev` (branch `v2-fixes`, docker disabled there) → appends "## Fixes" to `v2/reports/slice2b-review.md`. Lead commits on `v2-fixes` (`35ca957` = 2b review fixes), then merges `v2-fixes` into `v2` after the benchmark ends; dev moves back to the v2 worktree and benchmarks use a frozen `../mcv2-bench` (D11).
+## In flight (2026-10-09 ~21:00)
+- Regression agent in `../mcv2-dev` (branch `v2-fixes`, uncommitted WIP) → R1 natural-terrain path digging + thinkTimeout + unreachable-species avoidance, R2 filler reservations, R3 door assist, R4 tree detection for logs → `v2/reports/regressions-1.md`. `v2-fixes` already merged into `v2` up to `a8e9dab`; merge again when R1–R4 land.
 - Frozen v1 bot checkout: `../minecraft-endeavours-v1base` (detached `c1587b0`). Don't edit it.
-If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + report files; whatever exists is the progress.
+If a session died mid-flight: `git -C ../mcv2-dev status`, typecheck there, read the report; whatever exists is the progress.
 
 ## Next steps
-1. When `v2-s2b` finishes: summarize vs baseline (`npm run eval:compare -- v2/runs/v1-baseline v2/runs/v2-s2b`), add a row to Benchmark scores, patch baseline-v1.md re-run lines.
-2. Apply slice 2b review fixes; implement D12 pillar `purpose` (pillar.ts `pillarUpBy` param; navigation escape + world.ts water escape = "escape"; eval counts purpose != escape).
-3. Milestone check-in with the owner (first-milestone DoD met if v2 beats v1).
-4. Regressions in v2-s2b (agent fixing offline in `../mcv2-dev` → `v2/reports/regressions-1.md`): R1 gather stuck on unreachable jungle species (+leaves impassable), R2 escape-pillaring eats job materials (cobblestone), R3 doors never open now that the door patch is actually applied. Then live re-test. Also: jungle-tree drops not picked up (v2-s2b t1.chop_logs: mined 8, collected 4, "no dropped items within 6 blocks"); canopy/2x2 trunk?
-5. Then slice 2c: prompt/tool-surface trim, request-handling (deliver to player, don't stop at a plan), builder (blueprints + scaffolding) for build_house/portal, pathfinder master pin (D9 #3).
+1. R1–R4 land → commit on `v2-fixes` → merge into `v2` → frozen bench checkout (D11) → targeted live re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
+2. Re-run v1 on `t3.build_house,cr.build_house,t3.wheat_farm,t3.portal` with the D13 confirm policy (fair baseline).
+3. Milestone check-in with the owner once v2 clearly beats v1.
+4. Next slices: builder (blueprints + scaffolding: houses, portal), farming, night survival/combat, creative give/deliver (`cr.give_torches`: fetched but never handed over), pathfinder master pin, prompt/tool-surface trim.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
@@ -40,7 +38,8 @@ If a session died mid-flight: `pgrep -f src/eval/runner.ts`; check run dirs + re
 ## Benchmark scores
 | run | core | t1 | t2 | t3 | conv | int | pl | cr | turns | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| v1-baseline | 12/30 | 6/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 1/2 | 202 | [report](reports/baseline-v1.md) |
+| v1-baseline | 13/30 | 7/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 1/2 | 187 | [report](reports/baseline-v1.md); t1.eat re-run after harness fix; results.jsonl reconstructed |
+| v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
 - None yet. (Pushing the `v1` tag / `v2` branch to GitHub: will ask before doing it.)
