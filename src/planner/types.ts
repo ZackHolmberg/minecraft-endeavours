@@ -14,7 +14,12 @@ export interface Vec3 {
   z: number;
 }
 
-/** "End up holding at least `count` of `item`." */
+/**
+ * "End up holding at least `count` of `item`."
+ * `item` may be a generic tag ("#log", "#planks", "#wool", "#stone_tool_material", "#coal", "#sand";
+ * see knowledge/tags.ts): any mix of the matching items counts. `plan()` resolves tags to concrete
+ * items (`Plan.goals` is always concrete); callers that re-plan keep passing the tag goals.
+ */
 export interface Goal {
   item: string;
   count: number;

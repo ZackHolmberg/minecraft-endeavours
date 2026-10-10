@@ -24,6 +24,9 @@ import {
   blockDimension,
   CROP_DROPS,
   WOOD_FAMILIES,
+  isGoalTag,
+  knownTagNames,
+  tagMembers,
 } from "./knowledge/index.js";
 import type { Goal, Plan, PlanFn, PlanOptions, Step, Vec3, WorldView } from "./types.js";
 
@@ -77,10 +80,10 @@ class Planner {
   }
 
   /** Lower = more readily available. 0 owned; ~1 mineable in view; +1 per crafting layer; +2 smelting; INF = nothing in reach. */
-  private cost(item: string, depth = 0): number {
-    const m = this.costMemo.get(item);
+  private cost(item: string, depth = 0, ignoreOwned = false): number {
+    const m = ignoreOwned ? undefined : this.costMemo.get(item);
     if (m !== undefined) return m;
-    if (this.owned(item) > 0) {
+    if (!ignoreOwned && this.owned(item) > 0) {
       // Held, but only obtainable from avoided blocks: a replacement is cheap to plan around, so any
       // species that is actually in view (cost ~1) beats topping this one up; still beats "nothing in reach".
       const src = this.book.blocksYielding(item);
@@ -102,7 +105,7 @@ class Planner {
     }
     for (const rule of SMELT_BY_OUTPUT.get(item) ?? []) best = Math.min(best, 2 + this.cost(rule.input, depth + 1));
     this.costBusy.delete(item);
-    if (depth === 0) this.costMemo.set(item, best);
+    if (depth === 0 && !ignoreOwned) this.costMemo.set(item, best);
     return best;
   }
 
@@ -153,6 +156,48 @@ class Planner {
     const near = logs.filter((l) => ok(planksOf(l)) && this.cost(l) < INF).sort((a, b) => this.cost(a) - this.cost(b));
     if (near[0]) return planksOf(near[0]);
     return ok("oak_planks") ? "oak_planks" : "spruce_planks";
+  }
+
+  // ---------------------------------------------------------------- generic goals
+
+  /**
+   * Replace tag goals ("#log" x10) by concrete ones. Owned members count first (largest stack
+   * first, so held items are delivered/kept as they are); any shortfall goes to the member that is
+   * cheapest to obtain right now (cost: in view / craftable from what is held), ties broken by
+   * owned count then the default species order. The chosen member's goal is "hold owned + shortfall".
+   */
+  resolveGoals(goals: Goal[]): { goals: Goal[]; bad: Plan["unresolved"] } {
+    if (!goals.some((g) => isGoalTag(g.item))) return { goals, bad: [] };
+    const out = new Map<string, number>();
+    const bad: Plan["unresolved"] = [];
+    const add = (item: string, n: number) => out.set(item, (out.get(item) ?? 0) + n);
+    for (const g of goals) {
+      if (!isGoalTag(g.item)) {
+        add(g.item, g.count);
+        continue;
+      }
+      const members = (tagMembers(g.item) ?? []).filter((m) => this.book.hasItem(m));
+      if (members.length === 0) {
+        bad.push({ item: g.item, count: g.count, reason: `unknown_item: "${g.item}" is not a known item tag (known: ${knownTagNames().join(", ")})` });
+        continue;
+      }
+      if (!(g.count > 0)) continue;
+      let remaining = Math.ceil(g.count);
+      const byOwned = members.filter((m) => this.owned(m) > 0).sort((a, b) => this.owned(b) - this.owned(a) || this.defaultIndex(a) - this.defaultIndex(b));
+      for (const m of byOwned) {
+        if (remaining <= 0) break;
+        const take = Math.min(this.owned(m), remaining);
+        add(m, take);
+        remaining -= take;
+      }
+      if (remaining > 0) {
+        // cost to GET more of it (ignoring what is already held): a held species that is out of view must not beat one at hand
+        const fresh = new Map(members.map((m) => [m, this.cost(m, 0, true)]));
+        const best = [...members].sort((a, b) => fresh.get(a)! - fresh.get(b)! || this.owned(b) - this.owned(a) || this.defaultIndex(a) - this.defaultIndex(b))[0]!;
+        add(best, remaining);
+      }
+    }
+    return { goals: [...out.entries()].map(([item, count]) => ({ item, count })), bad };
   }
 
   // ---------------------------------------------------------------- phase A
@@ -493,9 +538,13 @@ function summarize(steps: Step[], unresolved: Plan["unresolved"]): string {
 }
 
 export const plan: PlanFn = (goals, view, opts) => {
+  const planner = new Planner(getRecipeBook(), view);
+  const resolved = planner.resolveGoals(goals);
   if (view.gameMode === "creative") {
-    return { goals, steps: [], rawNeeds: {}, unresolved: [], summary: "creative: use getItems" };
+    return { goals: resolved.goals, steps: [], rawNeeds: {}, unresolved: resolved.bad, summary: "creative: use getItems" };
   }
-  const book = getRecipeBook();
-  return new Planner(book, view).run(goals, opts);
+  const result = planner.run(resolved.goals, opts);
+  if (resolved.bad.length === 0) return result;
+  const unresolved = [...resolved.bad, ...result.unresolved];
+  return { ...result, unresolved, summary: summarize(result.steps, unresolved) };
 };

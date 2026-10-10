@@ -40,7 +40,9 @@ export async function gatherStep({ bot, ctx }: StepEnv, step: Gather): Promise<S
     if (ctx.signal.aborted) return cancelled(step);
     if (have() >= target) break;
     const gained = have() - before;
-    if (gained <= 0 || !r.ok) {
+    // Progress beats a soft failure ("drops of this tree couldn't be collected", one unreachable block): go again
+    // until the count is met or a call makes none; only a call that gained nothing fails the step.
+    if (gained <= 0) {
       const kind = classifyFailure(r.message, r.state, "unreachable");
       return fail(step, kind, `${r.message} (have ${have() - ctx.baseline}/${step.count} ${step.item})`, 1, kind === "unreachable" ? unreachableBlocksOf(r.state, step.blocks) : undefined);
     }

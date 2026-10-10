@@ -124,8 +124,8 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
         // builds are not goal-keyed: the build ledger (onBuildEnd) and the synthetic-event cap are their loop guards
       } else if (job.status === "failed") {
         // A player who walked away makes the hand-over fail even though the bot holds the items: not a goal failure.
-        if (!(job.handoverFailed && job.failure?.kind === "unreachable")) ledgerFor(username).recordFailure(job.goals, job.failure?.kind ?? "internal");
-      } else if (job.status === "done") ledgerFor(username).recordSuccess(job.goals);
+        if (!(job.handoverFailed && job.failure?.kind === "unreachable")) ledgerFor(username).recordFailure(job.generic ?? job.goals, job.failure?.kind ?? "internal");
+      } else if (job.status === "done") ledgerFor(username).recordSuccess(job.generic ?? job.goals);
       const text = formatJobEvent(job);
       if (text) getAgent(username)?.pushJobEvent(text);
     },

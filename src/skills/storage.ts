@@ -6,20 +6,14 @@ import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 import { noteContainerOpening } from "../mineflayer-glue/event-hooks.js";
 import { readWorldKnowledge, type Container } from "../memory/world-knowledge.js";
+import { CONTAINER_SCAN_RADIUS, findNearbyContainers, isContainerName } from "./containers.js";
 import { resolveItem } from "./item-naming.js";
 import { navigate } from "./navigation.js";
 import type { Coords, SkillResult } from "./types.js";
 
-const CONTAINER_BLOCK_TYPES = new Set([
-  "chest",
-  "trapped_chest",
-  "barrel",
-  "shulker_box",
-]);
-
 const CHEST_REACH = 2;
 /** Live scan radius for a chest in plain sight when memory has nothing closer. */
-const CHEST_SEARCH_RADIUS = 16;
+const CHEST_SEARCH_RADIUS = CONTAINER_SCAN_RADIUS;
 
 export interface DepositToChestParams {
   item: string;
@@ -273,7 +267,7 @@ async function resolveChestBlock(
     if (!block) {
       return { ok: false, message: `chunk at ${fmt(new Vec3(pos.x, pos.y, pos.z))} isn't loaded — walk closer first` };
     }
-    if (!CONTAINER_BLOCK_TYPES.has(block.name) && !block.name.endsWith("_shulker_box")) {
+    if (!isContainerName(block.name)) {
       return {
         ok: false,
         message: `block at ${fmt(block.position)} is ${block.name}, not a container`,
@@ -328,7 +322,7 @@ async function resolveChestBlock(
       message: `nearest known container is at ${fmt(new Vec3(pick.c.position.x, pick.c.position.y, pick.c.position.z))} (~${Math.round(pick.dist)} blocks) but the chunk isn't loaded — walk closer first`,
     };
   }
-  if (!CONTAINER_BLOCK_TYPES.has(block.name) && !block.name.endsWith("_shulker_box")) {
+  if (!isContainerName(block.name)) {
     return {
       ok: false,
       message: `remembered ${pick.c.type} at ${fmt(block.position)} is now ${block.name} — chest may have been broken; refresh memory by passing an explicit pos`,
@@ -342,11 +336,7 @@ async function resolveChestBlock(
 }
 
 function findNearbyContainer(bot: Bot): Block | null {
-  const ids = [...CONTAINER_BLOCK_TYPES]
-    .map((n) => bot.registry.blocksByName[n]?.id)
-    .filter((id): id is number => id !== undefined);
-  if (ids.length === 0) return null;
-  return bot.findBlock({ point: bot.entity.position, matching: ids, maxDistance: CHEST_SEARCH_RADIUS });
+  return findNearbyContainers(bot, CHEST_SEARCH_RADIUS, 1)[0]?.block ?? null;
 }
 
 async function walkToChest(bot: Bot, block: Block): Promise<SkillResult> {

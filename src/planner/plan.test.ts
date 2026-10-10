@@ -472,3 +472,76 @@ describe("avoidBlocks (unreachable species fed back from the recovery ladder)", 
     expect(gatherBlocks(p)).toContain("cobblestone");
   });
 });
+
+describe("generic goal tags (#log, #planks, ...)", () => {
+  const gatherItems = (p: Plan) => find(p, "gather").map((s) => `${s.item}:${s.count}`);
+
+  it("#log gathers the species in view (nearest wins) and returns concrete goals", () => {
+    const view = mkView({ near: { birch_log: 9, jungle_log: 4 } });
+    const p = plan([g("#log", 10)], view);
+    expect(p.unresolved).toEqual([]);
+    expect(p.goals).toEqual([{ item: "jungle_log", count: 10 }]);
+    expect(gatherItems(p)).toEqual(["jungle_log:10"]);
+  });
+
+  it("#log counts logs already held, any species, before gathering", () => {
+    const view = mkView({ near: { birch_log: 5 }, inventory: { oak_log: 3 } });
+    const p = plan([g("#log", 10)], view);
+    expect(gatherItems(p)).toEqual(["birch_log:7"]);
+    expect(p.goals).toEqual(expect.arrayContaining([{ item: "oak_log", count: 3 }, { item: "birch_log", count: 7 }]));
+  });
+
+  it("#log is satisfied by mixed held logs: nothing to do", () => {
+    const view = mkView({ inventory: { oak_log: 6, spruce_log: 4 } });
+    const p = plan([g("#log", 10)], view);
+    expect(p.steps).toEqual([]);
+    expect(p.unresolved).toEqual([]);
+  });
+
+  it("re-planning the tag goal after a partial gather finishes only the shortfall", () => {
+    const view = mkView({ near: { birch_log: 5 }, inventory: { birch_log: 4 } });
+    const p = plan([g("#log", 10)], view);
+    expect(gatherItems(p)).toEqual(["birch_log:6"]);
+  });
+
+  it("an avoided species is not chosen when another is in view", () => {
+    const view = mkView({ near: { jungle_log: 3, oak_log: 12 }, avoidBlocks: ["jungle_log"] });
+    expect(gatherItems(plan([g("#log", 5)], view))).toEqual(["oak_log:5"]);
+  });
+
+  it("with nothing in view the default species (oak) is planned with a search hint", () => {
+    const p = plan([g("#log", 4)], mkView({ near: { stone: 5 } }));
+    expect(p.goals).toEqual([{ item: "oak_log", count: 4 }]);
+    expect(find(p, "gather")[0]!.searchHint?.kind).toBe("surface");
+  });
+
+  it("#planks uses the planks of the logs that are held / in view", () => {
+    const p = plan([g("#planks", 8)], mkView({ near: { birch_log: 6 } }));
+    expect(p.goals).toEqual([{ item: "birch_planks", count: 8 }]);
+    expect(gatherItems(p)).toEqual(["birch_log:2"]);
+    const held = plan([g("#planks", 8)], mkView({ near: { birch_log: 6 }, inventory: { spruce_log: 2 } }));
+    expect(held.goals).toEqual([{ item: "spruce_planks", count: 8 }]);
+  });
+
+  it("#stone_tool_material picks cobblestone when stone is nearby", () => {
+    const p = plan([g("#stone_tool_material", 3)], mkView({ near: { stone: 4 }, inventory: { wooden_pickaxe: 1 } }));
+    expect(p.goals).toEqual([{ item: "cobblestone", count: 3 }]);
+    expect(gatherItems(p)).toEqual(["cobblestone:3"]);
+  });
+
+  it("an unknown tag is unresolved with the known tags listed", () => {
+    const p = plan([g("#gems", 2)], mkView());
+    expect(p.steps).toEqual([]);
+    expect(p.unresolved[0]!.reason).toMatch(/unknown_item.*#log/);
+  });
+
+  it("tags and concrete goals combine; duplicates merge", () => {
+    const p = plan([g("#log", 3), g("oak_log", 2)], mkView({ near: { oak_log: 3 } }));
+    expect(p.goals).toEqual([{ item: "oak_log", count: 5 }]);
+  });
+
+  it("creative: tags resolve too (hand-over needs concrete items)", () => {
+    const p = plan([g("#log", 3)], mkView({ gameMode: "creative", near: { birch_log: 3 } }));
+    expect(p.goals).toEqual([{ item: "birch_log", count: 3 }]);
+  });
+});

@@ -5,6 +5,7 @@ const { goals } = pathfinderPkg;
 import type { Block } from "prismarine-block";
 import type { Item } from "prismarine-item";
 import { Vec3 } from "vec3";
+import { surfaceInterrupted } from "./auto-behaviors.js";
 import { inventoryCounts, inventoryGain, pickUpNearby, snapshotItemIds, waitForDropNear } from "./inventory.js";
 import { resolveBlock, resolveItem } from "./item-naming.js";
 import { navFailureOf, navigate } from "./navigation.js";
@@ -28,7 +29,9 @@ const POST_DIG_PICKUP_RADIUS = 4;
 // End-of-run sweep for drops that were dug but not yet collected.
 const FINAL_SWEEP_RADIUS = 8;
 // Give up the batch after this many candidates we could not get at.
-const MAX_UNREACHABLE_SKIPS = 6;
+const MAX_UNREACHABLE_SKIPS = 12;
+// A tree whose drops could not be picked up is abandoned for the next one; give up after this many.
+const MAX_ABANDONED_TREES = 6;
 // ...or after this many consecutive digs that put nothing in the inventory.
 const MAX_FRUITLESS_DIGS = 3;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
@@ -260,6 +263,9 @@ async function mineBlocksInner(
   const unreachableTypes: Record<string, number> = {};
   let lastFailure = "";
   let fruitlessStreak = 0;
+  /** Trees (log keys) whose drops we could not collect: skipped from then on so the batch moves to another tree. */
+  const abandoned = new Set<string>();
+  let abandonedTrees = 0;
   /** Tree felling state: the tree just chopped (for stickiness + the per-trunk sweep) and logs refused as out of reach. */
   const fell: FellCtx = { lastTree: null, next: null, tooHigh: 0, underLog: 0 };
   // Positions refused by the structure guard, reported so the agent knows
@@ -281,7 +287,8 @@ async function mineBlocksInner(
     headline: string,
     extra: Record<string, unknown> = {},
   ): Promise<SkillResult> => {
-    if (mined > 0 && !creative && !cancellation?.isRequested() && collectedNow() < mined) {
+    // Felling leaves litter (leaf drops: saplings, sticks, apples) near the trunk even when every log landed: tidy up.
+    if (mined > 0 && !creative && !cancellation?.isRequested() && (collectedNow() < mined || felling)) {
       await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS }, { freeStuck: felling });
     }
     const collected = collectedNow();
@@ -321,7 +328,8 @@ async function mineBlocksInner(
       return finish(mined > 0, `mining cancelled${mined > 0 ? ": {summary}" : ""}`, { cancelled: true });
     }
 
-    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, unreachable, fell);
+    const skipKeys = abandoned.size > 0 ? new Map<string, unknown>([...unreachable, ...[...abandoned].map((k): [string, unknown] => [k, 1])]) : unreachable;
+    const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, skipKeys, fell);
     // Done with a trunk (the next target is another tree, or none): sweep its drops before moving on.
     if (fell.lastTree && !creative && (!block || !fell.lastTree.has(posKey(block.position)))) {
       if (mined > 0 && collectedNow() < mined && !cancellation?.isRequested()) await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS }, { freeStuck: felling });
@@ -401,7 +409,23 @@ async function mineBlocksInner(
     if (collectedNow() <= before && (dropsByBlock.get(block.type)?.length ?? 0) > 0) {
       fruitlessStreak += 1;
       if (fruitlessStreak >= MAX_FRUITLESS_DIGS) {
-        return finish(false, `stopped after ${fruitlessStreak} blocks dropped nothing I could pick up — {summary}`);
+        if (bot.inventory.emptySlotCount() === 0) {
+          return finish(false, `stopped after ${fruitlessStreak} blocks dropped nothing I could pick up — {summary}`);
+        }
+        // Not a reason to quit: sweep wider for the drops; if they are out of reach, give up on THIS tree and go on to the next.
+        const beforeSweep = collectedNow();
+        if (!creative) await pickUpNearby(bot, { maxDist: FINAL_SWEEP_RADIUS }, { freeStuck: felling });
+        if (cancellation?.isRequested()) continue;
+        if (collectedNow() > beforeSweep) {
+          fruitlessStreak = 0;
+        } else if (felling && fell.lastTree && abandonedTrees < MAX_ABANDONED_TREES) {
+          for (const k of fell.lastTree) abandoned.add(k);
+          abandonedTrees += 1;
+          fruitlessStreak = 0;
+          console.log(`[${bot.username}] [mine] drops of this tree can't be collected; moving on to another tree (${abandonedTrees}/${MAX_ABANDONED_TREES})`);
+        } else {
+          return finish(false, `stopped after ${fruitlessStreak} blocks dropped nothing I could pick up — {summary}`);
+        }
       }
     } else {
       fruitlessStreak = 0;
@@ -556,6 +580,7 @@ async function mineOneBlock(
   block: Block,
   blockNameForMsg: string,
   allowStructures = false,
+  retriedAbort = false,
 ): Promise<SkillResult> {
   const bot = pBot as Bot;
 
@@ -616,6 +641,25 @@ async function mineOneBlock(
     console.warn(
       `[${bot.username}] dig FAILED at ${digDiag.targetPos} after ${elapsed}ms — ${message} | ${digDiag.summary}`,
     );
+    // "Digging aborted" = something called bot.stopDigging mid-dig. The only thing that does that
+    // while a skill runs is the survival reflex (drowning / suffocation), which is right to take
+    // over. Once it is done the bot is somewhere safe: retry the block once from scratch (re-path,
+    // re-equip) instead of reporting it unreachable. A second abort skips just this block.
+    if (/digging aborted/i.test(message) && !getBotState(bot.username)?.cancellation.isRequested()) {
+      await surfaceInterrupted(bot);
+      await new Promise((r) => setTimeout(r, 300));
+      const fresh = bot.blockAt(block.position);
+      if (!fresh || fresh.type !== block.type) return { ok: true, message: `${blockNameForMsg} at ${fmt(block.position.x, block.position.y, block.position.z)} is already gone` };
+      if (!retriedAbort) {
+        console.log(`[${bot.username}] [mine] dig was interrupted (survival reflex); retrying ${blockNameForMsg} once`);
+        return mineOneBlock(pBot, fresh, blockNameForMsg, allowStructures, true);
+      }
+      return {
+        ok: false,
+        message: `dig of ${blockNameForMsg} at ${fmt(block.position.x, block.position.y, block.position.z)} was interrupted twice (underwater / suffocation reflex)`,
+        state: { unreachable: true },
+      };
+    }
     return {
       ok: false,
       message: `dig failed at ${fmt(block.position.x, block.position.y, block.position.z)} after ${elapsed}ms: ${message}`,

@@ -420,3 +420,35 @@ describe("unreachable gather feeds the planner (avoidBlocks) and reserves the pl
     expect(reserved.at(-1)).toBeNull();
   });
 });
+
+describe("generic (tag) goals", () => {
+  it("keeps the tag goals for re-plans and stores the latest concrete resolution as job.goals", async () => {
+    const seen: Goal[][] = [];
+    const concrete = (item: string, count: number): Plan => mkPlan([gatherStep(item, count)], [{ item, count }]);
+    const queue = [concrete("birch_log", 5), mkPlan([], [{ item: "birch_log", count: 5 }])];
+    const h = harness({ plans: queue, script: () => okRes() });
+    // wrap the harness planner to record the goals it is asked for
+    const deps = (h.runner as unknown as { deps: RunnerDeps }).deps;
+    const inner = deps.plan;
+    deps.plan = (goals, view, o) => {
+      seen.push(goals.map((g) => ({ ...g })));
+      return inner(goals, view, o);
+    };
+    const res = await h.runner.start([{ item: "#log", count: 5 }], "Alex");
+    expect(res.ok).toBe(true);
+    await until(() => h.ended.length === 1);
+    const job = h.runner.current()!;
+    expect(job.status).toBe("done");
+    expect(job.generic).toEqual([{ item: "#log", count: 5 }]);
+    expect(job.goals).toEqual([{ item: "birch_log", count: 5 }]);
+    // the verify re-plan after the steps re-resolves from the tag, not from the concrete species
+    expect(seen).toEqual([[{ item: "#log", count: 5 }], [{ item: "#log", count: 5 }]]);
+  });
+
+  it("plain goals leave job.generic unset", async () => {
+    const h = harness({ plans: [mkPlan([gatherStep("oak_log", 1)]), mkPlan([])], script: () => okRes() });
+    await h.runner.start([{ item: "oak_log", count: 1 }], null);
+    await until(() => h.ended.length === 1);
+    expect(h.runner.current()!.generic).toBeUndefined();
+  });
+});
