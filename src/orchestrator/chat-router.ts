@@ -27,8 +27,10 @@
 // maybe re-read the question) regularly takes longer than 30s.
 const QUESTION_TTL_MS = 45 * 1000;
 // Window after any bot reply in which the same player's un-named chat still
-// routes back. Short on purpose — this is the most false-positive-prone path.
-const FOLLOW_UP_TTL_MS = 20 * 1000;
+// routes back. Was 20s; the 2026-10-10 live test showed players replying to
+// the bot ~30–60s later ("I don't see the furnace", "are you stuck?") and being
+// ignored. Still the most false-positive-prone path, so bounded.
+const FOLLOW_UP_TTL_MS = 60 * 1000;
 const ADDRESSED_TTL_MS = 5 * 60 * 1000;
 
 interface AddressedEntry {
@@ -61,7 +63,8 @@ export type RouteReason =
   | "all-mention"
   | "whisper"
   | "continuation"
-  | "follow-up";
+  | "follow-up"
+  | "job-requester";
 
 export interface RouteMatch {
   channel: ChatChannel;
@@ -127,7 +130,21 @@ function computeMatch(
     return { channel: "chat", reason: "follow-up" };
   }
 
+  // While the bot is running a job for this player, they're working together:
+  // their un-named chat is for the bot.
+  if (jobRequesterProbes.get(botUsername)?.() === event.sender) {
+    return { channel: "chat", reason: "job-requester" };
+  }
+
   return null;
+}
+
+/** Per bot: who the running job was requested by (null if none). Set by src/jobs/wire.ts. */
+const jobRequesterProbes = new Map<string, () => string | null>();
+
+export function registerJobRequesterProbe(botUsername: string, probe: (() => string | null) | null): void {
+  if (probe) jobRequesterProbes.set(botUsername, probe);
+  else jobRequesterProbes.delete(botUsername);
 }
 
 /** Configured aliases (config/bots.yml `aliases:`), by bot username. */
@@ -286,4 +303,5 @@ export function resetChatRouter(): void {
   recentReplies.clear();
   configuredAliases.clear();
   onlinePlayers.clear();
+  jobRequesterProbes.clear();
 }

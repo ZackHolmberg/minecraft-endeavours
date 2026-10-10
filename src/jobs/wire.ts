@@ -14,6 +14,7 @@ import { clearReserved, reservedSnapshot, setReserved } from "../state/reservati
 import { formatJobEvent } from "./describe.js";
 import { createExplorer, createRelocator } from "./explore.js";
 import { buildLedgerFor, ledgerFor } from "./ledger.js";
+import { registerJobRequesterProbe } from "../orchestrator/chat-router.js";
 import { registerJobRunner, unregisterJobRunner } from "./registry.js";
 import { JobRunner } from "./runner.js";
 import { createBuildDeps } from "./steps/build.js";
@@ -49,6 +50,7 @@ function logJobEvent(username: string, e: TelemetryInput): void {
 export async function attachJobRunner(bot: Bot, username: string, state: BotState): Promise<JobRunner> {
   // Dispose the previous connection's runner first: it ends its job as interrupted
   // before the new runner reads job.json.
+  registerJobRequesterProbe(username, null);
   await unregisterJobRunner(username);
   const path = memoryFileFor(username, "job.json");
   let off: () => void = () => {};
@@ -142,6 +144,10 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     void runner.dispose().catch((err) => console.warn(`[${username}] job runner dispose failed:`, err));
   });
   await registerJobRunner(username, runner);
+  registerJobRequesterProbe(username, () => {
+    const j = runner.current();
+    return j && j.status === "running" ? j.requestedBy : null;
+  });
   // Scaffold blocks a previous run left standing (crash / restart / stop): take them down once the bot is in the world.
   const reclaim = (): void => {
     setTimeout(() => void runner.reclaimOrphans().catch(() => undefined), 5_000);

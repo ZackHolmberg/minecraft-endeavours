@@ -74,7 +74,9 @@ export function formatJobEvent(job: Job): string | null {
       return `[job finished] ${goals} — done in ${dur}, ${b.placed}/${b.total} blocks placed${who}. Reply with one short line saying it's built (and where, if useful).`;
     }
     if (job.deliverTo) return `[job finished] ${goals} — handed over in ${dur}${who}. Reply with one short line (they have it now).`;
-    return `[job finished] ${goals} — done in ${dur}${who}. Reply with one short line saying you've got it (or what you now have).`;
+    // Live test 2026-10-10: after "achieve furnace" Haiku said "furnace placed, cooking the beef next" and
+    // stopped — the item was only crafted, and the announced next step never ran.
+    return `[job finished] ${goals} — done in ${dur}${who}. The items are in your inventory (crafted, not placed). If this was a step toward something the player asked for (you said you'd do something next), do that next step now with a tool call; otherwise reply with one short line saying you've got it. Never claim something was placed or done unless a tool result says so.`;
   }
   if (job.status === "failed" && job.failure) {
     const f = job.failure;
