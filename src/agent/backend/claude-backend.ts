@@ -52,7 +52,7 @@
  * more quota per ARCHITECTURE.md "Resilience".
  */
 
-import { coalesceMessages, isDirectAddress } from "../coalesce.js";
+import { coalesceMessages, isDirectAddress, silentNudgeText } from "../coalesce.js";
 import {
   query,
   type Query,
@@ -633,9 +633,7 @@ export class ClaudeBackend implements AgentBackend {
     const how = partner ? `say (or whisper to ${partner} if they whispered you)` : "say";
     console.log(`[${this.opts.bot.username}] task ended without say/whisper; nudging once`);
     this.followUpQueued = true;
-    this.pushUserMessage(
-      `[orchestrator note — not a player message] Nobody heard anything from you on the last message: plain text is invisible, only the say/whisper tools reach players. Using only ${how}, answer them now in one short line (what you're doing, or your proposal/question). Don't call any other tool this turn.`,
-    );
+    this.pushUserMessage(silentNudgeText(how));
   }
 
   /** True while an event is running (or, per_task, about to start). */

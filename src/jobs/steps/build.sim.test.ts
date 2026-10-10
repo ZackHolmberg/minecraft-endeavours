@@ -25,6 +25,11 @@ interface Sim {
   box: { x0: number; z0: number; x1: number; z1: number } | null;
   /** The next N dug-up `dirt` blocks (scaffolds) drop nothing the bot can get. */
   loseDrops: number;
+  /** Called after every successful placement (tests abort / throw from here). */
+  onPlace?: (type: string) => void;
+  /** Digging `dirt` throws (scaffold removal fails). */
+  failDig?: boolean;
+  health?: number;
 }
 let sim: Sim;
 
@@ -54,7 +59,15 @@ vi.mock("../../skills/creative.js", () => ({
   },
 }));
 vi.mock("../../skills/navigation.js", () => ({
-  navigate: async (_b: unknown, goal: { x: number; y: number; z: number }) => {
+  navigate: async (_b: unknown, goal: { x: number; y: number; z: number; rangeSq?: number }) => {
+    // GoalNear (near a possibly solid block): stand on top of it
+    if (goal.rangeSq !== undefined && SOLIDISH(nameAt(goal.x, goal.y, goal.z))) {
+      const g = goal;
+      const free = [[0, 1, 0], [0, 2, 0], [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1], [2, 1, 0], [-2, 1, 0]]
+        .map(([dx, dy, dz]) => ({ x: g.x + dx!, y: g.y + dy!, z: g.z + dz! }))
+        .find((c) => !SOLIDISH(nameAt(c.x, c.y, c.z)) && !SOLIDISH(nameAt(c.x, c.y + 1, c.z)));
+      if (free) goal = free;
+    }
     const dest = new Vec3(goal.x + 0.5, goal.y, goal.z + 0.5);
     if (SOLIDISH(nameAt(goal.x, goal.y, goal.z)) || SOLIDISH(nameAt(goal.x, goal.y + 1, goal.z))) return { ok: false, message: "no path" };
     sim.pos = dest;
@@ -80,6 +93,7 @@ vi.mock("../../skills/world.js", () => ({
     sim.world.set(k(p.x, p.y, p.z), type);
     if (/_door$/.test(type)) sim.world.set(k(p.x, p.y + 1, p.z), type);
     sim.log.push({ op: "place", at: k(p.x, p.y, p.z), block: type, botInside: insideBox(Math.floor(sim.pos.x), Math.floor(sim.pos.z)) });
+    sim.onPlace?.(type);
     return { ok: true, message: "placed" };
   },
 }));
@@ -117,7 +131,11 @@ function fakeBot(): Bot {
       };
     },
     blockAt: (p: Vec3) => fakeBlock(p.x, p.y, p.z),
+    get health() {
+      return sim.health;
+    },
     dig: async (b: { position: Vec3; name: string }) => {
+      if (sim.failDig && b.name === "dirt") throw new Error("dig refused");
       const drop = b.name === "grass_block" ? "dirt" : b.name;
       if (b.name === "dirt" && sim.loseDrops > 0) sim.loseDrops--;
       else if (/^(dirt|cobblestone|netherrack)$/.test(drop)) sim.inv[drop] = (sim.inv[drop] ?? 0) + 1;
@@ -129,8 +147,24 @@ function fakeBot(): Bot {
 }
 
 const records: unknown[] = [];
-const ctx = (): BuildRunContext => ({ signal: new AbortController().signal, radius: 64, baseline: 0, jobId: "j", record: (e) => records.push(e), progress: () => {} });
+const ctx = (): BuildRunContext => ({ signal: new AbortController().signal, radius: 64, baseline: 0, jobId: "j", record: (e) => records.push(e), progress: () => {}, scaffolds: [], setScaffolds: () => {} });
 const A = { x: 0, y: 64, z: 0 };
+
+const dirtCount = (): number => [...sim.world.values()].filter((n) => n === "dirt").length;
+
+/** Portal run with hooks; returns the scaffold lists the builder persisted. */
+async function runPortal(opts: { ctxOver?: Partial<BuildRunContext>; setup?: (abort: () => void) => void; inv?: Record<string, number> } = {}) {
+  sim = { world: new Map(), inv: { obsidian: 10, flint_and_steel: 1, dirt: 1, ...(opts.inv ?? {}) }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+  const { createBuildDeps } = await import("./build.js");
+  const deps = createBuildDeps(fakeBot());
+  const prep = await deps.prepare({ blueprint: "portal", params: {}, anchor: A, avoid: [A] }, null);
+  if (!prep.ok) throw new Error("no prep");
+  const abort = new AbortController();
+  const saved: Array<Array<{ x: number; y: number; z: number; item: string }>> = [];
+  opts.setup?.(() => abort.abort());
+  const c: BuildRunContext = { ...ctx(), signal: abort.signal, setScaffolds: (l) => saved.push(l.map((x) => ({ ...x }))), ...opts.ctxOver };
+  return { deps, prep, ctx: c, saved, abort };
+}
 
 async function runKind(blueprint: "house" | "portal" | "farm", params: Record<string, unknown>, inv: Record<string, number>, creative = false, extra: Record<string, string> = {}, loseDrops = 0) {
   sim = { world: new Map(Object.entries(extra)), inv: { ...inv }, pos: new Vec3(0.5, 64, 0.5), creative, log: [], box: null, loseDrops };
@@ -222,3 +256,95 @@ describe("Builder simulation", () => {
     expect((out as { placed: number }).placed).toBe(30);
   });
 });
+
+describe("scaffold persistence and clean-up (H2)", () => {
+  it("persists each scaffold before placing it and ends with an empty list on success", async () => {
+    const { deps, prep, ctx: c, saved } = await runPortal();
+    if (!prep.ok) return;
+    const out = await deps.run(prep, c);
+    expect(out).toMatchObject({ ok: true });
+    expect(saved.some((l) => l.length === 1 && l[0]!.item === "dirt")).toBe(true);
+    expect(saved.at(-1)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("a stop mid-build still takes the scaffolds down (the abort that ended the run does not block clean-up)", async () => {
+    let abortFn: () => void = () => {};
+    const { deps, prep, ctx: c, saved } = await runPortal({ setup: (a) => (abortFn = a) });
+    if (!prep.ok) return;
+    sim.onPlace = (type) => {
+      if (type === "dirt") abortFn(); // stop lands right after the first scaffold went in
+    };
+    const out = await deps.run(prep, c);
+    expect(out).toMatchObject({ ok: false, kind: "cancelled" });
+    expect(saved.some((l) => l.length >= 1)).toBe(true);
+    expect(saved.at(-1)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+    expect(sim.inv["dirt"]).toBe(1); // got the block back
+  });
+
+  it("a thrown error also strips them (finally)", async () => {
+    const { deps, prep, ctx: c, saved } = await runPortal();
+    if (!prep.ok) return;
+    sim.onPlace = (type) => {
+      if (type === "dirt") throw new Error("boom");
+    };
+    await expect(deps.run(prep, c)).rejects.toThrow();
+    sim.onPlace = undefined;
+    expect(saved.at(-1)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("entries whose removal failed stay on the list (never cleared) and the next run reclaims them", async () => {
+    const { deps, prep, ctx: c, saved } = await runPortal();
+    if (!prep.ok) return;
+    sim.failDig = true;
+    await deps.run(prep, c); // the portal itself completes; the blocks it could not take down stay on the books
+    const left = saved.at(-1)!;
+    expect(left.length).toBeGreaterThan(0);
+    expect(left.every((x) => x.item === "dirt")).toBe(true);
+    expect(dirtCount()).toBe(left.length);
+    // next attempt: the leftovers are known, not terrain; removal works now
+    sim.failDig = false;
+    const again = await deps.reclaim!(left, new AbortController().signal);
+    expect(again).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("known scaffold cells are not terrain for prepare (masked as air), only while they still hold the item", async () => {
+    const { maskScaffolds, gridOf } = await import("./build.js");
+    sim = { world: new Map([[k(5, 64, 5), "dirt"], [k(6, 64, 5), "dirt"]]), inv: {}, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const g = maskScaffolds(gridOf(fakeBot()), [{ x: 5, y: 64, z: 5, item: "dirt" }, { x: 7, y: 64, z: 5, item: "dirt" }]);
+    expect(g.blockAt(5, 64, 5)).toBe("air"); // our scaffold
+    expect(g.blockAt(6, 64, 5)).toBe("dirt"); // unrelated dirt stays terrain
+    expect(g.blockAt(7, 64, 5)).toBe("air"); // already gone
+  });
+
+  it("a dead bot skips clean-up and keeps the list for the next build", async () => {
+    let abortFn: () => void = () => {};
+    const { deps, prep, ctx: c, saved } = await runPortal({ setup: (a) => (abortFn = a) });
+    if (!prep.ok) return;
+    sim.onPlace = (type) => {
+      if (type === "dirt") {
+        sim.health = 0;
+        abortFn();
+      }
+    };
+    await deps.run(prep, c);
+    expect(saved.at(-1)!.length).toBeGreaterThan(0);
+    expect(dirtCount()).toBeGreaterThan(0);
+    // alive again (next boot): reclaim removes it
+    sim.health = 20;
+    sim.onPlace = undefined;
+    expect(await deps.reclaim!(saved.at(-1)!, new AbortController().signal)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("reserves the build's materials, scaffold item, tools and door for the whole job", async () => {
+    const { prep } = await runKind("house", { wall: "oak_planks" }, { oak_planks: 64, oak_door: 1, glass: 4, dirt: 2 });
+    expect(prep.ok && prep.reserve).toEqual(expect.arrayContaining(["oak_planks", "glass", "oak_door"]));
+    const farm = await runKind("farm", { size: 5 }, { wooden_hoe: 1, wheat_seeds: 16, water_bucket: 1 });
+    expect(farm.prep.ok && farm.prep.reserve).toEqual(expect.arrayContaining(["wheat_seeds", "water_bucket", "wooden_hoe"]));
+  });
+});
+

@@ -90,7 +90,7 @@ function makeBot(name: string, blocks: Map<string, string>, o: Opts = {}) {
   let nextId = 1000;
   bot.dig = async (block: any) => {
     const key = `${block.position.x},${block.position.y},${block.position.z}`;
-    const dropItem = registry.items[(registry.blocks[block.type]!.drops as unknown as number[])[0]!]!.name;
+    const dropItem = registry.items[(registry.blocks[block.type]!.drops as unknown as number[])[0]!]?.name ?? "stick"; // leaves may drop nothing
     blocks.delete(key);
     digs += 1;
     o.onDig?.(digs);
@@ -345,6 +345,35 @@ async function main(): Promise<void> {
     console.log("  8:", r.message);
     assert.equal(inv.get("dirt"), 2);
     assert.match(r.message, /picked up 2 dirt/);
+  }
+
+  // 10. H1: items stuck on tree blocks are freed ONLY when the caller opted in (log gathering), never by a plain pickUpNearby.
+  {
+    const mkWorld = (): Map<string, string> => {
+      const blocks = new Map<string, string>();
+      for (let y = 64; y <= 66; y++) blocks.set(`6,${y},0`, "oak_log"); // trunk
+      for (let x = 4; x <= 8; x++) for (let z = -2; z <= 2; z++) blocks.set(`${x},67,${z}`, "oak_leaves"); // crown
+      blocks.set("3,63,0", "oak_leaves"); // low branch the item rests on
+      return blocks;
+    };
+    for (const optIn of [false, true]) {
+      let digs = 0;
+      const { bot } = makeBot(optIn ? "h1b" : "h1a", mkWorld(), { full: true, onDig: (n) => { digs = n; } });
+      (bot as any).canDigBlock = () => true;
+      (bot as any).entities[70] = { id: 70, name: "item", position: new Vec3(3.5, 64.2, 0.5), getDroppedItem: () => ({ name: "oak_log", count: 1 }), _drop: "oak_log" };
+      await pickUpNearby(bot, { maxDist: 8 }, optIn ? { freeStuck: true } : undefined);
+      console.log(`  10 (freeStuck=${optIn}): digs=${digs}`);
+      assert.equal(digs > 0, optIn, optIn ? "log gathering frees the stuck drop" : "plain pickUpNearby never breaks blocks");
+    }
+    // a player's leaf hedge with a stray item on it is left alone even when opted in
+    const hedge = new Map<string, string>();
+    for (let x = 0; x <= 6; x++) hedge.set(`${x},63,0`, "oak_leaves");
+    let digs = 0;
+    const { bot } = makeBot("h1c", hedge, { full: true, onDig: (n) => { digs = n; } });
+    (bot as any).canDigBlock = () => true;
+    (bot as any).entities[71] = { id: 71, name: "item", position: new Vec3(3.5, 64.2, 0.5), getDroppedItem: () => ({ name: "oak_log", count: 1 }), _drop: "oak_log" };
+    await pickUpNearby(bot, { maxDist: 8 }, { freeStuck: true });
+    assert.equal(digs, 0, "leaf hedge (no tree) is not touched");
   }
 
   console.log("gather-counting: all assertions passed");

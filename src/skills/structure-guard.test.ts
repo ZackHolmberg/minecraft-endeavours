@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Vec3 } from "vec3";
-import { isCheapBreak, isNaturalTerrain, isTreeLog } from "./structure-guard.js";
+import { builtReasonAt, craftedWithin, isCheapBreak, isFreeableTreeBlock, isNaturalTerrain, isTreeLog } from "./structure-guard.js";
 
 type World = Map<string, string>;
 const key = (x: number, y: number, z: number): string => `${x},${y},${z}`;
@@ -75,5 +75,62 @@ describe("path-digging allowlist", () => {
     for (const n of ["oak_log", "jungle_log", "stripped_oak_log", "oak_planks", "cobblestone", "oak_door", "glass", "chest", "crafting_table", "furnace", "white_wool"]) {
       expect(isNaturalTerrain(n) || isCheapBreak(n), n).toBe(false);
     }
+  });
+});
+
+describe("isFreeableTreeBlock (H1: what freeStuckDrops may break)", () => {
+  it("a natural tree's log and its leaves qualify", () => {
+    const w: World = new Map();
+    tree(w, 0, 0, 5);
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(0, 64, 0))).toBe(true); // stump log
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(1, 67, 1))).toBe(true); // canopy leaf next to the trunk
+  });
+  it("a leaf hedge / treehouse floor with no tree log within 4 blocks does not", () => {
+    const w: World = new Map();
+    fill(w, 0, 64, 0, 6, 64, 0, "oak_leaves"); // a hedge
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(3, 64, 0))).toBe(false);
+    const roof: World = new Map();
+    fill(roof, 0, 70, 0, 4, 70, 4, "oak_leaves"); // leaf roof
+    tree(roof, 20, 20, 5); // a tree far away
+    expect(isFreeableTreeBlock(nameAt(roof), new Vec3(2, 70, 2))).toBe(false);
+  });
+  it("leaves of a real tree still do not qualify when they touch a crafted block", () => {
+    const w: World = new Map();
+    tree(w, 0, 0, 5);
+    w.set(key(2, 67, 0), "oak_planks"); // a treehouse plank beside the canopy
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(1, 67, 0))).toBe(false); // adjacent to the plank
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(-2, 68, -2))).toBe(true); // far side of the crown is fine
+  });
+  it("a player's log post, wall or stripped log never qualifies, nor does one beside planks", () => {
+    const w: World = new Map();
+    fill(w, 0, 64, 0, 0, 68, 0, "oak_log"); // bare post
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(0, 64, 0))).toBe(false);
+    const wall: World = new Map();
+    fill(wall, 0, 64, 0, 4, 66, 0, "oak_log"); // log wall
+    fill(wall, -2, 67, -2, 6, 68, 2, "oak_leaves");
+    expect(isFreeableTreeBlock(nameAt(wall), new Vec3(2, 64, 0))).toBe(false);
+    const near: World = new Map();
+    tree(near, 0, 0, 5);
+    near.set(key(1, 64, 0), "spruce_planks");
+    expect(isFreeableTreeBlock(nameAt(near), new Vec3(0, 64, 0))).toBe(false);
+    expect(isFreeableTreeBlock(nameAt(near), new Vec3(0, 70, 5))).toBe(false); // not a tree block at all (air)
+  });
+  it("only logs and leaves: stone, dirt, planks never", () => {
+    const w: World = new Map();
+    tree(w, 0, 0, 5);
+    w.set(key(3, 64, 3), "dirt");
+    expect(isFreeableTreeBlock(nameAt(w), new Vec3(3, 64, 3))).toBe(false);
+  });
+});
+
+describe("builtReasonAt / craftedWithin (pure forms)", () => {
+  it("flags stone set into two crafted blocks, and finds crafted blocks within a radius", () => {
+    const w: World = new Map();
+    w.set(key(0, 0, 0), "stone");
+    w.set(key(1, 0, 0), "oak_planks");
+    w.set(key(-1, 0, 0), "oak_planks");
+    expect(builtReasonAt(nameAt(w), { name: "stone", position: new Vec3(0, 0, 0) })).toMatch(/built wall/);
+    expect(craftedWithin(nameAt(w), new Vec3(0, 2, 0), 2)).toBe(true);
+    expect(craftedWithin(nameAt(w), new Vec3(0, 5, 0), 2)).toBe(false);
   });
 });

@@ -10,8 +10,7 @@ import { isCreative } from "./game-mode.js";
 import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
 import { navigate } from "./navigation.js";
-import { builtStructureReason } from "./structure-guard.js";
-import { isLeafName, isTreeLogName } from "./tree-felling.js";
+import { isFreeableTreeBlock } from "./structure-guard.js";
 import type { SkillResult } from "./types.js";
 
 const PICKUP_DEFAULT_RADIUS = 8;
@@ -126,9 +125,16 @@ export function waitForDropNear(
  * drops that spawned mid-sweep; the skill returns and Claude can call it
  * again if needed.
  */
+/** Internal options (not part of the Haiku-facing params). */
+export interface PickUpOptions {
+  /** Log gathering only: break the natural tree block an item is stuck on. Off by default. */
+  freeStuck?: boolean;
+}
+
 export async function pickUpNearby(
   bot: Bot,
   { maxDist = PICKUP_DEFAULT_RADIUS }: PickUpNearbyParams = {},
+  opts: PickUpOptions = {},
 ): Promise<SkillResult> {
   if (maxDist < 1 || maxDist > PICKUP_MAX_RADIUS) {
     return { ok: false, message: `maxDist must be between 1 and ${PICKUP_MAX_RADIUS}, got ${maxDist}` };
@@ -170,7 +176,8 @@ export async function pickUpNearby(
   }
   // Items still lying around after two sweeps are usually perched where we can't stand:
   // on a stump/trunk top or on leaves. Break the natural block they rest on.
-  if (!cancellation?.isRequested()) await freeStuckDrops(bot, maxDist);
+  // Only while felling trees (opt-in from the log-gathering paths): never on a generic pickup.
+  if (opts.freeStuck && !cancellation?.isRequested()) await freeStuckDrops(bot, maxDist);
 
   const gained = inventoryGain(before, inventoryCounts(bot));
   const collected = Object.values(gained).reduce((a, b) => a + b, 0);
@@ -190,6 +197,7 @@ export async function pickUpNearby(
 }
 
 const STUCK_MAX_PER_CALL = 4;
+const TREE_DROP_RE = /(_log|_wood|_sapling|_propagule|^stick$|^apple$|^golden_apple$|^azalea$|^flowering_azalea$|^vine$|_leaves$)/;
 const STUCK_DIG_TIMEOUT_MS = 8_000;
 const STUCK_SETTLE_MS = 700;
 
@@ -202,12 +210,14 @@ const STUCK_SETTLE_MS = 700;
 async function freeStuckDrops(bot: Bot, maxDist: number): Promise<void> {
   const cancellation = getBotState(bot.username)?.cancellation;
   let freed = 0;
+  const verdicts = new Map<string, boolean>();
   for (const t of collectDroppedItemPositions(bot, maxDist)) {
     if (freed >= STUCK_MAX_PER_CALL || cancellation?.isRequested()) return;
     const e = bot.entities[t.entityId];
     if (!e || e.name !== "item") continue;
+    if (!TREE_DROP_RE.test(t.itemName)) continue; // only things a felled tree drops
     const support = bot.blockAt(new Vec3(Math.floor(e.position.x), Math.floor(e.position.y - 0.3), Math.floor(e.position.z)));
-    if (!support || !(isLeafName(support.name) || (isTreeLogName(support.name) && builtStructureReason(bot, support) === null))) continue;
+    if (!support || !isFreeableTreeBlock((p) => bot.blockAt(p), support.position, verdicts)) continue;
     freed += 1;
     try {
       await goTo(bot, { target: { kind: "coords", coords: { x: support.position.x, y: support.position.y, z: support.position.z } }, reach: 3 });
