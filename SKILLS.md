@@ -237,7 +237,9 @@ There is also a **side-channel** in `mineflayer-glue/event-hooks.ts`: when a can
 followPlayer(bot, { player: string, dist?: number }): Promise<SkillResult>
 ```
 
-Sets a dynamic pathfinder `GoalFollow(entity, dist)` and parks in a tick loop. Returns only when the cancellation flag is set (player says "stop"/"halt"/"wait", or Claude calls the `stop` skill) or when the player leaves the server. Blocks the agent loop — chat that arrives mid-follow queues normally, the side-channel handles the preempt.
+**v2: this tool starts a `follow` background job and returns at once** (`src/jobs/steps/follow.ts`, pure logic in `src/jobs/follow.ts`; see v2/PLANNER.md "Follow job"). The job keeps the dynamic `GoalFollow`, searches for the player if they leave view (last position, then ahead along their heading, up to 45 s; fails at once if they left the server), ends on stop / `cancelJob` / any non-exempt tool call / the 30-min cap, and does not end on chat. Without a job runner (legacy backends) the original blocking skill below runs.
+
+Legacy blocking skill: sets a dynamic pathfinder `GoalFollow(entity, dist)` and parks in a tick loop. Returns only when the cancellation flag is set (player says "stop"/"halt"/"wait", or Claude calls the `stop` skill) or when the player leaves the server. Blocks the agent loop — chat that arrives mid-follow queues normally, the side-channel handles the preempt.
 
 | Param | Default | Notes |
 |---|---|---|
