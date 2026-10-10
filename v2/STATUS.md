@@ -47,4 +47,6 @@ If a session died mid-flight: check the run dir + reports; whatever exists is th
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
+- **SECURITY (D16):** live `Steve_AI` on `main` loads the account's claude.ai connectors (no `strictMcpConfig`); one-line hotfix needs owner approval.
+- Push `v2` branch + `v1` tag to GitHub? Targets OK? Continue climbing?
 - None yet. (Pushing the `v1` tag / `v2` branch to GitHub: will ask before doing it.)
