@@ -5,6 +5,7 @@
 import type { Bot } from "mineflayer";
 import { defaultPlanks } from "../build/materials.js";
 import { getCurrentConversationPartner } from "../orchestrator/chat-router.js";
+import { isGoalTag, knownTagNames, tagMembers } from "../planner/knowledge/tags.js";
 import type { Goal } from "../planner/types.js";
 import { resolveItem } from "../skills/item-naming.js";
 import type { SkillResult } from "../skills/types.js";
@@ -69,6 +70,16 @@ export async function achieve(bot: Bot, { goals, deliverTo }: AchieveParams): Pr
   const errors: string[] = [];
   const stackSizes = new Map<string, number>();
   for (const g of goals) {
+    if (isGoalTag(g.item)) {
+      const tag = g.item.trim().toLowerCase();
+      if (!tagMembers(tag)) {
+        errors.push(`goals item "${g.item}" is not a known item tag (known: ${knownTagNames().join(", ")})`);
+        continue;
+      }
+      stackSizes.set(tag, 64);
+      merged.set(tag, (merged.get(tag) ?? 0) + Math.max(1, Math.floor(g.count)));
+      continue;
+    }
     const r = resolveItem(bot, g.item);
     if (!r.ok) {
       errors.push(`goals item ${r.message}`);

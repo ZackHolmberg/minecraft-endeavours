@@ -69,6 +69,12 @@ export interface Job {
   id: string;
   kind: JobKind;
   goals: Goal[];
+  /**
+   * achieve: the goals as asked when any used a generic tag ("#log"). Re-plans start from these so the
+   * species is re-chosen from the live world (an unreachable one is avoided); `goals` holds the latest
+   * concrete resolution (what a hand-over delivers). Absent for jobs without tags.
+   */
+  generic?: Goal[];
   /** achieve: hand the goal items to this player when the goals are met. */
   deliverTo?: string | null;
   /** Set when kind is "build". */

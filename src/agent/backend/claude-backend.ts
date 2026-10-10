@@ -52,7 +52,7 @@
  * more quota per ARCHITECTURE.md "Resilience".
  */
 
-import { coalesceMessages, isDirectAddress, silentNudgeText } from "../coalesce.js";
+import { coalesceMessages, isDirectAddress, isStatusQuestion, silentNudgeText } from "../coalesce.js";
 import {
   query,
   type Query,
@@ -81,6 +81,7 @@ import {
   ALLOWED_TOOL_NAMES,
   MCP_SERVER_NAME,
   allowedToolNamesFor,
+  buildSideReplyServer,
   buildSkillsServer,
   buildSkillsServerFor,
   resetFailureGuard,
@@ -116,6 +117,12 @@ const CONTEXT_TIMEOUT_MS = 2_000;
 const TOOL_IDLE_WAIT_MS = 35_000;
 const TOOL_IDLE_POLL_MS = 200;
 const MAX_LABEL_CHARS = 120;
+// Mid-task side reply (see runSideReply): hard cap before falling back to the normal queue.
+const SIDE_REPLY_TIMEOUT_MS = 15_000;
+const SIDE_REPLY_NOTE =
+  "[quick question while your task is still running — answer it now] The task in the context above keeps running by itself and you can't see its result yet. " +
+  "Reply with ONE short say (or whisper, if they whispered you) saying what you're doing and how far along, using only the \"Right now\" and job lines and your inventory. " +
+  "Don't promise or start anything; no tool except say/whisper works this turn.";
 // When per-event turn count crosses this fraction of the cap, the loop emits
 // a one-shot warn line so we notice approaching termination before the SDK
 // kills the turn silently.
@@ -296,6 +303,8 @@ export class ClaudeBackend implements AgentBackend {
   /** Labels of in-flight events, FIFO, for outcome lines in the conversation log. */
   private eventLabels: string[] = [];
   private stopped = false;
+  /** A mid-task side reply is running (at most one). */
+  private sideReplyBusy = false;
 
   private sessionUsage: SessionUsage = {
     input_tokens: 0,
@@ -356,6 +365,9 @@ export class ClaudeBackend implements AgentBackend {
         ...(hint === "haiku" ? { thinking: { type: "adaptive" as const }, effort: HAIKU_EFFORT } : {}),
         systemPrompt: systemPrompt ?? buildSystemPrompt(bot.username),
         mcpServers: { [MCP_SERVER_NAME]: skillsServer },
+        // Only OUR skill server: without this the session also loads the account's claude.ai connectors
+        // (seen: Haiku calling a Docs `batch` tool, and ~5k extra cached tokens of foreign tool definitions).
+        strictMcpConfig: true,
         // Disable Claude Code's built-in tools — the NPC's surface is the skill layer only.
         tools: [],
         allowedTools,
@@ -770,6 +782,12 @@ export class ClaudeBackend implements AgentBackend {
   pushUserMessage(content: string): void {
     if (this.stopped) return;
     if (this.mode === "per_task") {
+      if (this.shouldSideReply(content)) {
+        // Answered by a separate one-turn session; deliberately NOT queued, so it is neither a task nor coalesced.
+        takeRoutedChat(this.opts.bot.username);
+        void this.runSideReply(content);
+        return;
+      }
       this.pending.push(content);
       this.pendingMeta.push({ at: Date.now(), chat: takeRoutedChat(this.opts.bot.username) });
       void this.maybeStartTask();
@@ -788,6 +806,98 @@ export class ClaudeBackend implements AgentBackend {
       this.queueTelemetryTask([content], [meta], ctxMs, context, injected);
       session.input.push(userMessage(context ? `${context}\n\n${content}` : content));
     });
+  }
+
+  /**
+   * Mid-task responsiveness. In per_task mode a message that arrives while the task's session is blocked on a
+   * long tool call (a 30 s mineBlock) would wait for the whole task before anyone looks at it. A directly
+   * addressed status question ("how's it going?") is instead answered right away by `runSideReply`.
+   * Eligible only when: this is the standalone Haiku bot (not the hybrid planner), a task session is live,
+   * a skill is in flight, the message is a question about progress (not a request), and no side reply is running.
+   */
+  private shouldSideReply(content: string): boolean {
+    if (this.stopped || this.sideReplyBusy || this.opts.systemPrompt !== undefined) return false;
+    if (!this.task || this.task.resulted || this.cooldown.isActive()) return false;
+    if (!getBotState(this.opts.bot.username)?.currentTool.current()) return false;
+    return isDirectAddress(content) && isStatusQuestion(content);
+  }
+
+  /**
+   * One-turn side session answering a status question while the main task's skill keeps running.
+   *  - Same model, same system prompt and (via `buildSideReplyServer`) byte-identical tool definitions as the
+   *    task sessions, so the cached prefix is reused; the user message is the usual context block plus a
+   *    "Right now" section (tool in flight + age) and the live inventory/job progress, and a note asking for one say.
+   *  - Control safety: every tool except say/whisper is a refusing stub, and nothing here touches the
+   *    cancellation flag, the current-tool slot, the task queue or the telemetry task, so the running skill and the
+   *    main session are undisturbed. It is not counted as a task (no task_start/task_end, not coalesced).
+   *  - The say it makes is logged to the conversation file like any other, so the main session's next context sees it.
+   *  - If it fails, times out (15 s) or never said anything, the message falls back to the normal queue.
+   */
+  private async runSideReply(content: string): Promise<void> {
+    const { bot, botConfig } = this.opts;
+    const tag = `[${bot.username}]`;
+    this.sideReplyBusy = true;
+    const t0 = Date.now();
+    let said = false;
+    let q: Query | null = null;
+    let timer: NodeJS.Timeout | undefined;
+    const input = new UserMessageQueue();
+    try {
+      const context = await this.worldContext({ midTask: true });
+      if (this.stopped) return;
+      const hint = botConfig.model_hint;
+      q = query({
+        prompt: input,
+        options: {
+          model: modelIdFor(hint),
+          ...(hint === "haiku" ? { thinking: { type: "adaptive" as const }, effort: "low" as const } : {}),
+          systemPrompt: buildSystemPrompt(bot.username),
+          mcpServers: { [MCP_SERVER_NAME]: buildSideReplyServer(bot, () => { said = true; }) },
+          strictMcpConfig: true,
+          tools: [],
+          allowedTools: [...ALLOWED_TOOL_NAMES],
+          permissionMode: "bypassPermissions",
+          allowDangerouslySkipPermissions: true,
+          persistSession: false,
+          maxTurns: 3,
+        },
+      });
+      const session = q;
+      timer = setTimeout(() => session.close(), SIDE_REPLY_TIMEOUT_MS);
+      console.log(`${tag} side reply: answering while ${getBotState(bot.username)?.currentTool.current()?.name ?? "a skill"} runs`);
+      input.push(userMessage(`${context ?? ""}\n\n${content}\n\n${SIDE_REPLY_NOTE}`));
+      for await (const msg of session) {
+        if (msg.type === "assistant") {
+          for (const block of (msg.message?.content ?? []) as Array<{ type: string; name?: string; input?: unknown }>) {
+            if (block.type === "tool_use") console.log(`${tag} [side] → ${shortToolName(block.name)}(${shortJson(block.input)})`);
+          }
+        } else if (msg.type === "result") {
+          const u = usageOf(msg);
+          if (u) {
+            this.sessionUsage.input_tokens += u.input_tokens;
+            this.sessionUsage.output_tokens += u.output_tokens;
+            this.sessionUsage.cache_creation_input_tokens += u.cache_creation_input_tokens;
+            this.sessionUsage.cache_read_input_tokens += u.cache_read_input_tokens;
+            if (u.total_cost_usd !== null && this.sessionUsage.total_cost_usd !== null) this.sessionUsage.total_cost_usd += u.total_cost_usd;
+            console.log(`${tag} side reply done in ${Date.now() - t0}ms — in=${u.input_tokens} out=${u.output_tokens} cache_read=${u.cache_read_input_tokens}${u.total_cost_usd !== null ? ` $${u.total_cost_usd.toFixed(4)}` : ""}`);
+          }
+          break;
+        }
+      }
+    } catch (err) {
+      if (!this.stopped) console.warn(`${tag} side reply failed:`, err instanceof Error ? err.message : err);
+    } finally {
+      if (timer) clearTimeout(timer);
+      input.close();
+      try { q?.close(); } catch { /* already closed */ }
+      this.sideReplyBusy = false;
+    }
+    if (said || this.stopped) return;
+    // Nothing was said: let the normal path handle the message after the task.
+    console.log(`${tag} side reply said nothing; queueing the message normally`);
+    this.pending.push(content);
+    this.pendingMeta.push({ at: Date.now(), chat: null });
+    void this.maybeStartTask();
   }
 
   private injectsContext(): boolean {
@@ -877,12 +987,12 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   /** Fresh deterministic world snapshot, or null if it fails / takes too long. */
-  private async worldContext(): Promise<string | null> {
+  private async worldContext(opts: { midTask?: boolean } = {}): Promise<string | null> {
     const { bot } = this.opts;
     let timer: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([
-        buildAgentContext(bot),
+        buildAgentContext(bot, opts),
         new Promise<null>((resolve) => {
           timer = setTimeout(() => resolve(null), CONTEXT_TIMEOUT_MS);
         }),

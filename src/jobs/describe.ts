@@ -39,7 +39,7 @@ export function goalsText(goals: readonly Goal[]): string {
 
 /** Short name of what a job is doing: "achieve iron_pickaxe x1", "build house (...)", plus "→ deliver to X". */
 export function jobLabel(job: Job): string {
-  const base = job.kind === "build" && job.build ? `build ${job.build.blueprint}${job.build.summary ? ` (${job.build.summary})` : ""}` : `achieve ${goalsText(job.goals)}`;
+  const base = job.kind === "build" && job.build ? `build ${job.build.blueprint}${job.build.summary ? ` (${job.build.summary})` : ""}` : `achieve ${goalsText(job.generic ?? job.goals)}`;
   return job.deliverTo ? `${base} → give to ${job.deliverTo}` : base;
 }
 

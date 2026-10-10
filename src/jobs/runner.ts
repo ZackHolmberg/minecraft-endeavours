@@ -27,6 +27,7 @@ import {
   stepKey,
   type Episode,
 } from "./recovery.js";
+import { isGoalTag } from "../planner/knowledge/tags.js";
 import type { FailureKind, Goal, PlanFn, Plan, Step, StepFailure, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import type { StopReason } from "../state/cancellation.js";
@@ -244,6 +245,7 @@ export class JobRunner {
       id: newJobId(now),
       kind: "achieve",
       goals: plan.goals,
+      ...(goals.some((g) => isGoalTag(g.item)) ? { generic: goals.map((g) => ({ ...g })) } : {}),
       deliverTo,
       requestedBy,
       status: "running",
@@ -664,7 +666,8 @@ export class JobRunner {
       return "failed";
     }
     if (job.status !== "running") return "failed";
-    const plan: Plan = this.deps.plan(job.goals, view);
+    const plan: Plan = this.deps.plan(job.generic ?? job.goals, view);
+    if (job.generic && plan.goals.length > 0) job.goals = plan.goals; // latest concrete resolution (a hand-over delivers this)
     if (plan.steps.length === 0) {
       if (plan.unresolved.length === 0) return "done";
       const u = plan.unresolved[0]!;

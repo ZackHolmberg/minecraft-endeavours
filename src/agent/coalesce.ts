@@ -49,3 +49,23 @@ export function silentNudgeText(how: string): string {
     `Instead say what you can do, give your proposal, or ask your one question. Never claim work that hasn't begun. Don't call any other tool this turn.`
   );
 }
+
+const REQUEST_VERBS = "get|grab|chop|mine|make|craft|build|bring|give|collect|fetch|go|come|follow|put|place|kill|attack|stop|wait|find|dig|smelt|cook|also|please|help|do|stay|hold|drop|take";
+
+/**
+ * A routed chat that is a question about progress / state ("how's it going?", "what are you doing",
+ * "are you almost done?"), as opposed to a request phrased as a question ("can you also grab coal?").
+ * `message` is the formatted user message (`[public chat] <Alex> steve, how's it going?\n(note)`).
+ * Used to answer mid-task with a quick side reply instead of waiting for the blocking tool to return.
+ */
+export function isStatusQuestion(message: string): boolean {
+  const first = (message.split("\n")[0] ?? "").trim();
+  const text = first.replace(/^\[[^\]]*\]\s*(<[^>]*>\s*)?/, "").trim().toLowerCase();
+  if (text.length === 0) return false;
+  // "steve, can you also grab coal?" → request
+  const body = text.replace(/^[\w]+[,:]\s*/, "").trim();
+  if (new RegExp(`^(can|could|would|will)\\s+(you|u)\\s+(${REQUEST_VERBS})\\b`).test(body)) return false;
+  if (new RegExp(`^(do|could|can)\\s+you\\s+mind\\b`).test(body)) return false;
+  if (body.includes("?")) return true;
+  return /^(how|what|where|when|are|is|can)\b/.test(body);
+}

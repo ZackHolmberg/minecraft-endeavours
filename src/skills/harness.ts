@@ -108,7 +108,7 @@ export async function runSkill<P, R extends SkillResult>(
   // is still in flight. It must not overwrite / clear that skill's entry:
   // the per-task backend's waitForToolIdle and the reflexes key off it.
   const trackTool = !readOnly && !(name === "stop" && state?.currentTool.current());
-  const toolToken = trackTool ? state?.currentTool.begin(name) : undefined;
+  const toolToken = trackTool ? state?.currentTool.begin(name, safeArgs(params)) : undefined;
 
   let result: SkillResult;
   let watchdog: NodeJS.Timeout | null = null;
@@ -231,4 +231,12 @@ function maybeNoteQuestion(bot: Bot, name: string, params: unknown, result: Skil
 
   noteBotQuestionedPlayer(bot.username, target);
   console.log(`[${bot.username}] continuity armed for ${target} (30s)`);
+}
+
+function safeArgs(params: unknown): string | undefined {
+  try {
+    return params === undefined ? undefined : summarizeArgs(params);
+  } catch {
+    return undefined;
+  }
 }

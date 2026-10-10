@@ -22,6 +22,7 @@ import {
 import { jobContextLines } from "../jobs/describe.js";
 import { getJobRunner } from "../jobs/registry.js";
 import { getBotState } from "../state/index.js";
+import { findNearbyContainers } from "../skills/containers.js";
 import { observeSurroundings, type ObserveSurroundingsState } from "../skills/perception.js";
 
 const MAX_BLOCKS = 8;
@@ -46,12 +47,18 @@ export async function buildPlanningContext(bot: Bot): Promise<string> {
  * Per-task context for the standalone Claude bot: world lines, recent deaths,
  * and the recent conversation (which includes the message(s) being answered).
  */
-export async function buildAgentContext(bot: Bot): Promise<string> {
+export async function buildAgentContext(bot: Bot, opts: { midTask?: boolean } = {}): Promise<string> {
   const [world, convo] = await Promise.all([
     worldLines(bot, true),
     readRecentConversation(bot.username),
   ]);
   const L = [AGENT_CONTEXT_HEADER, ...world];
+  const tool = opts.midTask ? getBotState(bot.username)?.currentTool.current() : null;
+  if (tool) {
+    L.push("");
+    L.push("# Right now (a task of yours is still running; the inventory above is live)");
+    L.push(`running: ${tool.name}${tool.detail ? ` ${tool.detail}` : ""} for ${Math.round((Date.now() - tool.since) / 1000)}s — it has not returned yet`);
+  }
   const job = jobContextLines(getJobRunner(bot.username)?.current() ?? null);
   if (job.length > 0) {
     L.push("");
@@ -128,6 +135,11 @@ async function worldLines(bot: Bot, actionHistory = false): Promise<string[]> {
         .map((c) => `${c.type} @${fmt(c.pos)}${storageContents(c)}`)
         .join(", ")}`,
     );
+  }
+  // Chests in plain sight, opened or not (world memory only learns a chest once it was opened).
+  const containers = findNearbyContainers(bot);
+  if (containers.length > 0) {
+    L.push(`nearby containers: ${containers.slice(0, MAX_STORAGE).map((c) => `${c.name} @${fmt(c.pos)} (${c.dist}m)`).join(", ")}`);
   }
   if (s.knownUtilities.length > 0) {
     L.push(

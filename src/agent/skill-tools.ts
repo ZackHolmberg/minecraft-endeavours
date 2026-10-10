@@ -215,3 +215,38 @@ export const ALLOWED_TOOL_NAMES: readonly string[] = allowedToolNamesFor(CLAUDE_
 export function buildSkillsServer(bot: Bot): McpSdkServerConfigWithInstance {
   return buildSkillsServerFor(bot, CLAUDE_SPECS);
 }
+
+/** The only tools a mid-task side reply may run. */
+const SIDE_REPLY_TOOLS: ReadonlySet<string> = new Set(["say", "whisper"]);
+
+/**
+ * Tool server for the mid-task side reply (`ClaudeBackend.runSideReply`). Same names, descriptions
+ * and schemas as the full surface, in the same order — so the tool definitions stay byte-identical
+ * and the cached prompt prefix (tools + system prompt) is reused — but every tool except say /
+ * whisper is a stub that refuses without touching the bot. A side reply therefore can never start,
+ * stop or redirect anything while the real task's skill is running; it can only talk.
+ * `onSaid` fires after a successful say / whisper.
+ */
+export function buildSideReplyServer(bot: Bot, onSaid: () => void): McpSdkServerConfigWithInstance {
+  const specs = CLAUDE_SPECS.map((spec): SkillSpec => {
+    if (SIDE_REPLY_TOOLS.has(spec.name)) {
+      const wrapped = wrapSpec(spec);
+      return {
+        ...wrapped,
+        run: async (b, args) => {
+          const r = await wrapped.run(b, args);
+          if (r.ok) onSaid();
+          return r;
+        },
+      };
+    }
+    return {
+      ...spec,
+      run: async () => ({
+        ok: false,
+        message: "not available right now: you are answering a quick question while another task is still running. Only say / whisper work this turn; answer in one short line and stop.",
+      }),
+    };
+  });
+  return toClaudeMcpServer(MCP_SERVER_NAME, bot, specs);
+}
