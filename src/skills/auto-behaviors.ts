@@ -228,7 +228,7 @@ export function noteHurt(bot: Bot, attacker: Entity | undefined): void {
 }
 
 /** Skills that already handle a threat, eating or sleeping: the defensive swing leaves them alone. */
-const OWN_THREAT_HANDLING = new Set(["attack", "flee", "eat", "sleepIn", "fish", "build"]);
+const OWN_THREAT_HANDLING = new Set(["attack", "flee", "eat", "sleepIn", "fish", "build", "digIn"]);
 
 /** Busy for the defensive swing: a window open, a reflex mid-flight, or a skill that fights / eats / sleeps itself. */
 export function defendBlocked(bot: Bot, state: BotState): boolean {

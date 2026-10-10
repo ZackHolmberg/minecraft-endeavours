@@ -645,9 +645,10 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "surviveNight",
     description:
-      "Survive the night safely (call it at dusk, or when asked to 'survive the night', 'it's getting dark', 'stay safe tonight'). Background job: sleeps in a bed if one is within reach, otherwise builds a minimal 3x3 hut next to the player from dirt / cobblestone / planks, gets inside, closes the door (or plugs the doorway), lights a torch if it has one and waits there until dawn, defending itself if hit. Never just stand around outside at night. useBed:false builds the hut even when a bed is near (use it if sleeping failed). After it starts, reply briefly and end your turn — you get '[job finished]' at dawn or '[job failed]'. Don't call movement/building tools while it runs (that cancels it). Not for creative mode.",
+      "Survive the night safely (call it at dusk, or when asked to 'survive the night', 'it's getting dark', 'stay safe tonight'). Background job: sleeps in a bed if one is within reach, otherwise digs itself a 1x2 pocket into the ground or a hillside in seconds (the quick shelter a player makes at dusk), seals it with the dug dirt and waits inside until dawn, then opens up. If no safe spot exists it builds a minimal 3x3 hut instead (next to the player, door or plugged doorway, torch if it has one). Never just stand around outside at night. useBed:false skips the bed (use it if sleeping failed). shelter:'hut' skips digging in and builds the hut (use it if digging in failed). After it starts, reply briefly and end your turn — you get '[job finished]' at dawn or '[job failed]'. Don't call movement/building tools while it runs (that cancels it). Not for creative mode.",
     schema: {
       useBed: z.boolean().optional().describe("false = build a shelter even if a bed is at hand"),
+      shelter: z.enum(["dig", "hut"]).optional().describe("hut = build the 3x3 hut instead of digging in (default dig)"),
     },
     run: withParams("surviveNight", surviveNight, READ_ONLY),
     surfaces: CLAUDE_ONLY,

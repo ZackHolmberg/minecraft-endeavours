@@ -20,8 +20,11 @@ import { navigate } from "../../skills/navigation.js";
 import { sleepIn } from "../../skills/survival.js";
 import { placeBlock } from "../../skills/world.js";
 import { placeFromInventoryNearby } from "../../skills/place-helper.js";
+import { fightNearbyHostiles } from "../../skills/melee-guard.js";
+import { PILLAR_FILLER_PRIORITY, pickFiller, pillarUpBy, waitForGrounded } from "../../skills/pillar.js";
 import { getBotState } from "../../state/index.js";
 import { inNightWindow, type ShelterGeometry } from "../night.js";
+import { choosePocket, type PocketPlan, type Probe } from "../pocket.js";
 import type { NightDeps, StepRunContext } from "../runner.js";
 import type { StepResult } from "../types.js";
 import { tracked } from "./util.js";
@@ -50,6 +53,8 @@ export function createNightDeps(bot: Bot): NightDeps {
     findBed: () => findBed(bot),
     sleepThrough: (ctx) => sleepThrough(bot, ctx),
     holdInShelter: (geo, ctx) => holdInShelter(bot, geo, ctx),
+    planPocket: () => planPocket(bot),
+    digInThrough: (plan, ctx) => digInThrough(bot, plan, ctx),
   };
 }
 
@@ -238,4 +243,210 @@ async function holdInShelter(bot: Bot, geo: ShelterGeometry, ctx: StepRunContext
     return { ok: true, message: "left the shelter" };
   });
   return okR(`waited out the night in a ${geo.hasDoor ? "door-closed" : "plugged"} shelter${lit ? " with a torch" : ""} and walked out at dawn`);
+}
+
+
+// ── quick shelter: dig in ───────────────────────────────────────────────────
+
+const DIG_TIMEOUT_MS = 25_000;
+const SEAL_TRIES = 4;
+
+const countOf = (bot: Bot, names: readonly string[]): number =>
+  bot.inventory.items().filter((i) => names.includes(i.name)).reduce((n, i) => n + i.count, 0);
+const hasPickaxe = (bot: Bot): boolean => bot.inventory.items().some((i) => /_pickaxe$/.test(i.name));
+
+function probeOf(bot: Bot): Probe {
+  return (x, y, z) => {
+    const b = bot.blockAt(new Vec3(x, y, z));
+    return b ? { name: b.name, solid: b.boundingBox === "block" } : null;
+  };
+}
+
+/** Where to dig a 1x2 pocket near the bot, or null. Cheap world read, no side effects. */
+function planPocket(bot: Bot): PocketPlan | null {
+  if (!bot.entity) return null;
+  const p = bot.entity.position.floored();
+  const plan = choosePocket(probeOf(bot), { x: p.x, y: p.y, z: p.z }, {
+    hasPickaxe: hasPickaxe(bot),
+    filler: countOf(bot, PILLAR_FILLER_PRIORITY),
+  });
+  if (plan) log(bot, `pocket plan: ${plan.summary} (~${plan.cost.toFixed(1)}s, yields ${plan.yields})`);
+  else log(bot, "no safe spot to dig in nearby");
+  return plan;
+}
+
+async function equipForDig(bot: Bot, block: { name: string }): Promise<void> {
+  try {
+    const pf = (bot as Bot & { pathfinder?: { bestHarvestTool?(b: unknown): { type: number } | null } }).pathfinder;
+    const tool = pf?.bestHarvestTool?.(block);
+    if (tool && bot.heldItem?.type !== tool.type) await bot.equip(tool as never, "hand");
+  } catch {
+    // bare hands are fine for dirt
+  }
+}
+
+async function digCell(bot: Bot, c: Cell): Promise<string | null> {
+  const b = bot.blockAt(v(c));
+  if (!b) return `(${c.x}, ${c.y}, ${c.z}) isn't loaded`;
+  if (b.boundingBox !== "block") return null; // already open
+  await waitForGrounded(bot, 1500);
+  await equipForDig(bot, b);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      bot.dig(b),
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(() => {
+          try { bot.stopDigging?.(); } catch { /* best effort */ }
+          rej(new Error(`dig timeout after ${DIG_TIMEOUT_MS}ms`));
+        }, DIG_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    return `couldn't dig ${b.name} at (${c.x}, ${c.y}, ${c.z}): ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return null;
+}
+
+/** Wait (bounded) for the bot to stand in the cell column `c` at height <= c.y + 0.3 (it falls into a dug shaft). */
+async function settleAt(bot: Bot, c: Cell, maxMs = 1500): Promise<void> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    const p = bot.entity.position;
+    if (Math.floor(p.x) === c.x && Math.floor(p.z) === c.z && p.y <= c.y + 0.3 && bot.entity.onGround) return;
+    await sleepMs(60);
+  }
+}
+
+const isOpen = (bot: Bot, c: Cell): boolean => {
+  const b = bot.blockAt(v(c));
+  return !!b && b.boundingBox !== "block" && !/^(water|lava)$/.test(b.name);
+};
+
+/** Shuffle onto the middle of the column so the 0.6-wide body drops cleanly into a 1-wide shaft. */
+async function centreOn(bot: Bot, x: number, z: number): Promise<void> {
+  try {
+    bot.setControlState("sneak", true); // slow and exact; also keeps us from stumbling off
+    for (let i = 0; i < 25; i++) {
+      const p = bot.entity.position;
+      const dx = x + 0.5 - p.x;
+      const dz = z + 0.5 - p.z;
+      if (Math.hypot(dx, dz) < 0.12) break;
+      await bot.lookAt(new Vec3(x + 0.5, p.y + 1.6, z + 0.5), true);
+      bot.setControlState("forward", true);
+      await sleepMs(Math.hypot(dx, dz) > 0.5 ? 120 : 45);
+      bot.setControlState("forward", false);
+      await sleepMs(70);
+    }
+  } finally {
+    bot.setControlState("forward", false);
+    bot.setControlState("sneak", false);
+  }
+}
+
+/** Dig from inside out and seal. Returns an error text, or null when sealed in. */
+async function digAndSeal(bot: Bot, plan: PocketPlan, ctx: StepRunContext): Promise<string | null> {
+  const s = plan.stand;
+  const flat = Math.hypot(bot.entity.position.x - (s.x + 0.5), bot.entity.position.z - (s.z + 0.5));
+  if (flat > 0.8 || Math.abs(bot.entity.position.y - s.y) > 1.2) {
+    if (!(await goTo(bot, s, "to the dig-in spot"))) return "couldn't reach the spot to dig in";
+  }
+  const hill = plan.kind === "hill";
+  if (!hill) await centreOn(bot, s.x, s.z);
+  for (let i = 0; i < plan.dig.length; i++) {
+    if (stopped(bot, ctx)) return "cancelled";
+    if (!alive(bot)) return "died";
+    const c = plan.dig[i]!;
+    await fightNearbyHostiles(bot, () => stopped(bot, ctx));
+    const err = await digCell(bot, c);
+    if (err) return err;
+    if (hill) {
+      // after a cell pair is open, step into it (the next pair is dug from inside)
+      if (i === 1 || i === 3) {
+        const feet = plan.dig[i - 1]!;
+        if (!(await goTo(bot, feet, "into the tunnel"))) return "couldn't step into the tunnel";
+      }
+    } else {
+      await settleAt(bot, c);
+    }
+  }
+  // we should now stand in the resting cell with the head free
+  const r = plan.rest;
+  await settleAt(bot, r, 1200);
+  const at = bot.entity.position;
+  if (Math.floor(at.x) !== r.x || Math.floor(at.z) !== r.z || Math.floor(at.y + 0.01) !== r.y) {
+    return `not where expected after digging (at ${at.x.toFixed(1)}, ${at.y.toFixed(1)}, ${at.z.toFixed(1)}, wanted ${r.x}, ${r.y}, ${r.z})`;
+  }
+  // drops land in the cell we fell into / walked through: give the pick-up a moment
+  const t0 = Date.now();
+  while (!pickFiller(bot) && Date.now() - t0 < 2000) await sleepMs(100);
+  for (const c of plan.seal) {
+    let done = false;
+    for (let attempt = 0; attempt < SEAL_TRIES && !done; attempt++) {
+      if (stopped(bot, ctx)) return "cancelled";
+      await fightNearbyHostiles(bot, () => stopped(bot, ctx));
+      const filler = pickFiller(bot);
+      if (!filler) return "nothing to seal the pocket with (the dug blocks left no dirt / cobblestone)";
+      const res = await placeBlock(bot, { type: filler.name, position: { x: c.x, y: c.y, z: c.z } });
+      await sleepMs(res.ok ? 150 : 350);
+      done = !isOpen(bot, c);
+    }
+    if (!done) return `couldn't seal the pocket at (${c.x}, ${c.y}, ${c.z})`;
+  }
+  const head = { x: r.x, y: r.y + 1, z: r.z };
+  if (!isOpen(bot, head)) return "no room for my head in the pocket";
+  return null;
+}
+
+/** Dawn: open the seal and get back to the surface. Best effort, bounded. */
+async function climbOut(bot: Bot, plan: PocketPlan): Promise<void> {
+  const t0 = Date.now();
+  const left = (): boolean => Date.now() - t0 < EXIT_BUDGET_MS;
+  try {
+    // top-most seal block first
+    for (const c of [...plan.seal].reverse()) {
+      const b = bot.blockAt(v(c));
+      if (b && b.boundingBox === "block" && left()) {
+        await equipForDig(bot, b);
+        await bot.dig(b).catch(() => undefined);
+        await sleepMs(250);
+      }
+    }
+    if (plan.kind === "down") {
+      const rise = plan.stand.y - Math.floor(bot.entity.position.y);
+      if (rise > 0 && left()) await pillarUpBy(bot, rise, "escape"); // refills the pocket with the dirt we dug
+    }
+    if (left() && bot.entity.position.distanceTo(v(plan.stand).offset(0.5, 0, 0.5)) > 1.2) await goTo(bot, plan.stand, "out of the pocket");
+  } catch {
+    // best effort: the night is over either way
+  }
+}
+
+async function digInThrough(bot: Bot, plan: PocketPlan, ctx: StepRunContext): Promise<StepResult> {
+  let err: string | null = "not started";
+  await tracked(bot, "digIn", { kind: plan.kind, at: plan.rest }, async () => {
+    err = await digAndSeal(bot, plan, ctx);
+    return { ok: !err, message: err ?? "sealed in" };
+  });
+  if (stopped(bot, ctx)) return failR("cancelled", "cancelled");
+  if (!alive(bot)) return failR("died", "died while digging in");
+  if (err) {
+    // half-dug and unsealed: get out rather than wait in an open hole
+    await tracked(bot, "digIn", { escape: true }, async () => {
+      await climbOut(bot, plan);
+      return { ok: true, message: "left the half-dug pocket" };
+    });
+    return failR("unreachable", `couldn't dig in: ${err}. Try surviveNight with shelter:"hut"`);
+  }
+  log(bot, `sealed in the ${plan.kind === "down" ? "ground" : "hillside"} pocket at (${plan.rest.x}, ${plan.rest.y}, ${plan.rest.z}); waiting for dawn`);
+  const res = await waitForDawn(bot, ctx);
+  if (res === "cancelled") return failR("cancelled", "cancelled");
+  if (res === "dead") return failR("died", "died in the pocket");
+  await tracked(bot, "digIn", { leave: true }, async () => {
+    await climbOut(bot, plan);
+    return { ok: true, message: "opened the pocket" };
+  });
+  return okR(`dug into the ${plan.kind === "down" ? "ground" : "hillside"}, sealed in, waited out the night and opened up at dawn`);
 }

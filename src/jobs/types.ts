@@ -9,6 +9,7 @@
 import type { Facing, BlueprintKind } from "../build/types.js";
 import type { FailureKind, Goal, Plan, Step, StepFailure, Vec3 } from "../planner/types.js";
 import type { Exhausted } from "./exhausted.js";
+import type { PocketPlan } from "./pocket.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
 
@@ -43,7 +44,9 @@ export interface BuildState extends BuildSpec {
   /** True when this job continues an earlier failed/cancelled build at its stored origin (no re-siting). */
   resumed?: boolean;
   /** hold === "night": sleep in a bed that was at hand instead of building a shelter. */
-  holdMode?: "sleep" | "shelter";
+  holdMode?: "sleep" | "shelter" | "pocket";
+  /** holdMode === "pocket": the dig-in plan (where to dig, where to rest, what to seal). */
+  pocket?: PocketPlan;
   /** How the night went (set when the hold phase ends), for the job event. */
   holdDetail?: string;
 }
