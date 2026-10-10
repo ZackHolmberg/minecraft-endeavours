@@ -11,13 +11,13 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## In flight (2026-10-09 ~21:00)
-- Regression agent in `../mcv2-dev` (branch `v2-fixes`, uncommitted WIP) → R1 natural-terrain path digging + thinkTimeout + unreachable-species avoidance, R2 filler reservations, R3 door assist, R4 tree detection for logs → `v2/reports/regressions-1.md`. `v2-fixes` already merged into `v2` up to `a8e9dab`; merge again when R1–R4 land.
-- Frozen v1 bot checkout: `../minecraft-endeavours-v1base` (detached `c1587b0`). Don't edit it.
-If a session died mid-flight: `git -C ../mcv2-dev status`, typecheck there, read the report; whatever exists is the progress.
+## In flight (2026-10-09 ~21:30)
+- R1–R4 committed `7125375` on `v2-fixes`, merged into `v2` (`3480223`). Frozen bench checkout `../mcv2-bench` @ `3480223` (docker disabled there).
+- Background: v1 re-run of the 4 confirm-policy scenarios → `v2/runs/v1-baseline` (appends); then targeted v2 re-test → `v2/runs/v2-r1` (8 scenarios).
+- Dev worktree `../mcv2-dev` (branch `v2-fixes`) idle; frozen v1 bot `../minecraft-endeavours-v1base`.
 
 ## Next steps
-1. R1–R4 land → commit on `v2-fixes` → merge into `v2` → frozen bench checkout (D11) → targeted live re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
+1. Read `v2/runs/v2-r1` results (targeted re-test (`t1.chop_logs,t2.wooden_pickaxe,t2.stone_pickaxe,t2.door_house,t2.door_exit,t2.coal,pl.no_grief,int.not_stop`) → fix → full core run `v2-s2c`.
 2. Re-run v1 on `t3.build_house,cr.build_house,t3.wheat_farm,t3.portal` with the D13 confirm policy (fair baseline).
 3. Milestone check-in with the owner once v2 clearly beats v1.
 4. Next slices: builder (blueprints + scaffolding: houses, portal), farming, night survival/combat, creative give/deliver (`cr.give_torches`: fetched but never handed over), pathfinder master pin, prompt/tool-surface trim.
