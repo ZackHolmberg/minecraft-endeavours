@@ -200,3 +200,30 @@ const NATURAL_TERRAIN_PATTERNS: readonly RegExp[] = [/_ore$/, /_leaves$/];
 export function isNaturalTerrain(name: string): boolean {
   return NATURAL_TERRAIN_EXACT.has(name) || NATURAL_TERRAIN_PATTERNS.some((re) => re.test(name));
 }
+
+/**
+ * Blocks that fall when the block under them is removed. Breaking a block with one of
+ * these directly above it drops it into the hole, onto whoever stands in that column
+ * (v2 R6: gravel/sand over a dug cell). Used by the pathfinder (`gravityBlocks`,
+ * `dontMineUnderFallingBlock`) and by the explicit-dig guard in `mineOneBlock`.
+ */
+const FALLING_RE = /^(sand|red_sand|gravel|suspicious_sand|suspicious_gravel|dragon_egg|anvil|chipped_anvil|damaged_anvil)$|_concrete_powder$/;
+
+export function isFallingBlockName(name: string): boolean {
+  return FALLING_RE.test(name);
+}
+
+/**
+ * Would breaking `target` drop a falling block onto `standing`? True when the block directly
+ * above `target` falls AND the bot stands in `target`'s column (below the dug cell). A bot
+ * beside the column is safe: the block just refills the hole. Pure over `nameAt`.
+ */
+export function fallsOnBot(
+  nameAt: (p: Vec3) => { name: string } | null,
+  target: Vec3,
+  standing: { x: number; y: number; z: number },
+): boolean {
+  const above = nameAt(target.offset(0, 1, 0));
+  if (!above || !isFallingBlockName(above.name)) return false;
+  return Math.floor(standing.x) === target.x && Math.floor(standing.z) === target.z && standing.y < target.y + 1;
+}

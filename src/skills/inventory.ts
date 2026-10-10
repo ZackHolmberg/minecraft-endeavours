@@ -10,6 +10,8 @@ import { isCreative } from "./game-mode.js";
 import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
 import { navigate } from "./navigation.js";
+import { builtStructureReason } from "./structure-guard.js";
+import { isLeafName, isTreeLogName } from "./tree-felling.js";
 import type { SkillResult } from "./types.js";
 
 const PICKUP_DEFAULT_RADIUS = 8;
@@ -166,6 +168,9 @@ export async function pickUpNearby(
     }
     if (cancellation?.isRequested()) break;
   }
+  // Items still lying around after two sweeps are usually perched where we can't stand:
+  // on a stump/trunk top or on leaves. Break the natural block they rest on.
+  if (!cancellation?.isRequested()) await freeStuckDrops(bot, maxDist);
 
   const gained = inventoryGain(before, inventoryCounts(bot));
   const collected = Object.values(gained).reduce((a, b) => a + b, 0);
@@ -182,6 +187,60 @@ export async function pickUpNearby(
     message: `picked up ${gainedText} from the ground within ${maxDist} blocks`,
     state: { walked: targets.length, collected, gained },
   };
+}
+
+const STUCK_MAX_PER_CALL = 4;
+const STUCK_DIG_TIMEOUT_MS = 8_000;
+const STUCK_SETTLE_MS = 700;
+
+/**
+ * For each dropped item still present: if it rests on leaves or on a natural
+ * tree log (a stump top, a trunk, low canopy), walk within reach, break that
+ * block (natural, so fair game), let the item fall and collect it. Bounded to
+ * {@link STUCK_MAX_PER_CALL} items per call; every failure is swallowed.
+ */
+async function freeStuckDrops(bot: Bot, maxDist: number): Promise<void> {
+  const cancellation = getBotState(bot.username)?.cancellation;
+  let freed = 0;
+  for (const t of collectDroppedItemPositions(bot, maxDist)) {
+    if (freed >= STUCK_MAX_PER_CALL || cancellation?.isRequested()) return;
+    const e = bot.entities[t.entityId];
+    if (!e || e.name !== "item") continue;
+    const support = bot.blockAt(new Vec3(Math.floor(e.position.x), Math.floor(e.position.y - 0.3), Math.floor(e.position.z)));
+    if (!support || !(isLeafName(support.name) || (isTreeLogName(support.name) && builtStructureReason(bot, support) === null))) continue;
+    freed += 1;
+    try {
+      await goTo(bot, { target: { kind: "coords", coords: { x: support.position.x, y: support.position.y, z: support.position.z } }, reach: 3 });
+      const fresh = bot.blockAt(support.position);
+      if (!fresh || fresh.name !== support.name || !bot.canDigBlock(fresh)) continue;
+      const pf = (bot as Bot & { pathfinder?: { bestHarvestTool?(b: unknown): Item | null } }).pathfinder;
+      const tool = pf?.bestHarvestTool?.(fresh);
+      if (tool && bot.heldItem?.type !== tool.type) await bot.equip(tool, "hand").catch(() => {});
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          bot.dig(fresh),
+          new Promise<never>((_, rej) => {
+            timer = setTimeout(() => {
+              try { bot.stopDigging?.(); } catch { /* best-effort */ }
+              rej(new Error("dig timeout"));
+            }, STUCK_DIG_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      console.log(`[${bot.username}] [pickup] broke ${support.name} at (${support.position.x}, ${support.position.y}, ${support.position.z}) to free a ${t.itemName}`);
+      await sleep(STUCK_SETTLE_MS);
+      const again = bot.entities[t.entityId];
+      if (again && again.name === "item") {
+        await goTo(bot, { target: { kind: "coords", coords: { x: again.position.x, y: again.position.y, z: again.position.z } }, reach: 1 });
+        await sleep(POST_GOTO_PICKUP_WAIT_MS + PICKUP_PER_ITEM_WAIT_MS);
+      }
+    } catch (err) {
+      console.log(`[${bot.username}] [pickup] could not free ${t.itemName}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 }
 
 interface DropTarget {

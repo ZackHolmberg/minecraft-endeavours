@@ -36,7 +36,7 @@ import type { Bot } from "mineflayer";
 import pathfinderPkg, { type Pathfinder } from "mineflayer-pathfinder";
 import type { Block } from "prismarine-block";
 import { installDoorAssist, patchMovementsForDoors } from "./doors.js";
-import { builtStructureReason, isCheapBreak, isNaturalTerrain } from "./structure-guard.js";
+import { builtStructureReason, isCheapBreak, isFallingBlockName, isNaturalTerrain } from "./structure-guard.js";
 import { isCreative } from "./game-mode.js";
 
 const { Movements } = pathfinderPkg;
@@ -45,6 +45,8 @@ const { Movements } = pathfinderPkg;
 export const BASE_DIG_COST = 4;
 /** The scoped digging variant (retry toward a buried/blocked natural target). */
 export const SCOPED_DIG_COST = 1;
+/** Extra cost per swim step (see buildMovements). */
+export const LIQUID_COST = 8;
 const SURVIVAL_MAX_DROP = 3;
 /** No fall damage in creative; players hop off ledges freely. */
 const CREATIVE_MAX_DROP = 8;
@@ -225,6 +227,19 @@ function buildMovements(bot: BotWithPathfinder, digging = false): MovementsT {
   // Default 1 makes a swim as cheap as a walk, so the planner happily routes
   // across lakes and through flooded caves (slow, drowning risk, and the
   // bot bobs along looking lost). 3 still swims when it's the only way.
-  (m as unknown as { liquidCost: number }).liquidCost = 3; // not in the .d.ts
+  // v2 R6: raised from 3 to 8. At 3 a swim costs 4/block, cheaper than digging through rock (~7), so the
+  // planner swam a flooded tunnel under a sealed roof and the bot drowned. At 9/block a 5-block swim
+  // already costs 45 and digging or walking around wins; a real crossing is still possible when it is the
+  // only way. The breath reflex (auto-behaviors.ts) is the safety net, this just avoids planning them.
+  (m as unknown as { liquidCost: number }).liquidCost = LIQUID_COST; // not in the .d.ts
+  // Free motion (straight-line moves through open water/air, skipping A* node-to-node) lets a path cut
+  // across a flooded cave, so keep it off (it is also the default).
+  (m as unknown as { allowFreeMotion: boolean }).allowFreeMotion = false;
+  // pathfinder 2.4.5 supports this (default true; made explicit so a lib change can't silently drop it):
+  // safeToBreak() refuses a block whose upper neighbour is a gravityBlocks member or has an entity on it.
+  (m as unknown as { dontMineUnderFallingBlock: boolean }).dontMineUnderFallingBlock = true;
+  // ...but the lib's gravity list is only sand + gravel; add the other blocks that fall.
+  const gravity = (m as unknown as { gravityBlocks: Set<number> }).gravityBlocks;
+  for (const b of bot.registry.blocksArray) if (isFallingBlockName(b.name)) gravity.add(b.id);
   return m;
 }

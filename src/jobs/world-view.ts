@@ -10,6 +10,7 @@ import { readWorldKnowledge } from "../memory/world-knowledge.js";
 import { plan as planGoals } from "../planner/plan.js";
 import type { Goal, WorldView } from "../planner/types.js";
 import { currentGameMode } from "../skills/game-mode.js";
+import { isTreeLogName, speciesViewScore } from "../skills/tree-felling.js";
 
 export const DEFAULT_SCAN_RADIUS = 48;
 const STATION_RADIUS = 32;
@@ -27,6 +28,10 @@ const BASE_SCAN_RADIUS = 48;
 const WIDE_SCAN_RADII = [96, 160] as const;
 const WIDE_PER_TYPE_COUNT = 2;
 const YIELD_EVERY = 3;
+/** Logs are scanned wider: a tall tree's canopy would fill the nearest-N and hide a short tree behind it. */
+const LOG_PER_TYPE_COUNT = 64;
+/** A species with logs in view but none fellable from the ground stays a last resort (not "absent"). */
+const UNFELLABLE_SPECIES_PENALTY = 60;
 
 /** Always-scanned resource families (matched against registry block names). */
 const BASE_RESOURCE = [
@@ -98,10 +103,20 @@ export async function buildWorldView(bot: Bot, goals: Goal[], radius: number = D
     const id = bot.registry.blocksByName[name]?.id;
     if (id === undefined) return;
     if (scans++ % YIELD_EVERY === YIELD_EVERY - 1) await new Promise<void>((res) => setImmediate(res));
-    const found = bot.findBlocks({ point: pos, matching: id, maxDistance: r, count });
+    const isLog = isTreeLogName(name);
+    const found = bot.findBlocks({ point: pos, matching: id, maxDistance: r, count: isLog ? Math.max(count, LOG_PER_TYPE_COUNT) : count });
     if (found.length === 0) return;
     let nearest = Infinity;
     for (const p of found) nearest = Math.min(nearest, p.distanceTo(pos));
+    if (isLog) {
+      // Felling-aware: `nearest` becomes distance + tree penalty of the best tree choppable from the ground
+      // (short trees first), so the planner prefers a small oak over a jungle giant. See skills/tree-felling.ts.
+      const v = speciesViewScore((p) => bot.blockAt(p), found, pos);
+      nearbyBlocks[name] = v
+        ? { count: v.count, nearest: Math.round(v.score * 10) / 10 }
+        : { count: found.length, nearest: Math.round((nearest + UNFELLABLE_SPECIES_PENALTY) * 10) / 10 };
+      return;
+    }
     nearbyBlocks[name] = { count: found.length, nearest: Math.round(nearest * 10) / 10 };
   };
   const baseR = Math.min(radius, BASE_SCAN_RADIUS);

@@ -24,6 +24,7 @@ import { Vec3 } from "vec3";
 import { recordEvent } from "../observability/telemetry.js";
 import type { Vec } from "../observability/telemetry-types.js";
 import { getBotState } from "../state/index.js";
+import { surfaceInterrupted } from "./auto-behaviors.js";
 import { diggingDepth, ensureMovements, withDiggingMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import { pickFiller, pillarUpBy } from "./pillar.js";
 import type { SkillResult } from "./types.js";
@@ -38,6 +39,8 @@ const BASE_TIMEOUT_MS = 20_000;
 const TIMEOUT_PER_BLOCK_MS = 1_000;
 const MAX_TIMEOUT_MS = 5 * 60_000;
 export const MAX_THINK_TIMEOUT_MS = 10_000;
+/** How many times one navigate re-issues its goal after the surfacing reflex took over. */
+const MAX_SURFACE_RESUMES = 3;
 
 export interface NavigateOptions {
   /** Human/LLM-readable target name for messages, e.g. "oak_log at (1, 64, 2)". */
@@ -257,7 +260,20 @@ async function navigateInner(
   const prevThink = pfTimeouts.thinkTimeout;
   if (opts.thinkTimeoutMs !== undefined) pfTimeouts.thinkTimeout = Math.min(MAX_THINK_TIMEOUT_MS, Math.max(prevThink, opts.thinkTimeoutMs));
   try {
-    await pBot.pathfinder.goto(goal);
+    // The survival reflex (drowning / suffocation) drops our goal to take the controls. When
+    // that is what rejected the goto, wait for it to finish and re-issue the same goal.
+    for (let resumes = 0; ; resumes++) {
+      try {
+        await pBot.pathfinder.goto(goal);
+        break;
+      } catch (err) {
+        if (!abort && resumes < MAX_SURFACE_RESUMES && (await surfaceInterrupted(bot))) {
+          console.log(`[${bot.username}] [nav] resuming ${opts.label} after the surfacing reflex`);
+          continue;
+        }
+        throw err;
+      }
+    }
   } catch (err) {
     if (!abort) {
       const message = err instanceof Error ? err.message : String(err);

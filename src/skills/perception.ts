@@ -5,6 +5,7 @@ import { Vec3 } from "vec3";
 import { isUtilityBlockType, readWorldKnowledge } from "../memory/world-knowledge.js";
 import { getBotState } from "../state/index.js";
 import { currentGameMode, type GameMode } from "./game-mode.js";
+import { isTreeLogName, speciesViewScore } from "./tree-felling.js";
 import type { SkillResult } from "./types.js";
 
 const DEFAULT_RADIUS = 16;
@@ -43,6 +44,8 @@ export interface ObserveSurroundingsState {
     type: string;
     count: number;
     nearest: { x: number; y: number; z: number; dist: number };
+    /** Set on tree logs: how choppable this species is from the ground (tall trees only yield their bottom logs). */
+    note?: string;
   }>;
   nearbyEntities: Array<{
     type: "player" | "hostile" | "passive" | "vehicle" | "object" | "other";
@@ -100,32 +103,51 @@ export async function observeSurroundings(
     count: FIND_BLOCK_LIMIT,
   });
 
-  const groups = new Map<string, { count: number; nearest: { pos: { x: number; y: number; z: number }; dist: number } }>();
+  const groups = new Map<string, { count: number; nearest: { pos: { x: number; y: number; z: number }; dist: number }; logs?: Vec3[] }>();
   for (const p of positions) {
     const block = bot.blockAt(p);
     if (!block) continue;
     const dist = me.distanceTo(p);
     const existing = groups.get(block.name);
+    const isLog = isTreeLogName(block.name);
     if (!existing) {
       groups.set(block.name, {
         count: 1,
         nearest: { pos: { x: p.x, y: p.y, z: p.z }, dist },
+        ...(isLog ? { logs: [p] } : {}),
       });
     } else {
       existing.count += 1;
+      existing.logs?.push(p);
       if (dist < existing.nearest.dist) {
         existing.nearest = { pos: { x: p.x, y: p.y, z: p.z }, dist };
       }
     }
   }
 
+  // Tree logs sort by felling score (distance + penalty for tall trees) so a small oak lists ahead
+  // of a jungle giant at similar range; the reported distance stays the real one.
+  const sortKey = new Map<string, number>();
   const nearbyBlocks = [...groups.entries()]
-    .map(([type, g]) => ({
-      type,
-      count: g.count,
-      nearest: { x: g.nearest.pos.x, y: g.nearest.pos.y, z: g.nearest.pos.z, dist: round2(g.nearest.dist) },
-    }))
-    .sort((a, b) => a.nearest.dist - b.nearest.dist)
+    .map(([type, g]) => {
+      let note: string | undefined;
+      sortKey.set(type, g.nearest.dist);
+      if (g.logs) {
+        const v = speciesViewScore((q) => bot.blockAt(q), g.logs, me);
+        if (!v) note = "too tall to chop from the ground (logs out of reach); pick another tree";
+        else {
+          sortKey.set(type, v.score);
+          if (v.score - g.nearest.dist > 6) note = "tall tree: only its lowest logs are choppable; a shorter tree is faster";
+        }
+      }
+      return {
+        type,
+        count: g.count,
+        nearest: { x: g.nearest.pos.x, y: g.nearest.pos.y, z: g.nearest.pos.z, dist: round2(g.nearest.dist) },
+        ...(note ? { note } : {}),
+      };
+    })
+    .sort((a, b) => (sortKey.get(a.type) ?? a.nearest.dist) - (sortKey.get(b.type) ?? b.nearest.dist))
     .slice(0, MAX_BLOCK_GROUPS);
 
   const nearbyEntities = collectEntities(bot, radius);

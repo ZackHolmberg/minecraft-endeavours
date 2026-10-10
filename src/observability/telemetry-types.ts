@@ -25,6 +25,9 @@ export interface TelemetryBase {
 
 export type TaskOutcome = "finished" | "stopped" | "max_turns" | "failed" | "rate_limited";
 
+/** Reflex names. `surface` = drowning/suffocation escape (skills/survival-reflex.ts). */
+export type ReflexName = "look" | "eat" | "armor" | "defend" | "surface";
+
 export type TelemetryEvent =
   // ── Agent / task lifecycle ────────────────────────────────────────────
   | (TelemetryBase & {
@@ -117,10 +120,10 @@ export type TelemetryEvent =
   // ── Reflexes / survival ───────────────────────────────────────────────
   | (TelemetryBase & {
       kind: "reflex";
-      reflex: "look" | "eat" | "armor" | "defend";
+      reflex: ReflexName;
       detail: string;
     })
-  | (TelemetryBase & { kind: "hurt"; health: number; by: string | null })
+  | (TelemetryBase & { kind: "hurt"; health: number; by: string | null; cause?: string })
   | (TelemetryBase & { kind: "death"; pos: Vec; cause: string })
   // ── Chat / routing ────────────────────────────────────────────────────
   | (TelemetryBase & {
@@ -239,7 +242,7 @@ export interface TelemetryAggregate {
   doors: { opened: number; closed: number };
   pillar: { runs: number; ok: number; placed: number };
   structureSkips: number;
-  reflexes: Record<"look" | "eat" | "armor" | "defend", number>;
+  reflexes: Record<ReflexName, number>;
   deaths: number;
   chat: { inbound: number; routed: number; outbound: number; stops: number };
   health: { disconnects: number; maxLoopLagMs: number | null; rateLimitEvents: number };

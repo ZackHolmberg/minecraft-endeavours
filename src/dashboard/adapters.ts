@@ -200,7 +200,7 @@ export function describeEvent(e: TelemetryEvent): NotableView | null {
       case "death":
         return n("red", `DEATH ${e.cause} @ ${fmtVec(e.pos)}`);
       case "hurt":
-        return e.health <= 6 ? n("red", `low health ${e.health}/20${e.by ? ` (by ${e.by})` : ""}`) : n("gray", `hurt → ${e.health}/20${e.by ? ` by ${e.by}` : ""}`);
+        return e.health <= 6 ? n("red", `low health ${e.health}/20${e.by ? ` (by ${e.by})` : e.cause ? ` (${e.cause})` : ""}`) : n("gray", `hurt → ${e.health}/20${e.by ? ` by ${e.by}` : e.cause ? ` (${e.cause})` : ""}`);
       case "chat_in":
         return e.isStop ? n("yellow", `stop from ${e.player}`) : null;
       case "chat_out":
