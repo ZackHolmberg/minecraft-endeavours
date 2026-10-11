@@ -17,7 +17,7 @@
 - Live findings, all fixed: stuck after a job (claimed "placed", stopped; un-named follow-ups dropped) → `46d6ba9`; missed message while following → follow job `e12f41b`.
 
 ## In flight (2026-10-10 night) — promotion work (D17)
-- Reviewer (read-only) → `v2/reports/promotion-review.md` (2c-A, 2c-B, quick shelter, live fixes, follow job + panel security verdict).
+- Promotion review done: panel PASS; H1 settingSources (D18), M1–M4. Fix agent in `../mcv2-dev` (src only; docs agent shares the worktree, docs only) → "## Fixes" in `v2/reports/promotion-review.md`.
 - Fix agent in `../mcv2-build` (v2-build): build placement retry + remembered chests → `v2/reports/s4-fixes.md`.
 - Docs agent in `../mcv2-dev` (v2-fixes, docs only): ARCHITECTURE/SKILLS/ROADMAP/README (+ JOBS.md?) and `v2/CLAUDE.md.next` → `v2/reports/docs-update.md`.
 - Then: merge all, review fixes, final full core run, cutover.
@@ -54,5 +54,6 @@
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
+- Don't start the v1 bot on `main` before cutover (D18 exposure), or approve adding `settingSources: []` to `main` too.
 - Push local `main` (security fix `bd32483`)? (Not requested yet.)
 - At cutover: confirm the panel UI rebuild + launchd restart (internet-facing) — plan in D17.
