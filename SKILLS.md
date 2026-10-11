@@ -1,6 +1,6 @@
 # Skills
 
-Reference for the v0.2 skill layer. Every skill is a plain async function:
+Reference for the v2 skill layer (41 registered tools; `src/skills/registry.ts` is the source of truth for schemas and the descriptions Haiku sees). Every skill is a plain async function:
 
 ```ts
 (bot: Bot, params: P) => Promise<SkillResult>
@@ -17,24 +17,23 @@ and returns the same shape regardless of success:
 - flips the conversation-continuity flag when `say` / `whisper` produces a `?`-terminated message,
 - tracks the in-flight skill name on `BotState.currentTool` (in a `try / finally`, so it always clears) — the v0.3 dashboard reads this for its live `DOING` field.
 
-For higher-level design (catalogue, principles, push-work-down-the-stack), see [ARCHITECTURE.md](ARCHITECTURE.md).
+For higher-level design see [ARCHITECTURE.md](ARCHITECTURE.md); the planner, job kinds, blueprints, recovery ladder and follow/night jobs are in [JOBS.md](JOBS.md). Haiku mostly calls the job tools (`achieve`, `build`, `followPlayer`, `surviveNight`); the primitives below remain for one-offs and are what the job step executors call.
 
 ## Status
 
-| Skill | Status |
-|---|---|
-| `say`, `whisper`, `observeSurroundings`, `goTo`, `mineBlock` | ✅ Implemented in slice 2 |
-| `remember`, `setTaskQueue`, `advanceTaskQueue` | ✅ Implemented in slice 3 (phase 2) |
-| `stop`, `followPlayer`, `placeBlock`, `pickUpNearby`, `dropItem`, `giveItemTo` | ✅ Implemented in v0.3+ priority batch |
-| `craft`, `attack`, `flee`, `depositToChest`, `withdrawFromChest` | ✅ Implemented in v0.3+ follow-on batch |
-| `checkInventory`, `equipItem`, `activateBlock`, `useOnEntity`, `smelt` | ✅ Implemented in v0.3+ tool-use slice |
-| `useItem`, `eat`, `fish`, `sleepIn` | ✅ Implemented in v0.3+ survival slice |
-| `mineBlocks`, `giveItemsTo`, `equipLoadout`, `craftMany`, `depositManyToChest`, `withdrawManyFromChest` | ✅ Implemented in v0.4 batch-variant slice (see [Batch variants](#batch-variants)) |
-| `pillarUp` | ✅ Implemented in v0.5 player-likeness pass |
-| `getItems` | ✅ Implemented in creative-mode pass (creative only) |
-| `findBlock`, `findEntity`, `lookAt`, `wait` | ⏳ Pending |
+All 41 registered tools are shipped. Pending (low value, see [ROADMAP.md](ROADMAP.md)): `findBlock`, `findEntity`, `lookAt`, `wait`.
 
-The slice-2 `!cmd` chat-trigger harness was removed in slice 3 (phase 5) — skills are now exercised through the Claude agent loop. See ["Exercising skills"](#exercising-skills) at the bottom of this file.
+| Group | Tools | Notes |
+|---|---|---|
+| **Jobs (v2)** | `achieve`, `build`, `surviveNight`, `cancelJob`, `followPlayer` | Start/stop background jobs and return at once. See [Job tools](#job-tools-v2). |
+| Perception / chat | `observeSurroundings`, `checkInventory`, `say`, `whisper` | |
+| Movement | `goTo`, `stop`, `pillarUp` | `goTo`: natural-terrain-only pathing, no placing. |
+| World | `mineBlock`, `mineBlocks`, `placeBlock`, `placeBlocks` | v2: counts what lands in the inventory. |
+| Inventory | `pickUpNearby`, `equipItem`, `equipLoadout`, `dropItem`, `giveItemTo`, `giveItemsTo`, `getItems` | `getItems` creative only; operator-item denylist. |
+| Interaction / crafting / combat | `activateBlock`, `useOnEntity`, `useItem`, `craft`, `craftMany`, `smelt`, `attack`, `flee` | Crafting clicks are paced (120 ms). |
+| Storage / survival / meta | `depositToChest`, `depositManyToChest`, `withdrawFromChest`, `withdrawManyFromChest`, `eat`, `fish`, `sleepIn`, `remember`, `setTaskQueue`, `advanceTaskQueue` | |
+
+Skills are exercised through the Claude agent loop (see ["Exercising skills"](#exercising-skills)) and the eval harness (`npm run eval`).
 
 ## Reference
 
@@ -114,11 +113,11 @@ type GoToTarget =
   | { kind: "block"; block: string };    // block ID, finds nearest within 64
 ```
 
-Pre-checks reachability with `pathfinder.getPathTo()`. If the path computation reports `status === "noPath"`, fails fast without committing to a doomed walk — this is the architectural "doomed action" pre-check from the push-work-down-the-stack table.
+Pre-checks reachability with `pathfinder.getPathTo()` and fails fast on `noPath`.
 
 All movement (every skill, not just `goTo`) goes through `navigate()` in `src/skills/navigation.ts`. It verifies real arrival (`goal.isEnd`), detects being stuck (<1.5 blocks moved in 12s), applies a hard timeout (20s + 1s/block, capped at 5min), and honors the stop flag. Failures include `state.position` and a re-plan hint ("look for its door…").
 
-**Pathfinder policy** (`pathfinder-config.ts`): never digs (`canDig=false`), never 1×1 towers, `maxDropDown=3`, `liquidCost=3`. **Doors:** pathfinder 2.4.5's own `canOpenDoors` only covers fence gates and is buggy, so it stays off. Instead `src/skills/doors.ts` makes wooden/copper doors and fence gates walk-through on cardinal moves, and a per-tick watcher opens the one ahead and closes it behind the bot once it's ≥2 blocks past (unless a player is right there). Iron doors and trapdoors are walls.
+**Pathfinder policy** (`pathfinder-config.ts`, shared by every skill; full rationale in ARCHITECTURE.md *Movement policy*): digging is on only for an **allowlist of natural terrain** (never logs, planks, cobblestone, glass, doors, containers, crops, beds; player-built structures are guarded) at `digCost` 4, so walking and doors win; it **never places** blocks (no bridging, stairs or towers: building/climbing is explicit via `placeBlocks`/`pillarUp`); `liquidCost` 8, `maxDropDown` 3 (creative 8). `navigate()` gives each path decision a 10 s think timeout and a swim/suffocation reflex can interrupt and resume it (<=3 times). **Doors:** `doors.ts` repairs door path nodes, opens wooden/copper doors and gates ahead (polling for the state flip) and closes them behind; iron doors/trapdoors are walls.
 
 | Param | Default | Notes |
 |---|---|---|
@@ -131,41 +130,33 @@ All movement (every skill, not just `goTo`) goes through `navigate()` in `src/sk
 
 ---
 
-### `mineBlock` — composite mining (find → path → equip → dig → pickup)
+### `mineBlock` / `mineBlocks` — gather natural blocks (find → path → equip → dig → pickup)
 
 ```ts
-mineBlock(bot, { type: string, count?: number, allowStructures?: boolean }): Promise<SkillResult>
+mineBlock(bot,  { type: string, count?: number /* 1..64, default 1 */, allowStructures?: boolean }): Promise<SkillResult>
+mineBlocks(bot, { types: string[], maxCount?: number /* 1..128, default 32 */, maxDistance?: number /* default 64 */, allowStructures?: boolean }): Promise<SkillResult>
 ```
 
-**Structure guard** (`src/skills/structure-guard.ts`): candidates that look player-built are skipped — doors, gates, trapdoors and glass always; crafted blocks (planks, stairs, bricks, wool…) touching another crafted block; anything touching ≥2 crafted blocks. Trees, ores, and terrain are unaffected. The result says how many were left alone and why. `allowStructures: true` bypasses it — only for explicit demolition requests. Also: cancellable between blocks; a mid-air bot pillars one block (`pillarUpBy(1)`) before digging to avoid the 5× air penalty.
+`mineBlock` is a one-type wrapper over `mineBlocks`. In v2, **`count`/`maxCount` count items that actually land in the inventory** (the blocks' expected drops from minecraft-data `drops`, measured as a delta against the pre-skill baseline), not digs: `stone` -> `cobblestone`, `iron_ore` -> `raw_iron`, logs -> themselves. v1 counted digs and reported "mined 10" with 3 logs in the inventory. Blocks with no tracked drop (creative, leaves) fall back to dig counting. Consequences: multi-yield blocks (lapis, redstone, copper) can overshoot the count; silk-touch or odd drop tables may read as fruitless.
 
-The canonical composite skill. Proves the skill model: one Claude tool call ≈ one meaningful task, ~5–6 mineflayer primitives hidden inside.
+Per iteration: pick the nearest candidate, path to it, equip the best harvest tool, `bot.dig`, wait for the drop entity (up to 600 ms), `pickUpNearby` r=4. A final sweep (r=8) collects dug-but-uncollected drops (and, after felling, leaf litter).
 
-Workflow per iteration:
-1. `bot.findBlock` for the nearest block of `type` within 64 blocks.
-2. Path to it with `GoalLookAtBlock`.
-3. Equip the first inventory item that satisfies `block.canHarvest(item.type)` (rough proxy for tier — picks the last match, replace with `digTime` comparison if it picks badly).
-4. `bot.dig(block)`.
-5. 500ms pause so the natural ~1.5-block server auto-collect can fire.
-
-| Param | Default | Notes |
-|---|---|---|
-| `type` | — | Required. Block ID (e.g. `oak_log`, `stone`). |
-| `count` | `1` | How many to mine. |
-
-**Tool pre-flight:** before any movement, probes one block of the requested type and checks `block.canHarvest(null)` (no tool needed) → any inventory item via `canHarvest`. If neither holds, fails fast with the tool family pulled from `block.material` (e.g. `"no pickaxe in inventory to mine stone"`). No half-walk-then-fail.
+- **Reach rules:** stands on the ground and takes only blocks within arm's reach; **logs** are picked by felling rank (`tree-felling.ts`): a log is a candidate only if no log is directly below it and it is <=4 above the floor, so a tall/jungle tree yields its bottom logs, never the canopy. It never climbs or towers.
+- **Unreachable** candidates are skipped (up to 12), not fatal; a tree whose drops can't be collected is abandoned after a wider sweep and the batch moves to the next tree (<=6). 3 consecutive digs that yield nothing with a **full inventory** stop the call. All-unreachable -> `could not reach any X`.
+- **Tunnelling:** a buried natural target may be approached through natural blocks only; dig is skipped under a falling block (`fallsOnBot`). A dig aborted by the drowning reflex is retried once.
+- **Structure guard** (`structure-guard.ts`): player-built blocks are left alone and reported (doors, gates, trapdoors, glass always; crafted blocks touching crafted blocks; any block touching >=2 crafted blocks; log clusters that aren't trees (`isTreeLog`: huts, beams, stripped logs)). `allowStructures:true` bypasses it, for explicit demolition only.
+- **Tool preflight:** probes one block; no usable tool -> `no <tool> in inventory to mine <block>` (mineBlocks skips such types and lists them in `state.skipped`). Cancellable between blocks.
+- **Exclusion (jobs):** `mineBlocks` also takes an internal `exclude(x,y,z)` predicate and returns `state.unreachablePositions`/`unreachableTypes` for the job runner's exhausted-area memory; not part of the Haiku schema.
+- **Creative:** instant, no tool check/pickup; `cleared N <type> (creative mode: broken blocks drop nothing)`.
+- Prefer `achieve` (`#log`, `cobblestone`, ...) for anything but a single block or ~3 items: it keeps going across trees/veins and leaves Haiku free to chat.
 
 | | |
 |---|---|
-| Success | `mined <N> <type>` |
-| Failures | `unknown block type "<name>"` · `no <type> within 64 blocks` · `no <tool> in inventory to mine <block>` · `mined <i> of <N> <type>; no more within 64 blocks` · `no path to <block> at (x, y, z)` · `dig failed at (x, y, z): <msg>` · `count must be >= 1, got <n>` |
+| Success | `collected 10 oak_log (mined 11)` (the parenthetical only when they differ) · multi-type: `collected 3 raw_iron, 5 coal` · `mined N <type>` (creative-style/untracked) |
+| Partial/soft | `…; some drops could not be picked up` · `…; inventory is full` · `…; no more within <R> blocks` · `…; gave up after N unreachable <type> blocks (<why>)` · `the rest of the logs here are too high to reach from the ground…` · `left N block(s) alone because they look player-built (e.g. <reason> at (x,y,z))…` · `mining cancelled: <summary>` |
+| Failures | `unknown block type "<name>"` · `no <type> within <R> blocks` · `no <tool> in inventory to mine <block>` · `cannot mine any requested type — <reasons>` · `could not reach any <type> (N tried; <last failure>)…` · `no path to <block> at (x, y, z) (out of reach without climbing or breaking player-built blocks)` · `dig failed at (x, y, z) after Nms: <msg>` · `not digging <block>…: a falling block is right above it` · `stopped after N blocks dropped nothing I could pick up` · `stuck retargeting same block at (x, y, z)` · `types must be a non-empty array` · `maxCount must be between 1 and 128, got <n>` |
 
-**Partial progress:** failure results include `state: { mined: <count> }` so the caller knows how far the skill got.
-
-**Known limitations:**
-- Tool selection picks the last `canHarvest` match in inventory rather than computing fastest dig time.
-
-**Drop pickup:** the prior 500ms post-dig wait was unreliable for blocks like sand. Each iteration now invokes `pickUpNearby({ maxDist: 4 })` after the dig, which walks to any dropped items in range so natural ~1.5-block auto-collect fires. Standalone `pickUpNearby` remains useful for "pick up what I just dropped" or after a mob fight.
+`state`: `mined` (blocks dug), `collected`, `gained` (by item), `byType`, `skipped[]`, `protectedSkipped`, `unreachable` (+ `unreachableTypes`, `unreachablePositions`), `position` on failure. Batch failure shape: see [Batch variants](#batch-variants).
 
 ---
 
@@ -231,25 +222,18 @@ There is also a **side-channel** in `mineflayer-glue/event-hooks.ts`: when a can
 
 ---
 
-### `followPlayer` — sustained follow until cancelled
+### `followPlayer` — follow a player (background job)
 
 ```ts
-followPlayer(bot, { player: string, dist?: number }): Promise<SkillResult>
+followPlayer(bot, { player: string, dist?: number /* 1..16, default 3 */ }): Promise<SkillResult>
 ```
 
-**v2: this tool starts a `follow` background job and returns at once** (`src/jobs/steps/follow.ts`, pure logic in `src/jobs/follow.ts`; see v2/PLANNER.md "Follow job"). The job keeps the dynamic `GoalFollow`, searches for the player if they leave view (last position, then ahead along their heading, up to 45 s; fails at once if they left the server), ends on stop / `cancelJob` / any non-exempt tool call / the 30-min cap, and does not end on chat. Without a job runner (legacy backends) the original blocking skill below runs.
-
-Legacy blocking skill: sets a dynamic pathfinder `GoalFollow(entity, dist)` and parks in a tick loop. Returns only when the cancellation flag is set (player says "stop"/"halt"/"wait", or Claude calls the `stop` skill) or when the player leaves the server. Blocks the agent loop — chat that arrives mid-follow queues normally, the side-channel handles the preempt.
-
-| Param | Default | Notes |
-|---|---|---|
-| `player` | — | Required. Player username; the player's `bot.players` entity must be visible at call time. |
-| `dist` | `2` | Follow distance, 1–16 blocks. |
+**v2: starts a `follow` job and returns at once** (the Haiku session ends; chat during the follow gets its own fresh task). Behaviour, lost-sight search, failure timings and caveats: [JOBS.md](JOBS.md) *Follow job*. Ends on stop / `cancelJob` / a new job / any non-exempt tool call / the 30-min cap; `say`/`whisper` don't end it. Use only when asked to follow; for "come here" use `goTo` with the player as target. Without a job runner (legacy backends) the original blocking skill runs (returns `stopped following <player>` when cancelled).
 
 | | |
 |---|---|
-| Success | `stopped following <player>` |
-| Failures | `player name required` · `dist must be between 1 and 16, got <n>` · `player "<name>" is not visible to the bot` · `lost sight of <player> (left server or moved out of range)` |
+| Success | `now following <player> (~<dist> blocks) as a background job. It keeps running while you chat: reply briefly with say and end your turn. …` |
+| Failures | `player name required` · `dist must be between 1 and 16, got <n>` · `player "<name>" is not visible to the bot` · `I can't follow myself` · `the job runner isn't available right now` · later, as `[job failed]` events: `following <player> ended after <dur> — <detail>` (kind `unreachable`: lost them for 45 s, they left the server, or no path for 40 s) |
 
 ---
 
@@ -497,7 +481,7 @@ Shortfall reporting picks the recipe variant closest to completion and lists eve
 pillarUp(bot, { height: number /* 1..32 */ }): Promise<SkillResult>
 ```
 
-For genuinely stuck situations (a hole, a ledge, a tree top) — never as travel. Filler priority: cobblestone, dirt, netherrack, stone (no sand/gravel). Pre-checks an empty feet cell, solid full block below, and headroom. Per level: look straight down, hold jump, poll each physics tick until feet ≥ cell + 1.1, release jump, place on the block below, verify it appeared and the bot landed on it; ≤3 attempts per level. (The old version placed on a fixed 120ms timer — before feet clear the cell on tick 3 — so the server rejected it as obstructed, and jump stayed held, causing repeat hopping.) Cancellable; returns `state.placed` and final position. Implementation in `src/skills/pillar.ts`.
+For genuinely stuck situations (a hole, a ledge, a tree top) — never as travel. Filler (`pickFiller`): never items **reserved** by a running job; prefers dirt, netherrack, cobbled_deepslate, andesite, diorite, granite, tuff, then cobblestone, stone, blackstone (no sand/gravel). The bot also uses this internally as an escape from pits/water (`purpose: escape`). Pre-checks an empty feet cell, solid full block below, and headroom. Per level: look straight down, hold jump, poll each physics tick until feet ≥ cell + 1.1, release jump, place on the block below, verify it appeared and the bot landed on it; ≤3 attempts per level. Cancellable; returns `state.placed` and final position. Implementation in `src/skills/pillar.ts`.
 
 ---
 
@@ -512,6 +496,8 @@ Creative mode only. In survival it refuses with a clear message. Fills the inven
 - **Slot order:** grows existing plain stacks first, then empty hotbar slots (36–44), then main inventory (9–35). Respects stack size, and never overwrites an occupied slot.
 - **Server confirmation:** on 1.21.3+ the server never confirms creative slot writes, and mineflayer's own rejection check is broken there. So writes use `waitTimeout = 0`, go strictly one slot at a time, and are spaced 60 ms apart.
 - **Full inventory:** returns `ok:false` with `state.missing`.
+- **Operator-item denylist** (`isOperatorItem`, `creative.ts`): refused by `getItems`, every auto-supply path (`creativeGive`) and `achieve({deliverTo})`: `command_block` (+chain/repeating/minecart), `structure_block`/`structure_void`/`jigsaw`/`test_block`, `barrier`, `light`, `bedrock`, `debug_stick`, `knowledge_book`, `end_portal_frame`, `spawner`/`trial_spawner`, `reinforced_deepslate`, `allow`/`deny`/`border_block`, griefing items `tnt`, `tnt_minecart`, `lava_bucket`, `end_crystal`, `respawn_anchor`, `wither_skeleton_skull`, and any `*_spawn_egg`. Message: `<item> is an operator/technical item; I don't hand those out`.
+- Count cap: 1..2304 per item, 36 item types per call.
 
 **Creative behavior of other skills** (every branch checks the live `bot.game.gameMode` via `src/skills/game-mode.ts`, never a cached value):
 - `mineBlock(s)`: instant, no tool check, pillar or pickup sweep. Reports "cleared … drop nothing". Switches off a held sword/trident/mace, because a creative player can't break blocks with one. The structure guard still applies.
@@ -609,13 +595,71 @@ Composite: `goTo(player)` via pathfinder `GoalNear(reach=2)`, then `lookAt` the 
 | Success | `gave <K> <item> to <player>` |
 | Failures | `player name required` · `item is required` · `player "<name>" is not visible to the bot` · `unknown item "<name>"` · `no <item> in inventory to give to <player>` · `couldn't reach <player> to hand off <item>: <msg>` · `reached <player> but: <dropItem failure message>` |
 
+## Job tools (v2)
+
+These start/stop background jobs ([JOBS.md](JOBS.md)) and **return at once**; the tool result ends with "reply briefly and end your turn — you'll get a [job finished]/[job failed] message". Calling any movement/mining/crafting tool while a job runs cancels it (exempt: `say whisper observeSurroundings checkInventory remember setTaskQueue advanceTaskQueue achieve build surviveNight cancelJob`). `state` is the `AchieveResult` `{ ok, jobId, message, rawNeeds?, unresolved? }`.
+
+### `achieve` — get items via a planned background job
+
+```ts
+achieve(bot, { goals: Array<{ item: string; count: number }>, deliverTo?: string }): Promise<SkillResult>
+```
+
+Pass **all** requested items in one call. `item` is an exact snake_case ID (validated with did-you-mean) or a tag: `#log #planks #wool #stone_tool_material #coal #sand` (any mix of matching items counts; species chosen per plan). Also THE way to collect N of something (chop 10 logs = `{ item: "#log", count: 10 }`). Duplicates are merged; counts floor at 1. `deliverTo` ("give/get/bring me"): when the goals are met the bot walks to that player and hands the items over (creative: takes them with `getItems` first; works even if the items are already held); capped at 2 stacks per stackable item, 4 for unstackables (the result says when it clamped, tell the player); operator items refused; the player must be in sight. "make/craft/get yourself X" = no `deliverTo`.
+
+| | |
+|---|---|
+| Success | `job started: iron_pickaxe x1[ → give to <player>]. Plan: <summary>. It runs in the background; reply briefly and end your turn — …` |
+| Failures | `the job runner isn't available right now` · `creative mode: don't gather or craft — take what you need with getItems (or pass deliverTo to hand items to a player)` · `can't hand things to "<name>": no player by that name is in sight…` · `goals item <unknown item + did-you-mean>` · `goals item "#x" is not a known item tag (known: …)` · `<item> is an operator/technical item; I don't hand those out` · `not started: this same goal already failed N times in the last 30 min (<kinds>). Running it again won't change the outcome — …` (failure ledger; cleared when a player speaks) · `nothing to do: you already have everything asked for` · planner refusal naming the unresolved leaf and reason (`not_obtainable: …`, `no_source: …`) · `not started: a stop request arrived while the job was being planned` |
+
+Ends later with `[job finished] achieve … — done in 4m12s (requested by Alex — tell them)` or `[job failed] … failure: <kind> — <detail>; remaining plan: …`.
+
+### `build` — house, nether portal or wheat farm
+
+```ts
+build(bot, { blueprint: "house" | "portal" | "farm", params?: { width?, depth?, height?, wall?, roof?, floor?, door?, windows?, size? }, at?: "here" | { x, y, z } }): Promise<SkillResult>
+```
+
+Picks a level site beside the requesting player (`at:"here"` default; never on top of them or any build), gets missing materials (survival: planner gathers/crafts inside the same job; creative: `getItems`), places bottom-up with temporary scaffolds and the door last, then verifies the block count. Params and geometry per blueprint: JOBS.md *Builder*. Big/permanent builds: Haiku proposes defaults first and waits for a yes (D13). The default wall is the planks the bot holds.
+
+| | |
+|---|---|
+| Success | `build started: <summary>. It runs in the background; …`; ends with `[job finished] build house (…) — done in 26s, 57/57 blocks placed` |
+| Failures | `the job runner isn't available right now` · `no spot for the <blueprint>: <reason>. Ask the player where, or try another area.` (`no_site`) · `not started: the <blueprint> already failed N times near here in the last 30 min (<kinds>; placed/total at x,y,z)…` · material gap unresolved (e.g. portal without obsidian/flint, farm without hoe/seeds) · later `[job failed] … failure: build_incomplete/timeout/… ` |
+
+An earlier unfinished structure of the same blueprint near the anchor is **resumed**, not duplicated.
+
+### `surviveNight` — get through the night safely
+
+```ts
+surviveNight(bot, { useBed?: boolean, shelter?: "dig" | "hut" }): Promise<SkillResult>
+```
+
+Sleeps in a bed within reach, else digs a sealed 1x2 pocket into the ground or a hillside in seconds, else builds a 3x3 hut beside the requester; waits inside until dawn (time 23500), then opens up. `useBed:false` skips the bed; `shelter:"hut"` skips digging in. Details/caveats: JOBS.md *Night job*.
+
+| | |
+|---|---|
+| Success | `night job started: <summary>. It runs in the background (digging in or building, then waiting inside until dawn); …`; ends `[job finished] survived the night — <detail>` |
+| Failures | `creative mode: mobs can't hurt you, so there is nothing to survive. Just carry on.` · `it's daytime (time <t>); there is nothing to shelter from. Night starts around 12500 (dusk ~11000).` · `the job runner isn't available right now` · hut refusals (`no_site`, ledger) · `[job failed]` kinds `died` / `timeout` / `no_site` / `build_incomplete` |
+
+### `cancelJob` — abandon the running job
+
+```ts
+cancelJob(bot): Promise<SkillResult>
+```
+
+| | |
+|---|---|
+| Success | `cancelled the job (<goals or label>)` · `no job is running` (ok:true) |
+| Failures | None. No `[job …]` event follows a cancel. |
+
 ## Batch variants
 
 v0.4 added batch siblings for every unary skill that had a realistic multi-target pattern. Each batch tool walks once, opens / equips once, runs the per-item operation in sequence, and returns a partial-result payload on first failure (mirroring `placeBlocks`). The unary siblings are **thin wrappers** around the batch siblings — calling the unary form with a list of one is exactly the batch path, no performance gap.
 
 | Unary | Batch | Use the batch form for |
 |---|---|---|
-| `mineBlock({ type, count? })` | `mineBlocks({ types[], maxCount?, maxDistance? })` | Prospecting — *"mine any ores you can find down there"*. Per-type tool-tier preflight; types the bot can't harvest are skipped and reported, not fatal. |
+| `mineBlock({ type, count? })` | `mineBlocks({ types[], maxCount?, maxDistance?, allowStructures? })` | Prospecting — *"mine any ores you can find down there"*. Per-type tool-tier preflight; types the bot can't harvest are skipped and reported, not fatal. |
 | `giveItemTo({ player, item, count? })` | `giveItemsTo({ player, items[] })` | Multi-item handoffs — full toolset, full armor set, food drop. One walk, many tosses. |
 | `equipItem({ item, slot? })` | `equipLoadout({ head?, torso?, legs?, feet?, hand?, offHand? })` | Multi-slot equips — armor set, weapon+shield. Object (not array) because the slots are a closed set. |
 | `craft({ item, count?, tablePos? })` | `craftMany({ items[], tablePos? })` | Multi-recipe crafts. Table is resolved lazily; if every item is 2×2, no table walk happens. Order matters — earlier recipes consume ingredients later ones may need. |
@@ -638,11 +682,12 @@ The bot is driven by Claude through natural in-game chat — no `!cmd` shortcuts
 - **Public chat** with the bot's name (e.g. `Steve_AI, look around`) wakes the bot. Reply lands in public chat via the `say` tool.
 - **`/msg <bot> <message>`** wakes the bot privately. Reply lands as a whisper via the `whisper` tool.
 - **`@all <message>`** wakes every configured bot.
-- **Follow-up without name-mention** (within 30s of the bot ending a reply with `?`) is routed via the conversation-continuity heuristic.
+- **Aliases** (`aliases:` in `config/bots.yml`, plus the suffix-stripped name: `Steve_AI` answers to "steve"), a **45 s question window**, a **60 s follow-up window** after any bot reply, and the running job's requester all route un-named chat (see ARCHITECTURE.md *Routing*).
 
 What to watch in the orchestrator console:
 
-- `ROUTE chat→<bot> reason=...` — the chat router picked this bot.
+- `ROUTE chat→<bot> reason=...` — the chat router picked this bot (`name-mention`, `follow-up`, `continuation`, `job-requester`, ...).
+- `[<bot>] job …` lines — job milestones (`grep job .bot-runtime/bot.log`): start, each step, recovery rungs, end.
 - `→ mcp__minecraft-skills__<skill>({...})` — the model called a skill.
 - `thinking: ...` — the model's plain assistant text (logged but never sent in-game).
 - `turn complete (cache_read=NNNN, out=NN)` — turn finished; usage stats.
