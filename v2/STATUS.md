@@ -16,8 +16,11 @@
 - Next live session: start the live server (main checkout `scripts/start.sh`), then `cd ../mcv2-live && ./scripts/botStart.sh`; stop with `./scripts/botStop.sh`.
 - Live findings, all fixed: stuck after a job (claimed "placed", stopped; un-named follow-ups dropped) → `46d6ba9`; missed message while following → follow job `e12f41b`.
 
-## In flight (2026-10-10 evening)
-- Nothing running. `v2` @ `4147b21` (361 tests). Worktrees idle: `../mcv2-dev` (v2-fixes), `../mcv2-build` (v2-build), `../mcv2-bench` (frozen @ `6d5af8b`), `../mcv2-live` (@ `4147b21`).
+## In flight (2026-10-10 night) — promotion work (D17)
+- Reviewer (read-only) → `v2/reports/promotion-review.md` (2c-A, 2c-B, quick shelter, live fixes, follow job + panel security verdict).
+- Fix agent in `../mcv2-build` (v2-build): build placement retry + remembered chests → `v2/reports/s4-fixes.md`.
+- Docs agent in `../mcv2-dev` (v2-fixes, docs only): ARCHITECTURE/SKILLS/ROADMAP/README (+ JOBS.md?) and `v2/CLAUDE.md.next` → `v2/reports/docs-update.md`.
+- Then: merge all, review fixes, final full core run, cutover.
 
 ## Next steps — toward promotion (D17)
 1. Full core run on the current `v2` HEAD → `v2-s5` (incl. `conv.chat_while_following`).
