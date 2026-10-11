@@ -351,6 +351,10 @@ export class ClaudeBackend implements AgentBackend {
         ...(hint === "haiku" ? { thinking: { type: "adaptive" as const }, effort: HAIKU_EFFORT } : {}),
         systemPrompt: systemPrompt ?? buildSystemPrompt(bot.username),
         mcpServers: { [MCP_SERVER_NAME]: skillsServer },
+        // SECURITY: only OUR skill server. Without this the session also loads the logged-in
+        // account's claude.ai connectors (Claude Docs etc.), callable under bypassPermissions —
+        // a player could steer the bot into the owner's accounts (found in v2 testing, D16).
+        strictMcpConfig: true,
         // Disable Claude Code's built-in tools — the NPC's surface is the skill layer only.
         tools: [],
         allowedTools,
