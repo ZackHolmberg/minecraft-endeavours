@@ -433,7 +433,7 @@ async function readMemory(username: string): Promise<MemoryFields> {
   return {
     refreshedAt: Date.now(),
     pois: { count: world.pois.length, latest: newest(world.pois, (p) => p.timestamp) },
-    containers: { count: world.containers.length, latest: newest(world.containers, (c) => c.last_opened) },
+    containers: { count: world.containers.length, latest: newest(world.containers, (c) => c.last_opened ?? c.last_seen ?? 0) },
     deaths: { count: world.deaths.length, latest: newest(world.deaths, (d) => d.timestamp) },
     conversation: { count: entries.length, tail: entries.slice(-CONVERSATION_TAIL) },
     tasks,

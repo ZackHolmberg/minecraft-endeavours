@@ -30,6 +30,11 @@ interface Sim {
   /** Digging `dirt` throws (scaffold removal fails). */
   failDig?: boolean;
   health?: number;
+  /** Server-side refusal hook: return a message to make this placement fail (face = the reference face a real placeBlock would report). */
+  refuse?: (p: { x: number; y: number; z: number }, avoidFaces: string[]) => { message: string; face: string } | null;
+  /** Entities the bot can see (a mob / player standing in a cell). */
+  entities?: () => Array<{ type: string; position: Vec3; width: number; height: number; username?: string }>;
+  chats?: string[];
 }
 let sim: Sim;
 
@@ -76,7 +81,7 @@ vi.mock("../../skills/navigation.js", () => ({
   },
 }));
 vi.mock("../../skills/world.js", () => ({
-  placeBlock: async (_b: unknown, { type, position: p }: { type: string; position: { x: number; y: number; z: number } }) => {
+  placeBlock: async (_b: unknown, { type, position: p, avoidFaces }: { type: string; position: { x: number; y: number; z: number }; avoidFaces?: string[] }) => {
     // creative: the real placeBlock flies to a hover spot when out of reach
     if (sim.creative && sim.pos.offset(0, 1.62, 0).distanceTo(new Vec3(p.x + 0.5, p.y + 0.5, p.z + 0.5)) > 4.5) sim.pos = new Vec3(p.x + 0.5, p.y + 2, p.z + 0.5);
     const eye = sim.pos.offset(0, 1.62, 0);
@@ -89,6 +94,8 @@ vi.mock("../../skills/world.js", () => ({
     });
     if (!nb) return { ok: false, message: "no solid neighbour" };
     if (!sim.creative && (sim.inv[type] ?? 0) < 1) return { ok: false, message: `no ${type} in inventory` };
+    const refused = sim.refuse?.(p, avoidFaces ?? []);
+    if (refused) return { ok: false, message: `place failed: ${refused.message}`, state: { face: refused.face } };
     if (!sim.creative) sim.inv[type] = (sim.inv[type] ?? 0) - 1;
     sim.world.set(k(p.x, p.y, p.z), type);
     if (/_door$/.test(type)) sim.world.set(k(p.x, p.y + 1, p.z), type);
@@ -121,6 +128,12 @@ function fakeBot(): Bot {
     registry: { itemsByName: new Proxy({}, { get: () => ({}) }) },
     get entity() {
       return { position: sim.pos };
+    },
+    get entities() {
+      return Object.fromEntries((sim.entities?.() ?? []).map((e, i) => [String(i), e]));
+    },
+    chat: (m: string) => {
+      (sim.chats ??= []).push(m);
     },
     get inventory() {
       const slots: Array<{ name: string; count: number } | null> = new Array(9).fill(null);
@@ -272,6 +285,71 @@ describe("Builder simulation", () => {
     expect(prep.ok && prep.missing).toEqual([]);
     expect(out).toMatchObject({ ok: true });
     expect([...sim.world.values()].filter((n) => n === "wheat")).toHaveLength(16);
+  });
+
+  it("retry: a player standing in a wall cell is waited out (and asked once), then the placement lands at the end of the layer", async () => {
+    const { RETRY_TUNING } = await import("./build.js");
+    Object.assign(RETRY_TUNING, { rounds: 3, entityWaitMs: 3_000, layerBudgetMs: 20_000 });
+    const target = { x: 0, y: 64, z: 0 };
+    let until = 0;
+    // a wall cell on the east side; the origin is known after prepare
+    sim = { world: new Map(), inv: { oak_planks: 64, oak_door: 1, glass: 4 }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const { createBuildDeps } = await import("./build.js");
+    const deps = createBuildDeps(fakeBot());
+    const prep = await deps.prepare({ blueprint: "house", params: { wall: "oak_planks" }, anchor: A, avoid: [A] }, null);
+    if (!prep.ok) throw new Error("no prep");
+    const o = prep.origin;
+    Object.assign(target, { x: o.x + 4, y: o.y + 1, z: o.z + 1 });
+    sim.box = { x0: o.x, z0: o.z, x1: o.x + 4, z1: o.z + 4 };
+    until = Date.now() + 1_500;
+    sim.entities = () => (Date.now() < until ? [{ type: "player", username: "Tester", position: new Vec3(target.x + 0.5, target.y, target.z + 0.5), width: 0.6, height: 1.8 }] : []);
+    sim.refuse = (p) => (Date.now() < until && p.x === target.x && p.y === target.y && p.z === target.z ? { message: "Server refused to place oak_planks: the block is still air", face: "bottom" } : null);
+    const out = await deps.run(prep, ctx());
+    expect(out).toMatchObject({ ok: true });
+    expect(sim.world.get(k(target.x, target.y, target.z))).toBe("oak_planks");
+    expect(sim.chats).toHaveLength(1);
+  });
+
+  it("retry: a refused click on one face is retried against another face", async () => {
+    const { RETRY_TUNING } = await import("./build.js");
+    Object.assign(RETRY_TUNING, { rounds: 3, entityWaitMs: 200, layerBudgetMs: 20_000 });
+    sim = { world: new Map(), inv: { oak_planks: 64, oak_door: 1, glass: 4 }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const { createBuildDeps } = await import("./build.js");
+    const deps = createBuildDeps(fakeBot());
+    const prep = await deps.prepare({ blueprint: "house", params: { wall: "oak_planks" }, anchor: A, avoid: [A] }, null);
+    if (!prep.ok) throw new Error("no prep");
+    const o = prep.origin;
+    const cell = { x: o.x + 4, y: o.y + 1, z: o.z + 1 };
+    sim.box = { x0: o.x, z0: o.z, x1: o.x + 4, z1: o.z + 4 };
+    const faces: string[][] = [];
+    // the (first-choice) "bottom" face is always refused; the mock reports it and honours avoidFaces
+    sim.refuse = (p, avoid) => {
+      if (p.x !== cell.x || p.y !== cell.y || p.z !== cell.z) return null;
+      faces.push(avoid);
+      return avoid.includes("bottom") ? null : { message: "Server refused to place oak_planks", face: "bottom" };
+    };
+    const out = await deps.run(prep, ctx());
+    expect(out).toMatchObject({ ok: true });
+    expect(faces.length).toBeGreaterThan(2); // two first-pass tries without an avoid list, then the retry with "bottom" avoided
+    expect(faces.at(-1)).toContain("bottom");
+  });
+
+  it("retry: a permanent refusal still fails the build after the bounded retries", async () => {
+    const { RETRY_TUNING } = await import("./build.js");
+    Object.assign(RETRY_TUNING, { rounds: 2, entityWaitMs: 200, layerBudgetMs: 5_000 });
+    sim = { world: new Map(), inv: { oak_planks: 64, oak_door: 1, glass: 4 }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const { createBuildDeps } = await import("./build.js");
+    const deps = createBuildDeps(fakeBot());
+    const prep = await deps.prepare({ blueprint: "house", params: { wall: "oak_planks" }, anchor: A, avoid: [A] }, null);
+    if (!prep.ok) throw new Error("no prep");
+    const o = prep.origin;
+    const cell = { x: o.x + 4, y: o.y + 1, z: o.z + 1 };
+    sim.box = { x0: o.x, z0: o.z, x1: o.x + 4, z1: o.z + 4 };
+    let tries = 0;
+    sim.refuse = (p) => (p.x === cell.x && p.y === cell.y && p.z === cell.z ? (tries++, { message: "Server refused to place oak_planks", face: "top" }) : null);
+    const out = await deps.run(prep, ctx());
+    expect(out).toMatchObject({ ok: false, kind: "build_incomplete" });
+    expect(tries).toBe(2 + 2 * 2); // first pass 2 tries + 2 retry rounds x 2 tries
   });
 
   it("creative house: materials come from getItems, same result", async () => {

@@ -14,6 +14,8 @@ import type { Coords, SkillResult } from "./types.js";
 const CHEST_REACH = 2;
 /** Live scan radius for a chest in plain sight when memory has nothing closer. */
 const CHEST_SEARCH_RADIUS = CONTAINER_SCAN_RADIUS;
+/** A container that was only seen (never opened) is a fallback target within this distance. */
+export const REMEMBERED_SEARCH_RADIUS = 64;
 
 export interface DepositToChestParams {
   item: string;
@@ -252,11 +254,12 @@ export async function withdrawManyFromChest(
   };
 }
 
-type ResolveResult =
-  | { ok: true; block: Block; source: "caller" | "nearest known" | "known with item" | "nearby" | "nearby, contents unknown" }
+export type ResolveResult =
+  | { ok: true; block: Block; source: "caller" | "nearest known" | "known with item" | "nearby" | "nearby, contents unknown" | "remembered, contents unknown" }
   | { ok: false; message: string };
 
-async function resolveChestBlock(
+/** @internal exported for tests */
+export async function resolveChestBlock(
   bot: Bot,
   pos: Coords | undefined,
   intent: "deposit" | "withdraw",
@@ -278,34 +281,41 @@ async function resolveChestBlock(
 
   const world = await readWorldKnowledge(bot.username);
   const nearby = findNearbyContainer(bot);
+  const me = bot.entity.position;
+  const distTo = (c: Container): number => me.distanceTo(new Vec3(c.position.x, c.position.y, c.position.z));
+  // Opened containers count at any distance; ones only SEEN (no contents) within REMEMBERED_SEARCH_RADIUS.
+  const remembered = world.containers.filter((c) => !c.seen || distTo(c) <= REMEMBERED_SEARCH_RADIUS);
   const isKnown = (b: Block): boolean =>
-    world.containers.some((c) => c.position.x === b.position.x && c.position.y === b.position.y && c.position.z === b.position.z);
+    world.containers.some((c) => !c.seen && c.position.x === b.position.x && c.position.y === b.position.y && c.position.z === b.position.z);
 
-  if (world.containers.length === 0) {
-    // Nothing remembered yet — use a chest in plain sight, like a player would.
+  if (remembered.length === 0) {
+    // Nothing remembered — use a chest in plain sight, like a player would.
     if (nearby) return { ok: true, block: nearby, source: intent === "withdraw" ? "nearby, contents unknown" : "nearby" };
     return {
       ok: false,
-      message: `no chest within ${CHEST_SEARCH_RADIUS} blocks and none remembered; walk to one or pass an explicit pos${intent === "deposit" ? " (or craft + place a chest: 8 planks)" : ""}`,
+      message: `no chest within ${CHEST_SEARCH_RADIUS} blocks and none remembered within ${REMEMBERED_SEARCH_RADIUS}; walk to one or pass an explicit pos${intent === "deposit" ? " (or craft + place a chest: 8 planks)" : ""}`,
     };
   }
 
-  let candidates: Array<{ c: Container; dist: number }> = world.containers.map((c) => ({
-    c,
-    dist: bot.entity.position.distanceTo(new Vec3(c.position.x, c.position.y, c.position.z)),
-  }));
+  let candidates: Array<{ c: Container; dist: number }> = remembered.map((c) => ({ c, dist: distTo(c) }));
+  let source: "nearest known" | "known with item" | "remembered, contents unknown" = "nearest known";
 
   if (intent === "withdraw" && itemForWithdraw) {
-    candidates = candidates.filter((entry) =>
-      (entry.c.contents ?? []).some((row) => row.item === itemForWithdraw && row.count > 0),
-    );
-    if (candidates.length === 0) {
-      // An unopened chest nearby might have it — worth one look.
+    const holding = candidates.filter((entry) => (entry.c.contents ?? []).some((row) => row.item === itemForWithdraw && row.count > 0));
+    if (holding.length > 0) {
+      candidates = holding;
+      source = "known with item";
+    } else {
+      // An unopened chest nearby might have it — worth one look; then the nearest one we only saw.
       if (nearby && !isKnown(nearby)) return { ok: true, block: nearby, source: "nearby, contents unknown" };
-      return {
-        ok: false,
-        message: `no remembered container holds ${itemForWithdraw}; pass an explicit pos or gather fresh`,
-      };
+      candidates = candidates.filter((entry) => entry.c.seen);
+      if (candidates.length === 0) {
+        return {
+          ok: false,
+          message: `no remembered container holds ${itemForWithdraw}; pass an explicit pos or gather fresh`,
+        };
+      }
+      source = "remembered, contents unknown";
     }
   }
 
@@ -315,11 +325,17 @@ async function resolveChestBlock(
   if (intent === "deposit" && nearby && bot.entity.position.distanceTo(nearby.position) < pick.dist) {
     return { ok: true, block: nearby, source: "nearby" };
   }
-  const block = bot.blockAt(new Vec3(pick.c.position.x, pick.c.position.y, pick.c.position.z));
+  const at = new Vec3(pick.c.position.x, pick.c.position.y, pick.c.position.z);
+  let block = bot.blockAt(at);
+  if (!block) {
+    // Remembered but out of the loaded chunks: head that way, then look again.
+    await navigate(bot, new goals.GoalNear(at.x, at.y, at.z, 8), { label: `the ${pick.c.type} at ${fmt(at)}`, target: at });
+    block = bot.blockAt(at);
+  }
   if (!block) {
     return {
       ok: false,
-      message: `nearest known container is at ${fmt(new Vec3(pick.c.position.x, pick.c.position.y, pick.c.position.z))} (~${Math.round(pick.dist)} blocks) but the chunk isn't loaded — walk closer first`,
+      message: `nearest known container is at ${fmt(at)} (~${Math.round(pick.dist)} blocks) but the chunk isn't loaded — walk closer first`,
     };
   }
   if (!isContainerName(block.name)) {
@@ -328,11 +344,7 @@ async function resolveChestBlock(
       message: `remembered ${pick.c.type} at ${fmt(block.position)} is now ${block.name} — chest may have been broken; refresh memory by passing an explicit pos`,
     };
   }
-  return {
-    ok: true,
-    block,
-    source: intent === "withdraw" && itemForWithdraw ? "known with item" : "nearest known",
-  };
+  return { ok: true, block, source };
 }
 
 function findNearbyContainer(bot: Bot): Block | null {

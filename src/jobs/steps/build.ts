@@ -15,6 +15,7 @@
  * existing `placeBlock` flies to high spots) and fetches materials with `getItems`.
  */
 import type { Bot } from "mineflayer";
+import type { Entity } from "prismarine-entity";
 import pathfinderPkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { pickDoor, pickHoe, pickScaffold } from "../../build/materials.js";
@@ -48,6 +49,12 @@ const MAX_FAIL_STREAK = 5;
 const DIG_TIMEOUT_MS = 15_000;
 /** Total time the scaffold clean-up (stop / failure / boot) may take before it gives up and leaves the rest on the books. */
 export const CLEANUP_BUDGET_MS = 20_000;
+
+/**
+ * Bounded retry for placements the server refused (a mob / player standing in the cell, a bad reference face).
+ * Mutable only so tests can shrink the waits.
+ */
+export const RETRY_TUNING = { rounds: 3, entityWaitMs: 4_000, layerBudgetMs: 45_000 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const v = (c: Cell): Vec3 => new Vec3(c.x, c.y, c.z);
@@ -168,6 +175,9 @@ class Builder {
   private scaffolds: ScaffoldCell[];
   private scaffoldItem = "dirt";
   private lastError = "";
+  /** Reference face (bottom / north / ...) the last placement clicked on, from the placeBlock result. */
+  private lastFace = "";
+  private askedPlayersToMove = false;
   private ended = false;
   private readonly onEnd = (): void => {
     this.ended = true;
@@ -310,8 +320,15 @@ class Builder {
     let layerT = Date.now();
     let layerOk = true;
     let failStreak = 0;
-    const flushLayer = (): void => {
+    /** Placements that failed in the current layer; retried (entities cleared, other face) before the layer is closed. */
+    let deferred: AbsPlacement[] = [];
+    const flushLayer = async (): Promise<void> => {
       if (layerY === null) return;
+      if (deferred.length > 0) {
+        const todo = deferred;
+        deferred = [];
+        if (await this.retryFailed(todo)) layerOk = true;
+      }
       ctx.record({
         kind: "step",
         jobId: ctx.jobId,
@@ -329,20 +346,23 @@ class Builder {
       if (this.stopped()) return this.outcome(false, "cancelled", "build cancelled"); // `run` strips the scaffolds
       if (a.op === "place") {
         if (layerY !== a.p.y) {
-          flushLayer();
+          await flushLayer();
           layerY = a.p.y;
           layerT = Date.now();
           layerOk = true;
         }
-      } else flushLayer();
+      } else await flushLayer();
 
       const ok = await this.perform(a);
       if (ok) failStreak = 0;
       else {
-        if (a.op === "place") layerOk = false;
+        if (a.op === "place") {
+          layerOk = false;
+          deferred.push(a.p);
+        }
         failStreak += 1;
         if (failStreak >= MAX_FAIL_STREAK) {
-          flushLayer();
+          await flushLayer();
           return this.outcome(false, "build_incomplete", `${failStreak} placements in a row failed; last: ${this.lastError}`);
         }
       }
@@ -352,7 +372,7 @@ class Builder {
         ctx.progress(`building ${kind}: ${this.countDone()}/${prepd.total}`, this.countDone());
       }
     }
-    flushLayer();
+    await flushLayer();
     await this.removeScaffolds();
 
     // 5. postcondition: count the blueprint's blocks in the world
@@ -425,7 +445,7 @@ class Builder {
     return this.grid.blockAt(c.x, c.y, c.z);
   }
 
-  private async placeCell(p: AbsPlacement, itemOverride?: string): Promise<boolean> {
+  private async placeCell(p: AbsPlacement, itemOverride?: string, avoidFaces?: readonly string[]): Promise<boolean> {
     const { bot } = this;
     if (itemOverride === undefined && placementDone(this.grid, p)) return true;
     const isDoor = p.role === "door";
@@ -451,7 +471,9 @@ class Builder {
 
     for (let attempt = 0; attempt < 2; attempt++) {
       if (this.stopped()) return false;
-      const r = await placeBlock(bot, { type: item, position: { x: p.x, y: p.y, z: p.z } });
+      const r = await placeBlock(bot, { type: item, position: { x: p.x, y: p.y, z: p.z }, ...(avoidFaces && avoidFaces.length > 0 ? { avoidFaces: [...avoidFaces] } : {}) });
+      const face = (r.state as { face?: string } | undefined)?.face;
+      if (face) this.lastFace = face;
       if (r.ok && (await this.settled(p, isDoor))) {
         if (isDoor || p.role === "foundation") this.log(`placed ${item} at (${p.x}, ${p.y}, ${p.z}); bot at ${this.botCell()}`);
         return true;
@@ -462,6 +484,79 @@ class Builder {
       else await sleep(150);
     }
     return false;
+  }
+
+  // ── retry of refused placements ────────────────────────────────────────
+
+  /** Entities whose hitbox overlaps `c` and that stop the server from placing a block there (items / orbs / arrows do not). */
+  blockersAt(c: Cell): Entity[] {
+    const out: Entity[] = [];
+    const me = this.bot.entity;
+    for (const e of Object.values((this.bot as { entities?: Record<string, Entity> }).entities ?? {})) {
+      if (!e || e === me || !e.position) continue;
+      const kind = e.type as string;
+      const solid = kind === "player" || kind === "mob" || kind === "hostile" || kind === "animal" || kind === "passive" || kind === "living" || /boat|minecart|armor_stand/.test(e.name ?? "");
+      if (!solid) continue;
+      const hw = (e.width ?? 0.6) / 2;
+      const h = e.height ?? 1.8;
+      const p = e.position;
+      if (p.x + hw > c.x && p.x - hw < c.x + 1 && p.z + hw > c.z && p.z - hw < c.z + 1 && p.y + h > c.y && p.y < c.y + 1) out.push(e);
+    }
+    return out;
+  }
+
+  /** Fight a hostile in the cell, ask a player to step aside (once), and wait a little for the cell to empty. True once it is free. */
+  private async clearBlockers(c: Cell): Promise<boolean> {
+    const t0 = Date.now();
+    for (;;) {
+      const b = this.blockersAt(c);
+      if (b.length === 0) return true;
+      if (this.stopped() || !this.alive() || Date.now() - t0 >= RETRY_TUNING.entityWaitMs) {
+        this.log(`cell (${c.x}, ${c.y}, ${c.z}) still occupied by ${b.map((e) => e.username ?? e.name ?? e.type).join(", ")}`);
+        return false;
+      }
+      if (!this.askedPlayersToMove) {
+        const who = b.find((e) => e.type === "player" && e.username);
+        if (who) {
+          this.askedPlayersToMove = true;
+          try {
+            (this.bot as { chat?: (m: string) => void }).chat?.(`${who.username}, could you step out of the wall I'm building? Thanks!`);
+          } catch {
+            // chat is best-effort
+          }
+        }
+      }
+      if (b.some((e) => e.kind?.toLowerCase().includes("hostile") && e.type !== "player")) await this.guard();
+      await sleep(250);
+    }
+  }
+
+  /**
+   * Second chance for placements the server refused: wait out / fight whatever stands in the cell, step off
+   * it, and click a different reference face each round. Bounded by {@link RETRY_TUNING}. True if all landed.
+   */
+  private async retryFailed(todo: readonly AbsPlacement[]): Promise<boolean> {
+    const t0 = Date.now();
+    let all = true;
+    for (const p of todo) {
+      let done = placementDone(this.grid, p);
+      const avoid: string[] = [];
+      for (let round = 0; !done && round < RETRY_TUNING.rounds; round++) {
+        if (this.stopped() || !this.alive() || Date.now() - t0 > RETRY_TUNING.layerBudgetMs) break;
+        if (!this.creative && (this.inv()[p.block] ?? 0) < 1) break; // out of material: nothing a retry can fix
+        await this.clearBlockers(p);
+        if (!this.creative && (round > 0 || this.overlapsBot(p))) await this.ensureReach(p, true);
+        this.lastFace = "";
+        done = await this.placeCell(p, undefined, avoid);
+        if (!done) {
+          if (this.lastFace && !avoid.includes(this.lastFace)) avoid.push(this.lastFace);
+          this.log(`retry ${round + 1}/${RETRY_TUNING.rounds} of ${p.block} at (${p.x}, ${p.y}, ${p.z}) failed (avoiding faces: ${avoid.join(",") || "none"})`);
+        }
+      }
+      if (done) this.log(`retry placed ${p.block} at (${p.x}, ${p.y}, ${p.z})`);
+      else all = false;
+    }
+    return all;
   }
 
   private async settled(p: AbsPlacement, isDoor: boolean): Promise<boolean> {

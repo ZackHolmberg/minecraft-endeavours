@@ -22,12 +22,14 @@ import {
 import { jobContextLines } from "../jobs/describe.js";
 import { getJobRunner } from "../jobs/registry.js";
 import { getBotState } from "../state/index.js";
-import { findNearbyContainers } from "../skills/containers.js";
+import { CONTAINER_SCAN_RADIUS, findNearbyContainers } from "../skills/containers.js";
 import { observeSurroundings, type ObserveSurroundingsState } from "../skills/perception.js";
 
 const MAX_BLOCKS = 8;
 const MAX_ENTITIES = 6;
 const MAX_STORAGE = 5;
+/** Extra remembered (seen, beyond the live scan) containers listed in the context block. */
+const MAX_REMEMBERED_FAR = 3;
 const MAX_UTILITIES = 5;
 const MAX_WAYPOINTS = 5;
 const MAX_ACTIONS = 5;
@@ -128,9 +130,10 @@ async function worldLines(bot: Bot, actionHistory = false): Promise<string[]> {
     );
   }
 
-  if (s.knownStorage.length > 0) {
+  const openedStorage = s.knownStorage.filter((c) => !c.seen);
+  if (openedStorage.length > 0) {
     L.push(
-      `known storage: ${s.knownStorage
+      `known storage: ${openedStorage
         .slice(0, MAX_STORAGE)
         .map((c) => `${c.type} @${fmt(c.pos)}${storageContents(c)}`)
         .join(", ")}`,
@@ -141,6 +144,9 @@ async function worldLines(bot: Bot, actionHistory = false): Promise<string[]> {
   if (containers.length > 0) {
     L.push(`nearby containers: ${containers.slice(0, MAX_STORAGE).map((c) => `${c.name} @${fmt(c.pos)} (${c.dist}m)`).join(", ")}`);
   }
+  // Containers seen earlier but beyond the live scan: the bot walked off, the chest is still there.
+  const farLine = rememberedContainersLine(s.knownStorage);
+  if (farLine) L.push(farLine);
   if (s.knownUtilities.length > 0) {
     L.push(
       `known utilities: ${s.knownUtilities
@@ -231,6 +237,13 @@ function inventorySummary(bot: Bot): string {
     .sort((a, b) => b[1] - a[1])
     .map(([name, count]) => `${name} x${count}`)
     .join(", ");
+}
+
+/** "remembered containers beyond 16m …" (≤3 nearest seen-only ones outside the live scan), or null. */
+export function rememberedContainersLine(storage: ObserveSurroundingsState["knownStorage"]): string | null {
+  const far = storage.filter((c) => c.seen && c.dist > CONTAINER_SCAN_RADIUS).sort((a, b) => a.dist - b.dist).slice(0, MAX_REMEMBERED_FAR);
+  if (far.length === 0) return null;
+  return `remembered containers beyond ${CONTAINER_SCAN_RADIUS}m (seen, not opened): ${far.map((c) => `${c.type} @${fmt(c.pos)} (${Math.round(c.dist)}m)`).join(", ")}`;
 }
 
 function storageContents(c: ObserveSurroundingsState["knownStorage"][number]): string {
