@@ -16,19 +16,14 @@
 - Next live session: start the live server (main checkout `scripts/start.sh`), then `cd ../mcv2-live && ./scripts/botStart.sh`; stop with `./scripts/botStop.sh`.
 - Live findings, all fixed: stuck after a job (claimed "placed", stopped; un-named follow-ups dropped) → `46d6ba9`; missed message while following → follow job `e12f41b`.
 
-## In flight (2026-10-10 night) — promotion work (D17)
-- Promotion review done: panel PASS; H1 settingSources (D18), M1–M4. Fix agent in `../mcv2-dev` (src only; docs agent shares the worktree, docs only) → "## Fixes" in `v2/reports/promotion-review.md`.
-- Fix agent in `../mcv2-build` (v2-build): build placement retry + remembered chests → `v2/reports/s4-fixes.md`.
-- Docs agent in `../mcv2-dev` (v2-fixes, docs only): ARCHITECTURE/SKILLS/ROADMAP/README (+ JOBS.md?) and `v2/CLAUDE.md.next` → `v2/reports/docs-update.md`.
-- Then: merge all, review fixes, final full core run, cutover.
+## In flight (2026-10-11) — final pre-cutover run
+- Merged @ `99f1610`: docs (`9255970`), s4 fixes (`b8efdeb`), promotion-review fixes incl. full SDK isolation (`21d66c6`, D18). 401 tests.
+- **Final run `v2/runs/v2-s5`** (core 31 scenarios ×2, bench `../mcv2-bench` @ `99f1610`), log ends CHAIN_DONE.
+- Then cutover per D17 (confirm panel UI rebuild + restart with owner first).
 
 ## Next steps — toward promotion (D17)
-1. Full core run on the current `v2` HEAD → `v2-s5` (incl. `conv.chat_while_following`).
-2. v2-s4 small fixes: build placement retry on server refusal; remember seen chests beyond 16 blocks.
-3. Independent review of 2c-A, 2c-B, quick shelter, follow job → fixes.
-4. Panel security review of v2 `src/web/**` diff (Events.tsx display-only so far).
-5. Docs for a cold-start Claude: fold v2 into ARCHITECTURE/SKILLS/ROADMAP + CLAUDE.md (gitignored; update the main checkout's copy at cutover).
-6. Cutover per D17. Done so far: security fix on main (`bd32483`), `v2` + `v1` tag pushed.
+1. Read `v2-s5`; if ≥ targets with no regressions → cutover per D17. (Done: s4 fixes, promotion review + fixes, panel security PASS, docs.)
+2. Cutover checklist: delete ROADMAP.md "Before cutover" section; `config/bots.yml` → `Steve_AI` (aliases [steve]); install `v2/CLAUDE.md.next` as the main checkout's CLAUDE.md; backup world; merge into main checkout (no branch switch) + `npm ci`; panel `ui:build` + launchd restart (owner OK); start live bot; push main (owner OK). Done so far: security fix on main (`bd32483`), `v2` + `v1` tag pushed.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
