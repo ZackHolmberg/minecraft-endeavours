@@ -152,18 +152,20 @@ async function withJobAutoCancel(
     : { ...result, message: `(your running job "${goals}" was cancelled because you started something else) ${result.message}` };
 }
 
-function wrapSpec(spec: SkillSpec): SkillSpec {
+function wrapSpec(spec: SkillSpec, sideReply = false): SkillSpec {
   return {
     ...spec,
-    run: (bot, args) => withJobAutoCancel(spec, bot, () => runWrapped(spec, bot, args)),
+    run: (bot, args) => withJobAutoCancel(spec, bot, () => runWrapped(spec, bot, args, sideReply)),
   };
 }
 
-async function runWrapped(spec: SkillSpec, bot: Bot, args: unknown): Promise<SkillResult> {
+async function runWrapped(spec: SkillSpec, bot: Bot, args: unknown, sideReply = false): Promise<SkillResult> {
   if (spec.name === "say" || spec.name === "whisper") {
     const result = await spec.run(bot, args);
     if (result.ok) {
-      markReply(bot.username);
+      // A side reply answers a different message than the main task; it must not count as the task's reply
+      // (that would suppress the silent-turn nudge if the main task then ends mute).
+      if (!sideReply) markReply(bot.username);
       const target =
         spec.name === "whisper"
           ? (args as { player?: string } | undefined)?.player
@@ -206,7 +208,7 @@ export function buildSkillsServerFor(
   bot: Bot,
   specs: SkillSpec[],
 ): McpSdkServerConfigWithInstance {
-  return toClaudeMcpServer(MCP_SERVER_NAME, bot, specs.map(wrapSpec));
+  return toClaudeMcpServer(MCP_SERVER_NAME, bot, specs.map((sp) => wrapSpec(sp)));
 }
 
 // Defaults: the full Claude surface (all 36), preserving today's behavior.
@@ -230,7 +232,7 @@ const SIDE_REPLY_TOOLS: ReadonlySet<string> = new Set(["say", "whisper"]);
 export function buildSideReplyServer(bot: Bot, onSaid: () => void): McpSdkServerConfigWithInstance {
   const specs = CLAUDE_SPECS.map((spec): SkillSpec => {
     if (SIDE_REPLY_TOOLS.has(spec.name)) {
-      const wrapped = wrapSpec(spec);
+      const wrapped = wrapSpec(spec, true);
       return {
         ...wrapped,
         run: async (b, args) => {

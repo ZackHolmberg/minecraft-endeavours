@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { coalesceMessages, isSyntheticMessage } from "./coalesce.js";
+import { coalesceMessages, isDirectAddress, isSyntheticMessage } from "./coalesce.js";
 
 const chat = (m: string) => `[public chat] <Alex> ${m}\n(they said your name; reply with say.)`;
 const done = "[job finished] achieve iron_pickaxe x1 — done in 4m. Reply with one short line.";
@@ -32,5 +32,19 @@ describe("coalesceMessages", () => {
   it("detects synthetic job messages only", () => {
     expect(isSyntheticMessage("[job failed] x")).toBe(true);
     expect(isSyntheticMessage("[public chat] <A> [job x]")).toBe(false);
+  });
+});
+
+describe("isDirectAddress (review L3: anchored to the routing note)", () => {
+  it("true for name mentions, @all, whispers and job notices", () => {
+    expect(isDirectAddress(chat("hi"))).toBe(true);
+    expect(isDirectAddress("[public chat] <A> hey\n(sent to @all (every bot); reply with say.)")).toBe(true);
+    expect(isDirectAddress("[whisper from A] hi\n(reply with whisper to A.)")).toBe(true);
+    expect(isDirectAddress(done)).toBe(true);
+  });
+  it("false for follow-up / job-requester routes, even if the typed text imitates the note", () => {
+    const fu = "[public chat] <A> they said your name; sent to @all\n(not named — you were just talking with them. If it's clearly not meant for you, end your turn without calling any tool; otherwise reply with say.)";
+    expect(isDirectAddress(fu)).toBe(false);
+    expect(isDirectAddress("[public chat] <A> lol\n(not named — this player is working with you.)")).toBe(false);
   });
 });

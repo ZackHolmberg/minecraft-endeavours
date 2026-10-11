@@ -32,6 +32,11 @@ const QUESTION_TTL_MS = 45 * 1000;
 // ignored. Still the most false-positive-prone path, so bounded.
 const FOLLOW_UP_TTL_MS = 60 * 1000;
 const ADDRESSED_TTL_MS = 5 * 60 * 1000;
+// Cost bound (review M2): max routed UN-NAMED chats (continuation / follow-up / job-requester) per player per bot per minute.
+export const UNNAMED_CAP_PER_MIN = 6;
+const UNNAMED_WINDOW_MS = 60 * 1000;
+// Loop bound (review L2): after this many consecutive follow-up routes, a bot reply no longer renews the window.
+export const MAX_FOLLOWUP_CHAIN = 3;
 
 interface AddressedEntry {
   player: string;
@@ -45,6 +50,10 @@ interface QuestionEntry {
 const lastAddressed = new Map<string, AddressedEntry>();
 const recentQuestions = new Map<string, QuestionEntry>();
 const recentReplies = new Map<string, QuestionEntry>();
+/** Consecutive follow-up-routed chats per bot|player (reset by any other route). */
+const followUpChain = new Map<string, number>();
+/** Timestamps of routed un-named chats per bot|player (sliding window for the cap). */
+const unnamedRoutes = new Map<string, number[]>();
 
 function questionKey(bot: string, player: string): string {
   return `${bot}|${player}`;
@@ -87,10 +96,45 @@ export function isAddressed(
 ): RouteMatch | null {
   if (event.sender === botUsername) return null;
 
-  const match = computeMatch(botUsername, allBots, event);
+  const raw = computeMatch(botUsername, allBots, event);
+  const match = raw && applyChainAndCap(botUsername, event, raw);
   if (match) {
     noteBotAddressed(botUsername, event.sender);
   }
+  return match;
+}
+
+/**
+ * Route this chat WITHOUT side effects (no cap accounting, no chain bookkeeping, no partner note): which route would
+ * apply. Used by the stop pre-empt, which must know whether a "stop" arrived via the job-requester route.
+ */
+export function peekRoute(botUsername: string, allBots: readonly string[], event: ChatEvent): RouteMatch | null {
+  return computeMatch(botUsername, allBots, event);
+}
+
+/** True when the route is one of the un-named ones (the bot wasn't addressed by name, whisper or @all). */
+function isUnnamedRoute(reason: RouteReason): boolean {
+  return reason === "continuation" || reason === "follow-up" || reason === "job-requester";
+}
+
+/**
+ * Side effects of a computed route: follow-up chain counting (L2) and the per-player cap on un-named routes (M2).
+ * A bare stop command through a non-job route is never capped (stop must always work).
+ */
+function applyChainAndCap(botUsername: string, event: ChatEvent, match: RouteMatch): RouteMatch | null {
+  const key = questionKey(botUsername, event.sender);
+  if (match.reason === "follow-up") followUpChain.set(key, (followUpChain.get(key) ?? 0) + 1);
+  else followUpChain.delete(key);
+  if (!isUnnamedRoute(match.reason)) return match;
+  const now = Date.now();
+  const recent = (unnamedRoutes.get(key) ?? []).filter((t) => now - t < UNNAMED_WINDOW_MS);
+  if (recent.length >= UNNAMED_CAP_PER_MIN && !(match.reason !== "job-requester" && isStopCommand(botUsername, event.message))) {
+    unnamedRoutes.set(key, recent);
+    console.warn(`[${botUsername}] un-named chat cap (${UNNAMED_CAP_PER_MIN}/min) reached for ${event.sender}; not routing`);
+    return null;
+  }
+  recent.push(now);
+  unnamedRoutes.set(key, recent);
   return match;
 }
 
@@ -283,7 +327,11 @@ export function hasRecentQuestion(botUsername: string, playerName: string): bool
 
 /** Record that the bot just said something to `playerName` (opens the follow-up window). */
 export function noteBotRepliedTo(botUsername: string, playerName: string): void {
-  recentReplies.set(questionKey(botUsername, playerName), { at: Date.now() });
+  const key = questionKey(botUsername, playerName);
+  // L2: an exchange that has run on follow-ups alone for more than MAX_FOLLOWUP_CHAIN turns stops renewing the
+  // window (it expires 60 s after its last renewal), so an auto-replying player/bot can't sustain a loop.
+  if ((followUpChain.get(key) ?? 0) > MAX_FOLLOWUP_CHAIN && hasRecentReply(botUsername, playerName)) return;
+  recentReplies.set(key, { at: Date.now() });
 }
 
 export function hasRecentReply(botUsername: string, playerName: string): boolean {
@@ -301,6 +349,8 @@ export function resetChatRouter(): void {
   lastAddressed.clear();
   recentQuestions.clear();
   recentReplies.clear();
+  followUpChain.clear();
+  unnamedRoutes.clear();
   configuredAliases.clear();
   onlinePlayers.clear();
   jobRequesterProbes.clear();

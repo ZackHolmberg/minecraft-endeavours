@@ -32,7 +32,10 @@ export function coalesceMessages(batch: readonly string[]): string {
 
 /** Messages a player aimed at the bot (or a job result for it): the routing note says "reply" without the soft follow-up escape. */
 export function isDirectAddress(message: string): boolean {
-  return /^\[job (finished|failed)\]/.test(message) || /they said your name;|sent to @all|^\[whisper from /.test(message);
+  if (/^\[job (finished|failed)\]/.test(message) || /^\[whisper from /.test(message)) return true;
+  // Only the routing-note line (after the header) counts: a player typing "they said your name;" must not force the direct path.
+  const note = message.split("\n").slice(1).join("\n");
+  return /^\(they said your name;|^\(sent to @all/.test(note);
 }
 
 
@@ -52,20 +55,40 @@ export function silentNudgeText(how: string): string {
 
 const REQUEST_VERBS = "get|grab|chop|mine|make|craft|build|bring|give|collect|fetch|go|come|follow|put|place|kill|attack|stop|wait|find|dig|smelt|cook|also|please|help|do|stay|hold|drop|take";
 
+// Words that make a message a request/suggestion rather than a pure status question, wherever they appear.
+const REQUEST_CUES =
+  /\b(instead|how about|what about|why don'?t|let'?s|please|also|then|should|maybe|rather|first|(?:get|grab|chop|mine|make|craft|build|bring|give|collect|fetch|go|come|follow|put|place|kill|attack|stop|wait|find|dig|smelt|cook|drop|stay|hold|help|switch|change|start|try|use|take me)\b)/;
+
+// Positive status shapes. A "?" alone is NOT enough ("grab coal instead?" is a request, review M1).
+const STATUS_SHAPES: RegExp[] = [
+  /^how(?:'s|s| is| are)\s+(?:it|that|things|the\s+\w+|you|your\s+\w+)\b/, // how's it going / how are you / how's the mining going
+  /^how\s+(?:far|long|much\s+(?:longer|more|left)|many\b.*\b(?:do you have|have you (?:got|gotten)|are left|left|so far|do you got)|much\b.*\b(?:do you have|have you (?:got|gotten)|left|so far))/,
+  /^what(?:'s|s| is| are|'re)\s+(?:you|u)\s+(?:doing|up to|making|building|mining|working on|carrying|holding)\b/,
+  /^what(?:'s|s| is)\s+(?:the\s+|your\s+)?(?:status|progress|plan|update|going on)\b/,
+  /^what(?:'s|s| is| do you have| have you got)\b.*\b(?:inventory|on you|in your)\b/,
+  /^what\s+do\s+you\s+(?:have|got|carry)\b/,
+  /^where\s+(?:are|r)\s+(?:you|u)\b/,
+  /^(?:are|r)\s+(?:you|u)\s+(?:almost|nearly|still|done|finished|stuck|ok|okay|alright|ready|busy|there|alive|close|getting)\b/,
+  /^is\s+(?:that|it|this)\s+(?:all|done|finished|everything|enough|working)\b/,
+  /^(?:got|have you (?:got|gotten|found|finished))\b.*\byet\b/,
+  /^(?:status|progress|update)\b/,
+  /^can\s+(?:you|u)\s+(?:see|tell me|hear)\b/,
+];
+
 /**
- * A routed chat that is a question about progress / state ("how's it going?", "what are you doing",
- * "are you almost done?"), as opposed to a request phrased as a question ("can you also grab coal?").
+ * A routed chat that is a pure question about progress / state ("how's it going?", "what are you doing",
+ * "are you almost done?"), as opposed to a request ("can you also grab coal?", "grab coal instead?", "what about iron?").
  * `message` is the formatted user message (`[public chat] <Alex> steve, how's it going?\n(note)`).
- * Used to answer mid-task with a quick side reply instead of waiting for the blocking tool to return.
+ * Used to answer mid-task with a quick side reply that is NOT queued, so this must be conservative: it needs a
+ * positive status shape AND no request cue anywhere; anything else is queued as a normal task (review M1).
  */
 export function isStatusQuestion(message: string): boolean {
   const first = (message.split("\n")[0] ?? "").trim();
   const text = first.replace(/^\[[^\]]*\]\s*(<[^>]*>\s*)?/, "").trim().toLowerCase();
   if (text.length === 0) return false;
-  // "steve, can you also grab coal?" → request
-  const body = text.replace(/^[\w]+[,:]\s*/, "").trim();
+  const body = text.replace(/^[\w]+[,:]\s*/, "").replace(/^(?:hey|yo|um|uh|so|ok|okay)[, ]+/, "").trim();
   if (new RegExp(`^(can|could|would|will)\\s+(you|u)\\s+(${REQUEST_VERBS})\\b`).test(body)) return false;
-  if (new RegExp(`^(do|could|can)\\s+you\\s+mind\\b`).test(body)) return false;
-  if (body.includes("?")) return true;
-  return /^(how|what|where|when|are|is|can)\b/.test(body);
+  if (/^(do|could|can)\s+you\s+mind\b/.test(body)) return false;
+  if (REQUEST_CUES.test(body)) return false;
+  return STATUS_SHAPES.some((re) => re.test(body));
 }

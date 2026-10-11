@@ -37,6 +37,8 @@ const MAX_SLEEP_TRIES = 3;
 /** Used when the server clock is unknown: one night. */
 const FALLBACK_WAIT_MS = 9 * 60_000;
 const EXIT_BUDGET_MS = 25_000;
+/** Un-sealing after a cancel / timeout / failure: must finish inside the runner's STEP_GRACE_MS (20 s) so the job never ends with the bot still digging out. */
+const UNSEAL_BUDGET_MS = 17_000;
 const PLACEHOLDER: Step = { op: "place_station", block: "crafting_table" };
 
 const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -55,6 +57,7 @@ export function createNightDeps(bot: Bot): NightDeps {
     holdInShelter: (geo, ctx) => holdInShelter(bot, geo, ctx),
     planPocket: () => planPocket(bot),
     digInThrough: (plan, ctx) => digInThrough(bot, plan, ctx),
+    leavePocket: (plan, signal) => leavePocket(bot, plan, signal),
   };
 }
 
@@ -401,9 +404,9 @@ async function digAndSeal(bot: Bot, plan: PocketPlan, ctx: StepRunContext): Prom
 }
 
 /** Dawn: open the seal and get back to the surface. Best effort, bounded. */
-async function climbOut(bot: Bot, plan: PocketPlan): Promise<void> {
+async function climbOut(bot: Bot, plan: PocketPlan, budgetMs = EXIT_BUDGET_MS): Promise<void> {
   const t0 = Date.now();
-  const left = (): boolean => Date.now() - t0 < EXIT_BUDGET_MS;
+  const left = (): boolean => Date.now() - t0 < budgetMs;
   try {
     // top-most seal block first
     for (const c of [...plan.seal].reverse()) {
@@ -424,29 +427,72 @@ async function climbOut(bot: Bot, plan: PocketPlan): Promise<void> {
   }
 }
 
+/** Is the bot's feet cell one of the pocket's own cells (the resting cell, or a cell dug for it)? */
+function insidePocket(bot: Bot, plan: PocketPlan): boolean {
+  if (!bot.entity) return false;
+  const p = bot.entity.position;
+  const fx = Math.floor(p.x);
+  const fy = Math.floor(p.y + 0.01);
+  const fz = Math.floor(p.z);
+  return [plan.rest, ...plan.dig].some((c) => c.x === fx && c.y === fy && c.z === fz);
+}
+
+/**
+ * Review M3: whatever ends the dig-in (cancel, replace, timeout, failure, an escape that half worked), a bot that is
+ * still in its pocket must get out: open the seal and climb to the surface. Bounded; ignores a latched stop flag
+ * (`tracked` resets it); skipped when dead or when the bot isn't in the pocket cells.
+ */
+async function unsealAndLeave(bot: Bot, plan: PocketPlan, why: string): Promise<void> {
+  if (!alive(bot) || !insidePocket(bot, plan)) return;
+  log(bot, `${why}: opening the pocket and climbing out`);
+  await tracked(bot, "digIn", { escape: true, why }, async () => {
+    await climbOut(bot, plan, UNSEAL_BUDGET_MS);
+    return { ok: true, message: "left the pocket" };
+  });
+}
+
+/**
+ * Boot recovery (see `JobRunner.reclaimOrphans`): the orchestrator restarted / reconnected while the bot was dug in.
+ * True when the bot was in its pocket and an exit was attempted.
+ */
+async function leavePocket(bot: Bot, plan: PocketPlan, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted || !insidePocket(bot, plan)) return false;
+  await unsealAndLeave(bot, plan, "boot recovery");
+  return true;
+}
+
 async function digInThrough(bot: Bot, plan: PocketPlan, ctx: StepRunContext): Promise<StepResult> {
   let err: string | null = "not started";
-  await tracked(bot, "digIn", { kind: plan.kind, at: plan.rest }, async () => {
-    err = await digAndSeal(bot, plan, ctx);
-    return { ok: !err, message: err ?? "sealed in" };
-  });
-  if (stopped(bot, ctx)) return failR("cancelled", "cancelled");
-  if (!alive(bot)) return failR("died", "died while digging in");
-  if (err) {
-    // half-dug and unsealed: get out rather than wait in an open hole
-    await tracked(bot, "digIn", { escape: true }, async () => {
-      await climbOut(bot, plan);
-      return { ok: true, message: "left the half-dug pocket" };
+  let leftAtDawn = false;
+  try {
+    await tracked(bot, "digIn", { kind: plan.kind, at: plan.rest }, async () => {
+      err = await digAndSeal(bot, plan, ctx);
+      return { ok: !err, message: err ?? "sealed in" };
     });
-    return failR("unreachable", `couldn't dig in: ${err}. Try surviveNight with shelter:"hut"`);
+    if (stopped(bot, ctx)) return failR("cancelled", "cancelled");
+    if (!alive(bot)) return failR("died", "died while digging in");
+    if (err) {
+      // half-dug and unsealed: get out rather than wait in an open hole (the finally below does it)
+      return failR("unreachable", `couldn't dig in: ${err}. Try surviveNight with shelter:"hut"`);
+    }
+    log(bot, `sealed in the ${plan.kind === "down" ? "ground" : "hillside"} pocket at (${plan.rest.x}, ${plan.rest.y}, ${plan.rest.z}); waiting for dawn`);
+    const res = await waitForDawn(bot, ctx);
+    if (res === "cancelled") return failR("cancelled", "cancelled");
+    if (res === "dead") return failR("died", "died in the pocket");
+    await tracked(bot, "digIn", { leave: true }, async () => {
+      await climbOut(bot, plan);
+      return { ok: true, message: "opened the pocket" };
+    });
+    leftAtDawn = true;
+    return okR(`dug into the ${plan.kind === "down" ? "ground" : "hillside"}, sealed in, waited out the night and opened up at dawn`);
+  } finally {
+    // Every other way out (cancelled, replaced, timed out, failed, crashed) still reopens the pocket.
+    if (!leftAtDawn) {
+      try {
+        await unsealAndLeave(bot, plan, "pocket job ended early");
+      } catch (e) {
+        log(bot, `unseal crashed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
   }
-  log(bot, `sealed in the ${plan.kind === "down" ? "ground" : "hillside"} pocket at (${plan.rest.x}, ${plan.rest.y}, ${plan.rest.z}); waiting for dawn`);
-  const res = await waitForDawn(bot, ctx);
-  if (res === "cancelled") return failR("cancelled", "cancelled");
-  if (res === "dead") return failR("died", "died in the pocket");
-  await tracked(bot, "digIn", { leave: true }, async () => {
-    await climbOut(bot, plan);
-    return { ok: true, message: "opened the pocket" };
-  });
-  return okR(`dug into the ${plan.kind === "down" ? "ground" : "hillside"}, sealed in, waited out the night and opened up at dawn`);
 }

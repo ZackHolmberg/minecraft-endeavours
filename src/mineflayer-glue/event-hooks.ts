@@ -14,6 +14,7 @@ import {
   getCurrentConversationPartner,
   isAddressed,
   isStopCommand,
+  peekRoute,
   registerOnlinePlayers,
   type ChatEvent,
 } from "../orchestrator/chat-router.js";
@@ -121,14 +122,14 @@ export function attachBotEventHooks(
   bot.on("chat", (player, message) => {
     if (player === username) return;
     console.log(`${tag} chat <${player}> ${message}`);
-    maybePreempt(tag, username, state, player, message);
+    maybePreempt(tag, username, allBots, state, { channel: "chat", sender: player, message });
     dispatch(tag, username, allBots, { channel: "chat", sender: player, message });
   });
 
   bot.on("whisper", (player, message) => {
     if (player === username) return;
     console.log(`${tag} whisper <${player}> ${message}`);
-    maybePreempt(tag, username, state, player, message);
+    maybePreempt(tag, username, allBots, state, { channel: "whisper", sender: player, message });
     dispatch(tag, username, allBots, { channel: "whisper", sender: player, message });
   });
 
@@ -336,12 +337,15 @@ async function scanForUtilityBlocks(bot: Bot, username: string, tag: string, ids
 function maybePreempt(
   tag: string,
   username: string,
+  allBots: readonly string[],
   state: BotState,
-  sender: string,
-  message: string,
+  event: ChatEvent,
 ): void {
+  const { sender, message } = event;
   const tool = state.currentTool.current();
   if (!tool || !CANCELLABLE_SKILLS.has(tool.name)) return;
+  // An un-named chat that only routes because its sender is the running job's requester must not preempt (review M2).
+  if (peekRoute(username, allBots, event)?.reason === "job-requester") return;
   // Strict whole-message match: "wait, also grab coal" must not preempt.
   if (!isStopCommand(username, message)) return;
   const partner = getCurrentConversationPartner(username);
