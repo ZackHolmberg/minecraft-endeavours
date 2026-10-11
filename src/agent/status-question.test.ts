@@ -14,6 +14,11 @@ describe("isStatusQuestion", () => {
     "is that all of them?",
     "steve, got any iron yet?",
     "can you see the village from there",
+    "steve, how far along are you?",
+    "how long will that take?",
+    "how many logs do you have so far",
+    "steve, what are you up to",
+    "are you stuck?",
   ])("answers %s", (t) => expect(isStatusQuestion(msg(t))).toBe(true));
 
   it.each([
@@ -24,6 +29,18 @@ describe("isStatusQuestion", () => {
     "wait, also grab some sticks",
     "thanks",
     "steve, come here",
+    // M1: requests phrased with "?" must be queued, never swallowed by the side reply
+    "steve, grab coal instead?",
+    "how about you build first?",
+    "go to spawn?",
+    "what about iron?",
+    "steve, coal?",
+    "why don't you mine some stone",
+    "how's it going? also grab some coal",
+    "are you done? then come here",
+    "can you dig down?",
+    "how about a house?",
+    "iron?",
   ])("leaves %s to a real task", (t) => expect(isStatusQuestion(msg(t))).toBe(false));
 
   it("works on whispers", () => {

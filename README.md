@@ -73,6 +73,12 @@ Add your Minecraft username to `OPS=` in `.env`, then restart the server. In-gam
 
 The server runs in offline-mode (no Mojang auth) to support AI NPC bots, so access is gated by the **whitelist**: only usernames listed in `WHITELIST=` in `.env` can join. Add friends' Minecraft usernames there (comma-separated) and restart.
 
+## AI NPC (Steve)
+
+`Steve_AI` is a Claude Haiku-driven player you chat with ("steve, make an iron pickaxe", "build me a house", "follow me", "survive the night"). The v2 bot plans goals deterministically and runs them as background jobs, so it is fast and cheap; start it with `./scripts/botStart.sh`. Design: [ARCHITECTURE.md](ARCHITECTURE.md), [JOBS.md](JOBS.md), [SKILLS.md](SKILLS.md), [ROADMAP.md](ROADMAP.md).
+
+**Benchmark:** `npm run eval` plays a scripted human against the bot on an isolated test server (`docker-compose.test.yml`, never the live one) and scores 31 core scenarios plus a stretch suite; see [v2/EVAL.md](v2/EVAL.md). `npm test` runs the unit tests.
+
 ## Why Docker, and not Apple's `container`
 
 Evaluated September 2026 (`apple/container` 1.4.1, macOS 26.1, M4 Pro) and

@@ -172,4 +172,90 @@ describe("dig-in executor simulation", () => {
     expect(r.ok).toBe(false);
     expect(r.ok === false && r.failure.detail).toMatch(/couldn't dig in: nothing to seal/);
   }, 15_000);
+
+  // ── review M3: a sealed pocket is always reopened ──────────────────────────
+  const abortWhen = (ac: AbortController, cond: () => boolean): void => {
+    const t = setInterval(() => {
+      if (cond()) {
+        ac.abort();
+        clearInterval(t);
+      }
+    }, 10);
+  };
+  const ctxOf = (ac: AbortController): StepRunContext => ({ signal: ac.signal, radius: 64, baseline: 0, jobId: "j" });
+
+  it("cancelled while sealed in: opens the lid and climbs out (not left entombed)", async () => {
+    reset(0, 64, 0);
+    S.dawnAfter = 1e9;
+    try {
+      const plan = choosePocket(probe, { x: 0, y: 64, z: 0 })!;
+      expect(plan.kind).toBe("down");
+      const ac = new AbortController();
+      abortWhen(ac, () => S.log.some((l) => l.startsWith("place")));
+      const { createNightDeps } = await import("./night.js");
+      const r = await createNightDeps(mkBot()).digInThrough!(plan, ctxOf(ac));
+      expect(r.ok === false && r.failure.kind).toBe("cancelled");
+      expect(S.log.some((l) => l.startsWith("pillar"))).toBe(true);
+      expect(Math.floor(S.pos.y)).toBe(plan.stand.y); // back on the surface
+      expect(nameAt(plan.seal[0]!.x, plan.seal[0]!.y, plan.seal[0]!.z)).not.toBe("air"); // column refilled by the pillar, not a hole
+    } finally {
+      S.dawnAfter = 2;
+    }
+  }, 15_000);
+
+  it("cancelled in the middle of digging: the half-dug shaft is left too", async () => {
+    reset(0, 64, 0);
+    const plan = choosePocket(probe, { x: 0, y: 64, z: 0 })!;
+    const ac = new AbortController();
+    const bot = mkBot();
+    const realDig = (bot as unknown as { dig: (b: { position: Vec3; name: string }) => Promise<void> }).dig;
+    let digs = 0;
+    (bot as unknown as { dig: typeof realDig }).dig = async (b) => {
+      await realDig(b);
+      if (++digs === 2) ac.abort(); // stop requested after the second cell
+    };
+    const { createNightDeps } = await import("./night.js");
+    const r = await createNightDeps(bot).digInThrough!(plan, ctxOf(ac));
+    expect(r.ok === false && r.failure.kind).toBe("cancelled");
+    expect(Math.floor(S.pos.y)).toBe(plan.stand.y);
+  }, 15_000);
+
+  it("hillside pocket cancelled while sealed: entrance reopened and the bot outside", async () => {
+    S.fill = (x, y) => (x >= 3 ? (y <= 68 ? "dirt" : "air") : y > 63 ? "air" : "sand");
+    S.dawnAfter = 1e9;
+    try {
+      reset(0, 64, 0);
+      const plan = choosePocket(probe, { x: 0, y: 64, z: 0 })!;
+      expect(plan.kind).toBe("hill");
+      const ac = new AbortController();
+      abortWhen(ac, () => S.log.filter((l) => l.startsWith("place")).length >= plan.seal.length);
+      const { createNightDeps } = await import("./night.js");
+      const r = await createNightDeps(mkBot()).digInThrough!(plan, ctxOf(ac));
+      expect(r.ok === false && r.failure.kind).toBe("cancelled");
+      for (const c of plan.seal) expect(nameAt(c.x, c.y, c.z)).toBe("air");
+      expect(Math.floor(S.pos.x)).toBe(plan.stand.x);
+    } finally {
+      S.fill = (_x, y) => (y > 63 ? "air" : y === 63 ? "grass_block" : y >= 60 ? "dirt" : "stone");
+      S.dawnAfter = 2;
+    }
+  }, 15_000);
+
+  it("boot recovery: a bot found inside its pocket climbs out; one outside is left alone", async () => {
+    reset(0, 64, 0);
+    const plan = choosePocket(probe, { x: 0, y: 64, z: 0 })!;
+    // state after a restart mid-night: cells dug, lid placed, bot resting inside
+    for (const c of plan.dig) S.world.set(k(c.x, c.y, c.z), "air");
+    for (const c of plan.seal) S.world.set(k(c.x, c.y, c.z), "dirt");
+    S.inv = { dirt: 3 };
+    S.pos = new Vec3(plan.rest.x + 0.5, plan.rest.y, plan.rest.z + 0.5);
+    const { createNightDeps } = await import("./night.js");
+    const deps = createNightDeps(mkBot());
+    expect(await deps.leavePocket!(plan, new AbortController().signal)).toBe(true);
+    expect(Math.floor(S.pos.y)).toBe(plan.stand.y);
+
+    reset(0, 64, 0);
+    S.pos = new Vec3(plan.stand.x + 0.5, plan.stand.y, plan.stand.z + 0.5);
+    expect(await createNightDeps(mkBot()).leavePocket!(plan, new AbortController().signal)).toBe(false);
+    expect(S.log).toEqual([]);
+  }, 15_000);
 });

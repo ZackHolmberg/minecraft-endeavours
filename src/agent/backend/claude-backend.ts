@@ -88,6 +88,8 @@ import {
 } from "../skill-tools.js";
 import { getJobRunner } from "../../jobs/registry.js";
 import { buildSystemPrompt } from "../system-prompt.js";
+import { sdkIsolation } from "./sdk-isolation.js";
+import { summarizeInit, type InitLike } from "./init-summary.js";
 import { MAX_TURNS_PER_EVENT } from "../limits.js";
 import type {
   AgentBackend,
@@ -368,6 +370,8 @@ export class ClaudeBackend implements AgentBackend {
         // Only OUR skill server: without this the session also loads the account's claude.ai connectors
         // (seen: Haiku calling a Docs `batch` tool, and ~5k extra cached tokens of foreign tool definitions).
         strictMcpConfig: true,
+        // SDK isolation (see sdk-isolation.ts): no operator settings / plugins / skills / CLAUDE.md / auto-memory.
+        ...sdkIsolation(),
         // Disable Claude Code's built-in tools — the NPC's surface is the skill layer only.
         tools: [],
         allowedTools,
@@ -462,11 +466,24 @@ export class ClaudeBackend implements AgentBackend {
     return turns;
   }
 
+  private lastInitSummary = "";
+  /** One compact line proving what the SDK session actually loaded (logged on first sight and whenever it changes). */
+  private logInit(msg: InitLike, tag: string): void {
+    const line = summarizeInit(msg);
+    if (line === this.lastInitSummary) return;
+    this.lastInitSummary = line;
+    console.log(`${tag} sdk init: ${line}`);
+  }
+
   private handleMessage(msg: SDKMessage, active: ActiveSession): void {
     const { bot } = this.opts;
     const tag = `[${bot.username}]`;
 
     switch (msg.type) {
+      case "system": {
+        if (msg.subtype === "init") this.logInit(msg as unknown as InitLike, tag);
+        break;
+      }
       case "assistant": {
         const messageId = (msg.message as { id?: string } | undefined)?.id ?? null;
         if (messageId === null || messageId !== this.lastAssistantMessageId) {
@@ -854,6 +871,7 @@ export class ClaudeBackend implements AgentBackend {
           systemPrompt: buildSystemPrompt(bot.username),
           mcpServers: { [MCP_SERVER_NAME]: buildSideReplyServer(bot, () => { said = true; }) },
           strictMcpConfig: true,
+          ...sdkIsolation(),
           tools: [],
           allowedTools: [...ALLOWED_TOOL_NAMES],
           permissionMode: "bypassPermissions",
@@ -867,6 +885,7 @@ export class ClaudeBackend implements AgentBackend {
       console.log(`${tag} side reply: answering while ${getBotState(bot.username)?.currentTool.current()?.name ?? "a skill"} runs`);
       input.push(userMessage(`${context ?? ""}\n\n${content}\n\n${SIDE_REPLY_NOTE}`));
       for await (const msg of session) {
+        if (msg.type === "system" && msg.subtype === "init") this.logInit(msg as unknown as InitLike, tag);
         if (msg.type === "assistant") {
           for (const block of (msg.message?.content ?? []) as Array<{ type: string; name?: string; input?: unknown }>) {
             if (block.type === "tool_use") console.log(`${tag} [side] → ${shortToolName(block.name)}(${shortJson(block.input)})`);

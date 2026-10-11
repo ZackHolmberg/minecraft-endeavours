@@ -186,3 +186,13 @@ The streaming-input plan above is now the `session_mode: persistent` fallback. D
 - **Spin-up cost:** each task launches a CLI subprocess and rebuilds the MCP server. Not yet measured. If chat → first reply is slow, fall back to `persistent`.
 - **Turn cap:** 50 per task. On `error_max_turns`, one non-recursive "tell the player where things stand" follow-up is queued.
 - **Assistant messages stream one per content block.** Thinking, text and tool_use blocks arrive as separate assistant messages sharing a `message.id`. Count turns by unique id; the result also carries `num_turns`.
+
+---
+
+## v2 update: strict MCP, side sessions, job events (Oct 2026)
+
+- **`strictMcpConfig: true` is mandatory on every bot session** (task and side reply). Without it the SDK also loads the logged-in account's claude.ai MCP connectors next to our skill server; with `permissionMode: "bypassPermissions"` Haiku can call them (it called a Docs `batch({})` once; +5k cached tokens of foreign tool defs). **Also `settingSources: []` and `skills: []`**: when omitted the SDK loads every filesystem settings source (the operator's `~/.claude` hooks, plugins, env, CLAUDE.md files, auto-memory) and skills, i.e. a whitelisted player could ask the bot to recite the owner's private instructions; the backend logs the session's `system/init` once (`sdk init: …`) to prove what loaded. Other options in use: `tools: []` (no built-in Claude Code tools), `allowedTools` = our namespaced skills, `persistSession: false`, `maxTurns` 50.
+- **Side-reply session** (`ClaudeBackend.runSideReply`): a second, short `query()` while the task session is blocked in a skill. `effort: "low"`, `maxTurns: 3`, closed by a 15 s timer; same system prompt and **byte-identical tool definitions** (every tool except `say`/`whisper` is a refusing stub, `buildSideReplyServer`) so the prompt cache hits. It must not touch the cancellation flag, current-tool, the task queue or task telemetry.
+- **Synthetic messages:** job-end (`[job finished]` / `[job failed]`), the max-turns report request and the silent-reply nudge are pushed with `pushUserMessage` and start a fresh per-task session like a chat. They are capped (3 job events per 10 min) because each costs a Haiku task.
+- **Tool-surface stability:** 41 tools; the tool list + system prompt form the cached prefix, so any description/schema edit in `skills/registry.ts` or `system-prompt.ts` invalidates the cache once. The context block (per-task data) stays in the user message.
+- **Cache hit** measured by the eval: ~99% of input tokens across a run; cost ~$0.001-0.007 per task.

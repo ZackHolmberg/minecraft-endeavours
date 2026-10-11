@@ -366,6 +366,36 @@ describe("JobRunner state machine", () => {
     expect(h.ended).toHaveLength(0);
   });
 
+  it("boot: an unfinished night pocket job triggers leavePocket (review M3); a finished one does not", async () => {
+    const plan = { kind: "down", stand: { x: 0, y: 64, z: 0 }, dig: [], rest: { x: 0, y: 61, z: 0 }, seal: [], cost: 1, yields: 1, summary: "x" };
+    const mk = (status: Job["status"]): Job => ({
+      id: "jp",
+      kind: "build",
+      goals: [],
+      requestedBy: "A",
+      status,
+      startedAt: 1,
+      endedAt: status === "running" ? null : 2,
+      plan: mkPlan([]),
+      stepIndex: 0,
+      replans: 0,
+      progress: "digging in for the night",
+      failure: null,
+      build: { phase: "holding", holdMode: "pocket", pocket: plan } as never,
+    });
+    const run = async (status: Job["status"]): Promise<number> => {
+      const h = harness({ plans: [mkPlan([])], script: () => okRes(), load: mk(status) });
+      let calls = 0;
+      const deps = (h.runner as unknown as { deps: RunnerDeps }).deps;
+      deps.night = { timeOfDay: () => null, findBed: () => null, sleepThrough: async () => okRes(), holdInShelter: async () => okRes(), leavePocket: async () => { calls++; return true; } };
+      await h.runner.reclaimOrphans();
+      return calls;
+    };
+    expect(await run("running")).toBe(1); // restart while dug in -> interrupted -> climb out
+    expect(await run("cancelled")).toBe(1); // cancelled but the exit never finished
+    expect(await run("done")).toBe(0);
+  });
+
   it("works with the real planner on a trivially satisfied goal", async () => {
     const h = harness({ plans: [realPlan([{ item: "oak_planks", count: 1 }], { inventory: { oak_planks: 5 }, gameMode: "survival", nearbyBlocks: {}, stations: { crafting_table: false, furnace: false }, containers: [], position: { x: 0, y: 64, z: 0 }, dimension: "overworld" })], script: () => okRes() });
     const r = await h.runner.start([{ item: "oak_planks", count: 1 }], null);

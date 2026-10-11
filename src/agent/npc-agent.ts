@@ -90,7 +90,7 @@ export class NpcAgent {
       channel: event.channel,
       text: event.message,
     });
-    const interrupted = this.maybeInterrupt(event);
+    const interrupted = this.maybeInterrupt(event, decision);
     this.backend.pushUserMessage(formatUserMessage(event, decision, interrupted));
   }
 
@@ -100,18 +100,22 @@ export class NpcAgent {
    * still pushed afterwards so the model acknowledges it. Only the Claude
    * backend supports interruption; others keep the event-hooks side-channel.
    */
-  private maybeInterrupt(event: ChatEvent): boolean {
+  private maybeInterrupt(event: ChatEvent, decision: RouteMatch): boolean {
     const { bot } = this.opts;
+    // An un-named line that only routed because its sender is the job's requester ("wait", "stop that" said to a
+    // friend) must NOT cancel the job or interrupt a task (review M2). Name-addressed, whisper, follow-up and
+    // continuation routes keep working; Haiku still sees the message and can call `stop` if it was meant for it.
+    const stopCmd = decision.reason !== "job-requester" && isStopCommand(bot.username, event.message);
     // v2: a running job is "in the middle of a task" even when no Haiku event is.
     const job = getJobRunner(bot.username);
-    const stopsJob = job?.isRunning() === true && isStopCommand(bot.username, event.message);
+    const stopsJob = job?.isRunning() === true && stopCmd;
     if (stopsJob) {
       console.log(`[${bot.username}] stop command from ${event.sender} — cancelling the running job`);
       void job!.cancel(`${event.sender} said stop`);
       void runSkill(bot, "stop", undefined, () => stop(bot));
     }
     if (!(this.backend instanceof ClaudeBackend)) return stopsJob;
-    if (!this.backend.isBusy() || !isStopCommand(bot.username, event.message)) return stopsJob;
+    if (!this.backend.isBusy() || !stopCmd) return stopsJob;
     console.log(`[${bot.username}] stop command from ${event.sender} — halting and interrupting current event`);
     void runSkill(bot, "stop", undefined, () => stop(bot));
     void this.backend.interruptCurrentEvent();
@@ -174,7 +178,7 @@ export class NpcAgent {
  * *why* it's seeing this, which matters for un-named routes where silence is
  * a valid answer.
  */
-function formatUserMessage(event: ChatEvent, decision: RouteMatch, interrupted: boolean): string {
+export function formatUserMessage(event: ChatEvent, decision: RouteMatch, interrupted: boolean): string {
   const header =
     decision.channel === "whisper"
       ? `[whisper from ${event.sender}] ${event.message}`
@@ -198,6 +202,11 @@ function formatUserMessage(event: ChatEvent, decision: RouteMatch, interrupted: 
     case "follow-up":
       notes.push(
         `not named — you were just talking with them. If it's clearly not meant for you, end your turn without calling any tool; otherwise ${reply}`,
+      );
+      break;
+    case "job-requester":
+      notes.push(
+        `not named — this player is working with you (your job is running for them), but their un-named chat may be addressed to someone else. If it isn't clearly for you, end your turn without calling any tool; if it is (a request, a question for you, or telling you to stop), ${reply}`,
       );
       break;
   }

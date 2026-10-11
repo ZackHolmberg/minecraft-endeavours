@@ -21,9 +21,10 @@ import { Vec3 } from "vec3";
 import { pickDoor, pickHoe, pickScaffold } from "../../build/materials.js";
 import { placementDone, prepare, solidName, type Prepared } from "../../build/prepare.js";
 import { isAir, isReplaceable, isWaterName, type WorldGrid } from "../../build/site.js";
-import { isCraftedBlockName, isFallingBlockName } from "../../skills/structure-guard.js";
+import { isFallingBlockName } from "../../skills/structure-guard.js";
 import { planOrder, type AbsPlacement, type BuildAction } from "../../build/support.js";
 import { cellKey, dirVec, type Cell } from "../../build/types.js";
+import { chooseDirtCell, DIRT_DIG_CAP } from "../dirt-source.js";
 import type { FailureKind } from "../../planner/types.js";
 import { getItems } from "../../skills/creative.js";
 import { flyTo, isFlying, land } from "../../skills/flight.js";
@@ -723,11 +724,18 @@ class Builder {
   }
 
   /** Dig natural ground (outside the site) until the inventory holds `want` of `item` (dirt). */
+  /** Ground blocks dug for self-supplied dirt so far (capped at DIRT_DIG_CAP, review M4). */
+  private dirtDug = 0;
+
   private async acquire(item: string, want: number): Promise<boolean> {
     const maxTries = Math.max(10, Math.ceil(want * 1.6)); // a dirt shelter needs ~60 blocks, a portal's scaffold 1-3
     let failed = 0;
     for (let tries = 0; tries < maxTries && (this.inv()[item] ?? 0) < want && failed < 8; tries++) {
       if (this.stopped()) return false;
+      if (this.dirtDug >= DIRT_DIG_CAP) {
+        this.lastError = `dug the ${DIRT_DIG_CAP}-block limit of natural ground for this build`;
+        break;
+      }
       const c = this.pickDigCell();
       if (!c) {
         this.lastError = "no diggable ground near the site";
@@ -739,39 +747,19 @@ class Builder {
         failed += 1;
         continue;
       }
+      this.dirtDug += 1;
       if (!(await this.collect(item, before))) failed += 1;
       else failed = 0;
     }
     return (this.inv()[item] ?? 0) >= want;
   }
 
-  /** Nearest plain dirt/grass ground cell (open above, no player build next to it) clear of the site. */
+  /** Nearest natural dirt/grass ground cell clear of the site and of anything a player built (see ../dirt-source.ts). */
   private pickDigCell(): Cell | null {
-    const { bot } = this;
-    const me = bot.entity.position;
-    let best: { c: Cell; d: number } | null = null;
-    for (let dx = -7; dx <= 7; dx++) {
-      for (let dz = -7; dz <= 7; dz++) {
-        for (let dy = -2; dy <= 1; dy++) {
-          const c = { x: Math.floor(me.x) + dx, y: Math.floor(me.y) + dy - 1, z: Math.floor(me.z) + dz };
-          const n = this.blockName(c);
-          if (n !== "grass_block" && n !== "dirt") continue;
-          if (dx === 0 && dz === 0 && dy <= 0) continue; // never the block underfoot: digging it only digs the bot into a pit
-          if (c.x >= this.origin.x - 3 && c.x < this.origin.x + this.dims.x + 3 && c.z >= this.origin.z - 3 && c.z < this.origin.z + this.dims.z + 3) continue;
-          const above = this.blockName({ ...c, y: c.y + 1 });
-          if (above === null || !(isAir(above) || isReplaceable(above))) continue;
-          const crafted = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]].some(([ax, ay, az]) => {
-            const q = this.blockName({ x: c.x + ax!, y: c.y + ay!, z: c.z + az! });
-            return q !== null && isCraftedBlockName(q);
-          });
-          if (crafted) continue;
-          // fresh grass tops first: a second block down the same column deepens a pit instead of spreading the digging
-          const d = Math.hypot(c.x + 0.5 - me.x, c.z + 0.5 - me.z) + Math.abs(c.y - (Math.floor(me.y) - 1)) + (n === "dirt" ? 6 : 0);
-          if (!best || d < best.d) best = { c, d };
-        }
-      }
-    }
-    return best?.c ?? null;
+    const o = this.origin;
+    return chooseDirtCell((x, y, z) => this.blockName({ x, y, z }), this.bot.entity.position, {
+      site: { minX: o.x, maxX: o.x + this.dims.x - 1, minZ: o.z, maxZ: o.z + this.dims.z - 1 },
+    });
   }
 
   /** Normal end of a build: remove what is still standing. Failures stay on the list (never forgotten). */

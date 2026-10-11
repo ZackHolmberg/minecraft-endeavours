@@ -28,6 +28,7 @@ import {
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { sdkIsolation } from "../src/agent/backend/sdk-isolation.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Define a stub tool shaped like our real `observeSurroundings` skill.
@@ -123,6 +124,9 @@ async function runQuery(prompt: string, label: string): Promise<TraceSummary> {
       model: "claude-sonnet-4-6",
       systemPrompt: SYSTEM_PROMPT,
       mcpServers: { "minecraft-skills": skillsServer },
+      // Isolation (D16): only our MCP server, no filesystem settings / skills of the operator's account.
+      strictMcpConfig: true,
+      ...sdkIsolation(),
       // Disable Claude Code built-in tools — our NPC only sees skill tools.
       tools: [],
       // Auto-allow our skill tools so the agent runs unattended.

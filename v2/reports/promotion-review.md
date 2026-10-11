@@ -89,3 +89,35 @@ Read-only static review; nothing was run. "Unverified" marks things that need on
   - Job events are capped at 3 per 10 min.
   - Relocation is capped at 2 per job.
   - Side replies are one-shot, with a 15 s close.
+
+## Fixes
+Worktree `mcv2-dev` (branch `v2-fixes`, uncommitted). `tsc` (src + web/ui) clean, `vitest` 401 pass, `*.check.ts` stubs pass. The eval (5 scenarios, `dev-prom` and `dev-prom2`) passed 5/5 in each run.
+- **H1 fixed, and it was bigger than reported.** New `agent/backend/sdk-isolation.ts` is spread into both `query()` calls (task and `runSideReply`) and into `spikes/sdk-spike.ts` (L4, plus `strictMcpConfig`).
+  - Probe against SDK 0.3.293. With no options the session loaded the operator's `engineering` plugin and 41 skills, including `delegation-audit`. `settingSources: []` cut that to 17 built-in skills and 3 built-in plugins.
+  - It did NOT stop auto-memory. Haiku quoted the operator's `MEMORY.md` index (DuckDNS host, panel choices) verbatim.
+  - Closed with `settings.autoMemoryEnabled:false` plus env `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. With that, the model reports no memory or CLAUDE.md.
+  - Belt and braces: `skills: []`, `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`, `CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1`.
+  - The model still sees the stock git-worktree and stash notes from the environment section. That is harmless.
+- **Init log** (`init-summary.ts`, logged once per distinct value): `sdk init: tools=41 foreign=0 mcp=[minecraft-skills] plugins=3 skills=3 slash=39[design,doctor,plugin-authoring,advisor,agents] agents=5`.
+  - `foreign=0`: every tool is `mcp__minecraft-skills__*`; `tools: []` means there is no Skill or Bash tool.
+  - The leftover skills, slash commands and agents are built-in Claude Code ones with no user content. They can't be invoked.
+- **Cache vs `v2-s4`** (same 5 scenarios; read / create tokens per call): inv_question 20-22k / 115-1.8k vs 19.4k / 0.7k; status_midtask 16-18k / 1.2-1.6k vs 16.7k / 0.7k; survive_night 13.5-16k / 1.4-1.7k vs 12.9k / 0.6k; int.stop 15-16k / 1.1-1.3k vs 14.4k / 0.5k.
+  - Reads are about 5-8% lower and creates are about half. Hit rate is 95-97%, up from 91-94%.
+  - The 13-19k floor is the system prompt, the 37 tool definitions and the context block, not leaked settings.
+- **M1**: `isStatusQuestion` now needs a positive status shape (how's it going / what are you doing / how far / are you done / got X yet / status...) AND no request cue anywhere (instead, how about, what about, let's, please, also, then, or any imperative verb). A bare "?" no longer qualifies. A message that fails the classifier is queued normally, so nothing is swallowed. Tests added for "grab coal instead?", "go to spawn?", "what about iron?" and compounds.
+- **M2**:
+  - `npc-agent.ts` has a `job-requester` routing note: "may be addressed to someone else... end your turn without calling any tool; if it is for you, reply".
+  - A `job-requester` message never triggers `maybeInterrupt`, and `maybePreempt` in `event-hooks.ts` skips it too (new side-effect-free `peekRoute`). Name, whisper, follow-up and continuation stops still work.
+  - New per-player cap of `UNNAMED_CAP_PER_MIN = 6` routed un-named chats per minute, applied to the continuation, follow-up and job-requester routes. A bare stop through follow-up or continuation is never capped.
+  - Tests: `chat-router.test.ts` and new `npc-agent.route.test.ts`.
+- **M3**: `digInThrough` now has a `try/finally`. Any exit that isn't a dawn leave (cancel, replace, timeout, failure, mid-dig stop) runs `unsealAndLeave`.
+  - The unseal is bounded to 17 s, under the runner's 20 s `STEP_GRACE_MS`, and runs via `tracked`, which resets the latched stop flag. It is skipped if the bot is dead or outside the pocket cells.
+  - Boot: `JobRunner.reclaimOrphans` also calls the new `night.leavePocket(plan)` when job.json holds a non-done pocket job. It acts only if the bot's feet are in a pocket cell.
+  - Simulated-world tests: cancel while sealed, cancel mid-dig, hillside, and boot recovery in and out of the pocket. Runner test for the boot hook.
+- **M4**: new pure `jobs/dirt-source.ts` (`chooseDirtCell`), wired into `Builder.pickDigCell`.
+  - Rules: nothing crafted or player-made within 4 blocks (broad `isPlayerBlock`: furnace, chest, torch, cobblestone, rails...), two natural solid blocks below (no 1-thick floor), nothing adjacent (3x3x3) that is farmland, dirt_path, sapling or crops, plus the old site-footprint and underfoot rules.
+  - Slope cells are preferred. Total capped at `DIRT_DIG_CAP = 80` per build (a hut needs ~57+).
+  - Side effect: a hut requested inside a base will fail with "no diggable ground" instead of digging up the yard.
+- **L2**: after more than 3 consecutive follow-up routes, a bot reply no longer renews the 60 s window; any other route resets the chain. **L3**: `isDirectAddress` is anchored to the routing-note line, and a side-reply `say` no longer stamps the main task's `firstReplyAt`. **L4**: done (see H1).
+- **Not done**: L1 (wider player-block predicate for pockets), L5 (relocation vs POIs), L6 (`Steve_v2` to `Steve_AI` rename at cutover) and ignoring senders without a player entity.
+- **Hunks outside my lane**: `src/jobs/steps/build.ts` (`pickDigCell` body, the `dirtDug` cap in `acquire`, one import) and `src/jobs/runner.ts` (`reclaimOrphans`, plus an optional `NightDeps.leavePocket`).

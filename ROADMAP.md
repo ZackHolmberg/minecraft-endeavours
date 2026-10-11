@@ -1,161 +1,75 @@
 # Roadmap
 
-Where the project is going. Items we've intentionally deferred from current work, with enough technical context to pick them up later without re-deriving the reasoning.
+What is still open, with enough context to pick items up cold. State as of v2 `032b0e4` (benchmark `v2-s4`: 57/60 core, 95%; owner live test: "nearly flawless, lightning fast"). Architecture: [ARCHITECTURE.md](ARCHITECTURE.md); job/planner/builder reference: [JOBS.md](JOBS.md); decision history: [v2/DECISIONS.md](v2/DECISIONS.md); measurement: [v2/EVAL.md](v2/EVAL.md).
 
 ## Versioning
 
-- **v0.1** — Plain Paper server in Docker with DuckDNS dynamic DNS. ✅ Shipped.
-- **v0.2** — First AI NPC: one bot, chat-driven (name-mention / `/msg` / `@all`), partial skill catalogue (8 of 24 skills), offline-mode + whitelist. ✅ Shipped. See [ARCHITECTURE.md](ARCHITECTURE.md).
-- **v0.3** — In-terminal dashboard (4 phases) + the full slice-3 skill follow-ons. ✅ Shipped. The original four dashboard phases landed on `main` (`cc0b0d3 → 0d2e174`), and the priority / follow-on / tool-use / survival skill batches landed on top (`37583ae → f695c10`), bringing the catalogue from 8 to 28 registered skills and closing the iron-armor production loop end-to-end.
-- **v0.3+** — Backlog below. No clear next version tag; items are sized so they can land independently.
+- **v0.1** Paper + DuckDNS. **v0.2-v0.5** single Haiku bot with per-step tool calls, dashboard, panel, creative mode (tag `v1`).
+- **v2** goal planner + background jobs + blueprint builder + honest movement primitives + eval harness. Replaces v1 as the live bot at cutover (D17).
 
----
+## Before cutover (delete this section once done; from `v2/STATUS.md` and D17)
 
-## Backlog
+1. Full core run on the final commit (`v2-s5`, incl. `conv.chat_while_following`); expect >= the `v2-s4` numbers and keep 0 protected blocks broken, 0 pillar-to-travel.
+2. `v2-s4` small fixes: **build placement retry** when the server refuses one placement (`build_house` r1 ended 80/82; today only the next whole attempt retries); **remember seen chests beyond 16 blocks** (`conv.followup_chest` r2: the chest was outside the 16 m `nearby containers` scan after chopping).
+3. Independent review of 2c-A, 2c-B, the quick shelter and the follow job: done (`v2/reports/promotion-review.md`); its findings:
+   Findings of `v2/reports/promotion-review.md` (static review of `032b0e4`): fix or consciously defer H1 `settingSources`/`skills` isolation (fix present in the working tree, verify it landed), M1 side reply swallowed requests phrased as '?' (`isStatusQuestion` narrowed to positive status shapes in the working tree; verify it landed), M2 `job-requester` routing has no "not for you" routing note, no per-sender chat cap, and a bare 'stop'-like line from the requester cancels a follow/night job, M3 a pocket job cancelled/timed out while sealed leaves the bot entombed (needs a bounded `climbOut` and a boot check), M4 the hut fallback can dig ~90 dirt blocks from the requester's lawn, L1-L6 (pocket player-made detection, follow-up TTL loop with other bots, side-reply bookkeeping, `sdk-spike.ts` isolation, relocation ignoring POIs, `bots.yml` rename).
+4. Security review of v2's `src/web/**` diff (verdict in the promotion review: PASS; one file, display-only). The panel is internet-facing.
+5. Cutover per D17: merge `v2` into `main` in the main checkout without switching branches (+ `npm ci`); `config/bots.yml` -> `Steve_AI` with `aliases: [steve]` (keeps live identity, whitelist, memory dir); install `v2/CLAUDE.md.next` as `CLAUDE.md`; rebuild the panel UI and restart it via its launchd service (the one live-panel touch); world backup first; start the bot from `main`; push with owner OK. Rollback: revert commit + bot restart.
 
-### Creative-mode + New world live tests
+## Measured gaps (benchmark & stretch)
 
-**Creative:**
-1. Switch the bot to creative from the panel. The log should show the mode change and the next context should say `CREATIVE`.
-2. "Build me a small house": `getItems` then `placeBlocks`, with no gathering.
-3. Watch for phantom items (Paper silently rejecting creative slot writes) and for movement kicks during flight.
-4. "Come up here" from a roof.
-5. Switch back to survival mid-hover: it should fall, and the reflexes should resume.
+- **Core failures left** (`v2-s4`): `build_house` r1 (placement refusal), `conv.followup_chest` r2 (chest beyond 16 m), `t3.survive_night` r2 (death before the quick shelter existed; 2/2 live after). Single runs are noisy: use `--repeat` for any decision.
+- **Stretch suite not yet run on v2:** `t4.iron_kit` (full iron kit; target >= 2/3 runs, < 20 min, <= 10 turns), `t4.diamonds` (target >= 50%; needs underground exploring without torches, lava/cave danger), `t4.portal_scratch` (obsidian from scratch needs a water/lava bucket flow and flint: the planner can make neither). Run at milestones: `npm run eval -- --suite stretch`.
+- Tracked targets (`v2/STATUS.md`): core >= 80% (met), tier 2 >= 85% (100% at `v2-s4`), 0 deaths outside combat scenarios (1 pre-quick-shelter), iron pickaxe from empty < 5 min and <= 6 turns (met: ~130 s, 5 turns), p50 first reply <= 3 s (met: 2.2 s).
 
-**New world:** do one supervised run from the panel with a known seed. Confirm:
-- the seed applied (the itzg image rewrites `server.properties` from env);
-- `backups/worlds/<ts>/` and `memory-archive/<ts>/` exist;
-- the bot restarted with empty memory.
+## Engineering backlog
 
-**Follow-ups:** add a `gamemode` telemetry event; add a creative line to the hybrid executor context.
+- **Pathfinder master pin.** npm `mineflayer-pathfinder` 2.4.5 is from 2023; master (`d773d15` when checked) has Sep-Oct 2026 fixes (A* heap bug, corner cuts, water, door nodes, a `createHuman` controller) and a **semantics change** (`goto` rejects unreachable goals). Do it as its own benchmarked slice so it isn't confounded with behaviour changes; put `createHuman` open-ground walking behind a flag. `doors.ts` and `pathfinder-config.ts` patch 2.4.5 internals and may need rework.
+- **Prompt / tool-surface trim.** The system prompt grew with each slice (job, build, side-reply, creative sections) and 41 tools are exposed. A full rewrite and a smaller surface (do `placeBlock`, `smelt`, `craft` and the interaction tools still earn their place now that jobs sequence the work?) is deferred. Measure turns, tokens and cache hit before/after; the prefix must stay byte-stable.
+- **Planner coverage.** Mob drops (leather, string, beef, gunpowder), fishing, trading, farming loops/bonemeal, blast furnace/smoker/smithing/brewing/enchanting, dye/wool cycles, buckets, Nether/End routing, netherite: all "unresolved" today, so `achieve` refuses with a reason. A plan cache on disk, use of world-memory **sightings** (`WorldView.sightings` is unused) and a spatial world model would cut re-scan time (a view build costs 0.7-1.4 s).
+- **Explore.** Torches/lighting underground, an ore-exposure filter, mob handling beyond reflexes, digging up, per-step progress in the context from live inventory.
+- **Combat.** Only `attack`/`flee` and reflexes exist: no planned fights, no armor-up logic, no ranged. Needed for mob-drop gathering and safe cave work.
+- **Night paths.** Live-verified: the `down` pocket (2/2, 0 deaths). Sim-only: the `hill` pocket, the hut fallback after `planPocket` returns null (incl. the whole hut hold phase: enter, close door/plug, torch, wait, leave), the bed path (`sleepIn`, re-sleep), stone-ground pockets without a pickaxe, the melee guard and `build`/`digIn` in the swing reflex's skip list, 58-block dirt digging via `acquire`. Risk: on plains mobs arrive ~2 min after dusk and a hut takes ~2.5 min; consider walls-before-roof or arrow cover for skeletons.
+- **Builder.** Flat roof only, no interior light, plain glass windows, no farm fence/harvest/replant, sizes beyond the defaults untested live, site radius 20 / slope <= 1 / trees never cleared, portal scaffold recovery sim-tested only. Review leftovers: pit refill in `pickDigCell`, portal non-flammable radius.
+- **Housekeeping.** `skill` telemetry from job steps lands in an overlapping Haiku task's counters; Haiku read-only tools reset the shared current-tool entry while a step runs (dashboard DOING can blank); registry-first imports still hit a circular-import edge (`Cannot access 'SKILL_SPECS'`); `world-view` `count` doc.
+- **Harness.** The eval Tester walks to dropped items within 6 blocks, which made `conv.two_part` wander (consider `walkItems=false` for non-give scenarios); add a scripted scenario that fires `runSideReply` ("mine 20 stone", then "how's it going?") and one for a vanishing player (follow search legs are unit-tested only).
+- **Dead code.** `local`/`hybrid` backends, `src/local-model/`, `scripts/llmStart.sh|llmStop.sh` and the hybrid prompts in `system-prompt.ts` are unused (Haiku-only policy). Remove when nobody wants them.
+- **CI.** `npm test` (vitest, ~360 tests) and `npm run typecheck` exist; nothing runs them on push.
 
-### v0.5 live-test pass (Haiku + player-likeness)
+## Live-test gaps (never exercised in real play)
 
-**Run `./scripts/botReport.sh --since run` after each play session.** Its flags answer most of the items below: cache hit, first-reply latency, the turn cap, stuck spots, and skill failure rates. The telemetry and dashboard pages are shipped (see ARCHITECTURE.md *Telemetry & insight*).
+- Side reply (`runSideReply`) against a blocking tool; follow lost-sight search legs; `deliverTo` with large or odd items; `build` beyond default sizes; relocation on a real lake map beyond `t2.coal`.
+- **Creative:** switch from the panel (context says `CREATIVE`); "build me a small house" (`getItems`, `placeBlocks`); phantom items if Paper rejects unacknowledged creative slot writes; kicks from flight; "come up here" from a roof; switching back to survival mid-hover. Add a `gamemode` telemetry event.
+- **New world** (panel action): one supervised run with a known seed; confirm the seed applied, `backups/worlds/<ts>/` and `memory-archive/<ts>/` exist, the bot restarted with empty memory.
+- **Reconnect of an active agent + job:** kill the MC container mid-turn and mid-job (`docker compose stop minecraft && start`); expect job `interrupted`, a fresh runner, no stray scaffolds.
+- **Rate-limit cooldown** (`status: rejected` -> whisper and drop) has never fired live; read the log the first time the 5-hour window burns. The dev team shares that window (D8).
+- After each play session run `./scripts/botReport.sh --since run`; its flags (cache hit, first-reply latency, turn cap, stuck spots, skill failure rates) answer most "how did it go" questions.
 
-The v0.5 pass (Haiku switch, per-task sessions, doors, pillar rewrite, structure guard, reflexes, crafting-count fix, disk persistence, `deaths[]` capture) is typecheck-clean but **not run in-game**. Highest-risk items to verify first:
+## Dashboard / telemetry polish
 
-- **Per-task session cost:** chat → first `say` latency (a CLI subprocess per task), and `cache_read` on the 2nd task ≈ system prompt + tools. If either is bad, set `session_mode: persistent`.
-- **Stop:** "steve stop" mid-`placeBlocks`/`mineBlocks` halts, acks, and the next task runs normally ("wait, also…" must *not* stop).
-- **Doors:** in/out of a closed-door house, double door, fence-gate pen; closes behind; iron door treated as wall; no open/close flapping in a 1-wide corridor.
-- **Pillar:** `pillarUp(5)` on flat ground and in a 1×1 hole.
-- **Structure guard:** `mineBlock oak_planks` next to a house refuses; trees still chop.
-- **Crafting counts:** 1 log → 4 planks; 2 planks → 4 sticks; pickaxe with no table nearby places one.
-- **Follow-ups from disk:** "steve get wood" → "now put it in the chest"; survives an orchestrator restart.
-- **Reflexes:** faces you when idle, eats at food ≤14, wears dropped armor, swings back at a zombie.
-- **Death:** `deaths[]` entry with cause; `lastDeath` in the context block.
+Narrow terminals clip the Perf/Skills tables below ~120 columns; tune the "silent tasks" (>30%) and cost-per-task ($0.05) flag thresholds after real sessions; per-bot log filtering; SDK subprocess stdout is not captured in the ring buffer; cost projection to the 5-hour window; no dashboard page for the current job (the panel's Events page renders job/step/recovery/surface events display-only).
 
-### Field-untested code paths
+## Pending catalogue skills
 
-Implementations exist; never run in live play. Each is a real risk surface.
+`findBlock`, `findEntity` (redundant with `observeSurroundings`), `lookAt` (cosmetic), `wait`. One tiny slice if ever needed.
 
-- **Reconnect of an active agent session.** The supervisor's reconnect logic existed before slice 3, but slice 3 added the per-bot agent lifecycle (`registerAgent` replaces the existing one and `stop()`s it). Tearing down a live SDK session mid-conversation and rebuilding it on the new bot connection isn't field-tested. Plan: kill the MC container mid-turn (`docker compose stop minecraft && docker compose start minecraft`) and confirm a clean rebuild on the new bot connection. Only ten minutes of work, prevents a real outage class.
-- **Rate-limit cooldown (`status: rejected` → whisper-and-drop).** Pro quota was healthy through all live testing — the rejected branch hasn't actually run. Will exercise itself naturally the first time the 5-hour window burns. No code action; just be ready to read the log when it happens.
+## Larger deferred features
 
-The 30s continuation heuristic was field-tested via the `026836e` fix; if you've seen `continuity armed for <player>` followed by `ROUTE chat→<bot> reason=continuation`, it's done.
+- **Personas / multi-bot differentiation:** a `persona` string in `bots.yml` interpolated into the system prompt (~30 LOC). Earns its keep at bot count > 1.
+- **Multi-NPC coordination:** per-bot `world.json` today; light (talk via chat) -> medium (shared container view) -> heavy (task delegation, resource mutex).
+- **Ambient overhearing:** every nearby chat is a potential Claude call; reconsider only off the Pro window or with a cheap pre-filter.
+- **Owner-based safety / griefing limits:** `owner` in `bots.yml`; gate destructive skills (`attack` on a player, breaking non-owner blocks). Closer than it looks: `attack({entity: "<player>"})` works today, and `deliverTo`/`getItems` refuse only an operator-item denylist but will hand over any other creative item in one call.
+- **Right-click / trade GUI / sign-and-book interactions:** needs a Paper plugin bridging events to the orchestrator.
+- **Direct Anthropic API runtime:** swap `@anthropic-ai/claude-agent-sdk` for `@anthropic-ai/sdk` with explicit caching if Pro limits or off-host deployment demand it; skills, jobs and routing don't change.
+- **Orchestrator as a compose service** (Dockerfile + service; `MC_HOST=minecraft`).
+- **Background / autonomous goals** (idle chores, base upkeep) on top of the job runner; needs the plan cache and sightings above.
 
-### Test scaffolding
+(Dropped: Opus escalation, which contradicts the Haiku-only decision; conversation persistence, which shipped as `conversation.json`.)
 
-No test suite exists today. ARCHITECTURE.md claims "skills are unit-testable independently of Claude" but no tests prove it. With 28 registered skills, the next refactor that touches `runSkill`, the harness, or any shared helper (item-naming, world-knowledge, pathfinder wrapping) could silently break several skills with no signal until live play surfaces the bug.
+## Recommended order
 
-**Minimal start:** `vitest` + 6 smoke tests for the most-touched skills (`mineBlock`, `craft`, `smelt`, `depositToChest`, `equipItem`, `observeSurroundings`) using a mineflayer-bot stub. ~4 hours including the stub helper.
-
-**Follow-up:** GitHub Actions CI running `npm run typecheck` + `npm test` on push. ~30 min once tests exist.
-
-### Pending catalogue skills
-
-From SKILLS.md status table. None gate real play; bundle as one cleanup slice if/when a player interaction surfaces the need.
-
-- `findBlock` / `findEntity` — mostly redundant with `observeSurroundings.nearbyBlocks` / `nearbyEntities`. Marginal value; ~30 LOC each.
-- `lookAt` — cosmetic. `goTo` and the activate skills both `lookAt` internally as needed. ~15 LOC.
-- `wait` — literal `await sleep(seconds)`. Model can express "do nothing" by not calling tools. ~10 LOC.
-
-### Dashboard polish (post-v0.3)
-
-- **Narrow terminals** — below ~120 columns the Perf / Skills tables clip on the right (no scrolling).
-- **Flag tuning** — the "silent tasks" (>30%) and cost-per-task ($0.05) thresholds in `src/report/flags.ts` are guesses for Haiku; tune after the first real sessions.
-- **Telemetry coverage for local/hybrid** — `LocalBackend` emits no task events; hybrid executor skills have `taskId: null`. Low priority while the bot is Haiku-only.
-- **Per-bot log filtering** — log pane shows orchestrator-wide; no `[username]`-prefix filter on the active tab.
-- **SDK subprocess stdout capture** — Claude Code subprocess's own stdout bypasses the ring buffer; only `console.*` from this process is captured. Pipe subprocess streams into the ring buffer if a bug ever hides there.
-- **Cost projections** — `total_cost_usd` is shown per-turn and per-session; no projection to the 5-hour-window likely spend.
-- **Pro window precision** — `rate_limit_info.utilization` may only populate at `allowed_warning`. Dashboard falls back to `status + resetsAt countdown` until `utilization` shows up. Verify in live use.
-
-### Larger deferred features
-
-Bigger swings, each with a technical sketch. None of these are small slices.
-
-#### Personas / multi-bot differentiation
-
-**Why deferred:** v0.2 / v0.3 ship with a single bot. Username alone is sufficient identity for one bot; persona is overkill. Earns its keep when bot count > 1.
-
-**Approach:** Add `persona` (one-sentence character description) to `config/bots.yml`. Injected into the per-bot system prompt to bias voice and default preferences (*"friendly and chatty, loves mining"* vs. *"terse, prefers building"*). Doesn't change capability — only tone and how vague requests get defaulted. Trivial: a string field in config, one interpolation point in the system-prompt builder. ~30 LOC.
-
-#### Ambient overhearing
-
-**Why deferred:** Highest-cost interaction mode (every nearby chat is a potential Claude call). Cut from v0.2 to fit Pro subscription rate limits.
-
-**Reconsider when:** (a) we move to direct Anthropic API + pay-per-token, or (b) measured Pro usage is consistently well under the 5-hour window cap with room to spare.
-
-**Approach:** Bots subscribe to nearby public chat within a configurable proximity radius. A cheap pre-filter — keyword / proximity / recency heuristic, possibly run through Haiku 4.5 — gates whether to invoke the main loop. Most overheard chat won't pass.
-
-#### Owner-based safety / griefing limits
-
-**Why deferred:** Friends server + whitelist already encodes trust. Per-bot ownership adds complexity without clear benefit at current scope.
-
-**Reconsider when:** opening the server to wider play, or when bots gain meaningfully destructive capabilities (breaking player-placed blocks, attacking players — `attack({ entity: "<player_name>" })` already works today, so this is closer than it looks).
-
-**Approach:** Add `owner` (Minecraft username) to `config/bots.yml`. Some skills become owner-gated — e.g., breaking blocks placed by non-owners requires confirmation, or `attack` on a player is owner-only. Sits in the orchestrator as a permission check around skill dispatch, before the call reaches mineflayer.
-
-#### Right-click / trade GUI / sign-and-book interactions
-
-**Why deferred:** Requires a server-side Paper plugin (Java, build cycle, server restart). Chat + `useOnEntity` cover the v0.3 surface.
-
-**Approach:** Paper plugin that exposes events for right-click-on-entity, trade attempts, and book / sign reads, then bridges them to the orchestrator over a local socket or HTTP. Bots gain new interaction *modes* without changes to the skill layer — the orchestrator just routes new event types to the same NPC agents.
-
-#### Multi-NPC coordination
-
-**Why deferred:** Each NPC has its own `world.json`. Two Steves in the same base would re-learn the chest contents independently. Not relevant until bot count > 1.
-
-**Approach:** Range of options:
-- **Light:** Bots can `say` to each other via public chat (already supported — Steve hears Brick's chat as ambient if ambient lands).
-- **Medium:** Shared world-knowledge store keyed by location (e.g., one merged `containers[]` view across all bots at the same base).
-- **Heavy:** Joint task delegation, mutex on shared resources, explicit handoff protocol.
-
-Pick a level based on friction observed once a second bot is added.
-
-#### Direct Anthropic API runtime (instead of Agent SDK + Pro)
-
-**Why deferred:** Pro subscription via Agent SDK covers current scope. Architecture is explicitly designed to make this swap cheap.
-
-**Reconsider when:** (a) ambient overhearing or multi-bot use regularly hits Pro rate limits, (b) we need finer per-call control over model selection / caching than the Agent SDK exposes, or (c) we want to deploy off this Mac (Agent SDK auth is host-bound to where Claude Code is installed).
-
-**Approach:** Swap the agent runtime layer in the orchestrator from `@anthropic-ai/claude-agent-sdk` to `@anthropic-ai/sdk`. Skill layer, behavior rules, interaction modes, server setup — all unchanged. New billing: `ANTHROPIC_API_KEY` in `.env`. Implement explicit prompt caching on system + tool defs.
-
-#### Conversation memory persistence across restarts
-
-**Why deferred:** The two-tier memory model already persists world knowledge by design (`world.json` per bot). Conversation memory — dialog history, recent intent, in-flight clarification — is held in-process by the Agent SDK and lost on restart. Acceptable; addressable later.
-
-**Approach:** Persist per-bot conversation state to disk alongside `world.json` under `data/orchestrator/memory/<bot-username>/`. Likely JSON for short-term history and Haiku-summarized long-term notes. Orchestrator loads on bot spawn, flushes on graceful shutdown plus periodic checkpoints. Implementation depends on whatever the Agent SDK exposes for serializing / restoring conversation state — pin down when starting.
-
-#### Heavy-reasoning escalation (Opus 4.7 on demand)
-
-**Why deferred:** Sonnet 4.6 + Haiku 4.5 cover current needs. Opus 4.7 is held in reserve.
-
-**Approach:** Two paths:
-- **Claude self-escalates** via a `requestHeavyReasoning(why)` skill that switches the model for the next turn. Cleanest, but requires the SDK to support per-call model switching cleanly.
-- **Orchestrator heuristic escalation** — detect complexity (large `mineBlock` counts, multi-step build plans, repeated skill failures) and route to Opus automatically.
-
-Probably implement the first; fall back to the second if Claude doesn't self-escalate well.
-
----
-
-### Recommended order
-
-In rough priority for picking the next slice:
-
-1. **v0.5 live-test pass** (above) — everything shipped in the Haiku/player-likeness pass is unverified in-game.
-2. **Reconnect live test** — no code; just kill MC mid-turn and confirm.
-3. **Minimal test scaffolding (vitest + 6 smoke tests + CI)** — pays off the moment the next refactor lands.
-4. **Pending catalogue skills (`findBlock` / `findEntity` / `lookAt` / `wait`)** as one tiny slice — closes the v0.2 catalogue to 100%.
-
-Everything else stays parked until a specific use case earns it.
+1. Finish the pre-cutover list and cut over (D17).
+2. First live session on `main`; run `botReport.sh`; fix what the live-test gaps turn up (side reply, reconnect, creative).
+3. Stretch suite baseline (`t4.*`), then the pathfinder master pin as its own benchmarked slice.
+4. Prompt/tool-surface trim (benchmarked), planner coverage for mob drops + combat, night-path live verification.
+5. Everything under *Larger deferred features* stays parked until a use case earns it.

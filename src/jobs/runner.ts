@@ -77,6 +77,8 @@ export interface NightDeps {
   planPocket?: () => PocketPlan | null;
   /** Dig the planned pocket from inside out, seal it, wait for dawn, open up and step out. */
   digInThrough?: (plan: PocketPlan, ctx: StepRunContext) => Promise<StepResult>;
+  /** Boot recovery: if the bot is still inside a pocket from an earlier run (restart while dug in), open it and climb out. True when it acted. */
+  leavePocket?: (plan: PocketPlan, signal: AbortSignal) => Promise<boolean>;
 }
 
 export interface BuildRunContext extends StepRunContext {
@@ -492,21 +494,30 @@ export class JobRunner {
     return { origin: b.origin, facing: b.facing, params: b.params, placed: b.placed, total: b.total };
   }
 
-  /** Boot / next start: remove scaffold blocks an earlier run left standing (persisted in job.json). Best effort, bounded. */
+  /**
+   * Boot / next start: remove scaffold blocks an earlier run left standing (persisted in job.json), and (M3) climb out of a
+   * night pocket the bot is still sealed in after a restart. Best effort, bounded.
+   */
   reclaimOrphans(): Promise<void> {
     const job = this.job;
     const build = this.deps.build;
-    if (this.disposed || this.reclaiming || !job?.scaffolds?.length || this.isRunning() || !build?.reclaim) return this.reclaiming ?? Promise.resolve();
+    const night = this.deps.night;
+    const scaffolds = job?.scaffolds?.length && build?.reclaim ? job.scaffolds : null;
+    const pocket = job && job.status !== "done" && job.build?.holdMode === "pocket" && job.build.pocket && night?.leavePocket ? job.build.pocket : null;
+    if (this.disposed || this.reclaiming || this.isRunning() || (!scaffolds && !pocket)) return this.reclaiming ?? Promise.resolve();
     const ctrl = new AbortController();
     this.reclaimCtrl = ctrl;
     const timer = setTimeout(() => ctrl.abort(), RECLAIM_WAIT_MS);
     this.reclaiming = (async () => {
       try {
-        const left = await build.reclaim!(job.scaffolds!, ctrl.signal);
-        job.scaffolds = left.length > 0 ? left : undefined;
-        this.persist(job);
+        if (pocket) await night!.leavePocket!(pocket, ctrl.signal);
+        if (scaffolds) {
+          const left = await build!.reclaim!(scaffolds, ctrl.signal);
+          job!.scaffolds = left.length > 0 ? left : undefined;
+          this.persist(job!);
+        }
       } catch (err) {
-        console.warn(`[${this.deps.username}] scaffold reclaim failed:`, err);
+        console.warn(`[${this.deps.username}] orphan reclaim failed:`, err);
       } finally {
         clearTimeout(timer);
         this.reclaimCtrl = null;

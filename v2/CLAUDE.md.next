@@ -1,0 +1,109 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A Paper Minecraft server running in Docker, with a DuckDNS sidecar to keep the public hostname `minecraft-with-friends.duckdns.org` pointed at the current public IP, plus an AI NPC (`Steve_AI`, a Claude Haiku-driven mineflayer bot) and a remote web control panel.
+
+## Server management
+
+```bash
+./scripts/start.sh        # docker compose up -d
+./scripts/stop.sh         # docker compose stop (saves world first)
+./scripts/console.sh      # open rcon-cli shell for in-game commands
+./scripts/backup.sh       # save-all, then tar world → ./backups/ (keeps last 10)
+docker compose logs -f    # tail live logs
+```
+
+## Architecture
+
+Two services in `docker-compose.yml`:
+
+- **minecraft** — `itzg/minecraft-server` image. Runs PaperMC, auto-downloads on first start. World data, plugins, and server config all live in `./data/` (gitignored, bind-mounted to `/data` in the container). Aikar JVM flags enabled by default.
+- **duckdns** — `linuxserver/duckdns` image. Polls DuckDNS to keep the subdomain's A record current. Requires `DUCKDNS_SUBDOMAIN` and `DUCKDNS_TOKEN` from `.env`.
+
+`docker-compose.test.yml` is a **separate, isolated test server** (project `mcv2test`, container `mc-v2-test`, loopback ports 25566/25576, own `./data`, whitelist off) used for development and the benchmark; see *Test server isolation* below.
+
+## Configuration
+
+All tunable settings are in `.env` and passed as environment variables to the container. Changes apply after `docker compose up -d`. Key variables:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `MC_VERSION` | `1.21.9` | Must stay within the mineflayer / `minecraft-data` supported range. Avoid `LATEST` — the mineflayer ecosystem trails Mojang releases (especially under the new year-based versioning like `26.x`), and a server ahead of `minecraft-data` will reject bot connections with `No data available for version …`. Bumping requires checking `node_modules/minecraft-data/minecraft-data/data/pc/` for supported versions (the planner and eval also read `MC_VERSION`). |
+| `MEMORY` | `4G` | JVM heap; adjust to available RAM |
+| `WHITELIST` | _(comma-separated list)_ | Server is offline-mode, so the whitelist is the access gate. `false` disables. |
+| `OPS` | _(empty)_ | Comma-separated usernames granted operator |
+| `LEVEL_SEED` | _(empty)_ | Only takes effect before world is generated |
+| `DUCKDNS_TOKEN` | — | From duckdns.org dashboard |
+| `MC_HOST` / `MC_PORT` | `localhost` / `25565` | Where the bot connects (read by `botStart.sh`) |
+| `PANEL_PORT` | `8443` (live: `443`) | Web panel HTTPS port |
+
+Server is configured **offline-mode** (`ONLINE_MODE: "false"` in `docker-compose.yml`) to support mineflayer-based AI NPCs that don't have Mojang accounts. Whitelist is enforced (`ENFORCE_WHITELIST: "true"`) to gate access; see [ARCHITECTURE.md](ARCHITECTURE.md) for rationale.
+
+## Orchestrator (v2)
+
+TypeScript project at the repo root. Host process (a compose service later). 41 registered skills (tools) plus background **jobs**. **The bot runs on Claude Haiku 5.5 (`claude-haiku-5-5`; `backend: claude`, `model_hint: haiku` in `config/bots.yml`) — the standing, owner-made choice; never switch to the local/hybrid backends or other model tiers to fix behavior.** Fix behavior with prompts, tool descriptions, the planner/job layer and deterministic middleware (push work down the stack: Haiku only for judgment). The live bot is `Steve_AI` with alias `steve` (players say "steve, …").
+
+Lifecycle scripts split cleanly into **server control** (`start.sh` / `stop.sh`), **bot control** (`botStart.sh` / `botStop.sh`), and **read-only viewers** (`botLogs.sh` / `dashboard.sh` / `botReport.sh`). Viewers refuse to run if the MC server or the bot isn't up — they never start anything implicitly. Scripts read `MC_HOST`/`MC_PORT` from `.env`.
+
+```bash
+./scripts/botStart.sh      # only entry point for starting the bot. Detaches the orchestrator; logs → .bot-runtime/bot.log
+./scripts/botStop.sh       # SIGTERM the running orchestrator (graceful disconnect)
+./scripts/botLogs.sh       # tail -F the bot log (read-only); `grep job` shows job milestones
+./scripts/dashboard.sh     # mount the TUI dashboard against the running bot (read-only)
+./scripts/botReport.sh     # performance report + auto-flags from telemetry; works with the bot DOWN. [--since run|today|2h|all] [--json]
+./scripts/panelSetup.sh    # web panel: set password + TOTP; --install-launchd to run it at login
+./scripts/panelStart.sh    # web control panel (HTTPS, public via DuckDNS); --dev = loopback self-signed
+./scripts/panelStop.sh
+npm run typecheck          # tsc --noEmit for the bot AND the panel UI; should always be clean
+npm test                   # vitest (~360 tests: planner, jobs, build, tree/door/structure logic); offline, no server
+npm run eval -- --bot-dir <checkout> --label <name> [--only "t1.*"] [--repeat N] [--suite core|stretch|all] [--dry]   # the benchmark (v2/EVAL.md)
+npm run eval:compare -- v2/runs/<A> v2/runs/<B>   # markdown deltas between two eval runs
+npx tsx src/planner/cli.ts iron_pickaxe 1 --inv oak_log=3   # print a plan without a bot
+npm run start              # tsx src/index.ts — invoked by botStart.sh; not for direct use
+npm run dashboard          # tsx src/dashboard/index.ts — invoked by dashboard.sh; not for direct use
+```
+
+Runtime state lives under `./.bot-runtime/` (gitignored, scrubbed on stop): `bot.pid`, `bot.log`, `snapshot.json`. Telemetry that must survive restarts lives in `data/orchestrator/telemetry/<bot>/events.jsonl` (override with `BOT_TELEMETRY_DIR`). The orchestrator writes its own PID and a 500ms snapshot; the dashboard is a separate process that reads `snapshot.json`.
+
+`src/` layout matches the layer stack from [ARCHITECTURE.md](ARCHITECTURE.md):
+
+- `mineflayer-glue/` — bot factory + reconnect supervisor + per-connection event hooks (chat dispatch + the "stop" side-channel preempt + container `windowOpen/windowClose` auto-capture + 5s utility-block proximity scan that fills `pois[]`). Isolation point if we ever swap bot clients.
+- `orchestrator/` — chat router: username / configured alias / suffix-stripped name mention, `/msg`, `@all`, 45s question-continuation, 60s follow-up after any bot reply, and job-requester routing (the player a running job is for); strict `isStopCommand`. All middleware.
+- `agent/` — per-bot Claude Agent SDK loop (`npc-agent.ts`, `backend/claude-backend.ts`: per-task sessions with **SDK isolation** (`strictMcpConfig`, `settingSources: []`, `skills: []`; never run the SDK for the bot without them, see D16), mid-task side replies, silent-reply nudge), per-task context block (`planning-context.ts` → `buildAgentContext`, incl. `# Current job`), MCP-wrapped skill tools (`skill-tools.ts`: repeat-failure guard + job auto-cancel; Zod schemas + descriptions live in `skills/registry.ts`), `system-prompt.ts`, model-id mapping + rate-limit cooldown (`behavior.ts`), turn cap `limits.ts`.
+- `jobs/` — **the primary execution model.** `achieve` / `build` / `followPlayer` / `surviveNight` start a persisted background job (`runner.ts`, `job.json`) and return at once; Haiku gets a synthetic `[job finished]` / `[job failed]` message when it ends. Per-step postconditions, typed `FailureKind`s, the recovery ladder (`recovery.ts`: relocate → re-plan → retry → widen → explore → fail), failure ledgers + event cap (`ledger.ts`), reservations, exhausted-area memory, `explore.ts`, `steps/` (gather, craft, smelt, withdraw, place-station, build, deliver, follow, night), `follow.ts` / `night.ts` / `pocket.ts` (pure logic), `wire.ts` (binds a runner to a live bot). Reference: [JOBS.md](JOBS.md).
+- `planner/` — pure goal planner: `plan(goals, worldView)` over minecraft-data + hand tables (`knowledge/`: smelting, fuel, tools, ores, wood, stations, generic tags like `#log`). No bot, no I/O.
+- `build/` — pure blueprint builder core: `blueprints.ts` (house, portal, farm, shelter), `site.ts`, `support.ts` (scaffold order), `materials.ts`, `prepare.ts`. The bot-bound executor is `jobs/steps/build.ts`.
+- `skills/` — capability layer. Each skill is a plain `(bot, params) => Promise<SkillResult>`, callable from anywhere, unit-testable without Claude. Movement goes through `navigation.ts` (`navigate()`) with one shared policy in `pathfinder-config.ts` (digs only an allowlist of natural terrain, never places); `doors.ts` repairs/opens/closes doors; `structure-guard.ts` keeps mining off player builds and detects trees; `tree-felling.ts` ranks reachable logs; `surfacing.ts` + the survival reflex handle water/suffocation; `pillar.ts` is the jump-place climb; `auto-behaviors.ts` holds LLM-free reflexes; `harness.ts` (`runSkill`) wraps every call (exception trap, stop-flag reset, 10-min watchdog, actions log, current tool). `item-naming.ts` normalizes IDs with did-you-mean. `creative.ts` has `getItems` and the operator-item denylist.
+- `state/` — per-bot in-process state: `actions-log`, `player-presence`, `task-queue`, `current-tool`, `cancellation` (cooperative stop flag), `reservations` (items a running job needs; escape-pillaring must not spend them). `task-queue` / `actions-log` persist to disk via `persist.ts`.
+- `memory/` — per-bot durable state in `data/orchestrator/memory/<bot>/`: `world.json` (`pois[]`, `containers[]`, `deaths[]`), `conversation.json`; `state/` persists `tasks.json` + `actions.json`; `jobs/` persists `job.json`. **Disk is the source of truth; the model keeps as little context as possible.**
+- `observability/` — `telemetry-types.ts` (event contract incl. `job_start`/`step`/`recovery`/`job_end`), `telemetry.ts` (observe-only JSONL writer), `aggregate.ts` (pure), `log-buffer.ts`, `snapshot.ts`.
+- `eval/` — **the measurement backbone.** Black-box benchmark (`runner.ts`): a mineflayer Tester talks to any bot checkout, RCON sets up/inspects the world, bot telemetry gives turns/cost. `scenarios/` (31 core + 3 stretch), `world.ts` (pristine-world restore), `sites.json`. Judge every behavior change by benchmark before/after. See [v2/EVAL.md](v2/EVAL.md), [v2/SCENARIOS.md](v2/SCENARIOS.md).
+- `web/` — remote control panel (see ARCHITECTURE.md *Web control panel*): `shared/api.ts` contract, `server/` (https+ws, auth/TOTP/CSRF/rate limits/audit, ACME via DuckDNS, allowlisted job runner, RCON console), `ui/` (Vite+Preact, own tsconfig, built to gitignored `ui/dist`). **Internet-facing — treat every change as security-sensitive.**
+- `report/` — standalone CLI behind `botReport.sh` (thresholds in `report/flags.ts`). `dashboard/` — standalone `blessed-contrib` TUI reading `.bot-runtime/snapshot.json` (pages: 1 Overview, 2 Perf, 3 Skills, 4 Memory; Tab cycles bots). `local-model/` and the `local`/`hybrid` backends are unused.
+- `config.ts`, `types.ts`, `index.ts` — config loading (`config/bots.yml`: `username`, `aliases`, `model_hint`, `backend`, `session_mode`), cross-cutting types, entry point.
+
+### How the loop runs
+
+When a player types in chat (or `/msg`s the bot), `mineflayer-glue/event-hooks.ts` hands the event to `orchestrator/chat-router.ts`, which decides which bot is addressed. The same hook runs the side-channel preempt: a strict stop command flips the cancellation flag immediately (the running skill or job exits within a tick or between blocks). If routing matches, the event is queued on that bot's `NpcAgent`. In the default `session_mode: per_task`, each task gets a **fresh** SDK `query()` whose single message is a deterministic ground-truth context block (game mode, live state, inventory, nearby containers, world.json knowledge, last death, recent actions, task queue, current job, recent conversation from `conversation.json`) plus the chat line; the session closes when the task's result arrives, and messages arriving mid-task are coalesced into the next task. A directly addressed status question while a blocking tool runs is answered by a one-turn side session. SDK auth uses the local Claude Code Pro subscription (no `ANTHROPIC_API_KEY`), shared with the dev team's 5-hour window.
+
+For work requests Haiku usually makes **one tool call** — `achieve({goals})` (items; generic tags like `#log`, optional `deliverTo`), `build({blueprint})` (propose first for big builds), `followPlayer`, `surviveNight` — says one line, and its session ends in ~2 turns. The planner resolves the recipe graph; the job runner executes it in the background (postconditions, recovery ladder, re-plans) and, at the end, queues `[job finished]` / `[job failed]` for a fresh Haiku decision (≤3 such events per 10 min). Any non-exempt Haiku tool call while a job runs cancels it; chat (`say`/`whisper`) does not. Restarts are safe: a leftover job becomes `interrupted`. Pinned-down SDK details: [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md).
+
+Bot must be on the server whitelist to actually join. `./scripts/console.sh` then `whitelist add <username>`.
+
+### Test server isolation (important)
+
+Never point experiments, the eval or a second bot at the live server. Development and the benchmark use a git worktree whose gitignored, non-secret `.env` sets `COMPOSE_FILE=docker-compose.test.yml`, `COMPOSE_PROJECT_NAME=mcv2test`, `MC_PORT=25566`, `RCON_PORT=25576`, so `docker compose`, `start.sh`, `stop.sh`, `console.sh` and `botStart.sh` there act on the test server only. The eval refuses the live checkout and benchmarks a frozen checkout (never the one being edited). The dev bot there is `Steve_v2`. Details: [v2/TEST_SERVER.md](v2/TEST_SERVER.md); decisions D1/D2/D11 in [v2/DECISIONS.md](v2/DECISIONS.md).
+
+## Project docs
+- [ARCHITECTURE.md](ARCHITECTURE.md) — design + as-shipped reference: layer stack, jobs, movement policy, routing, memory, telemetry & eval, web panel, creative mode, decisions table.
+- [JOBS.md](JOBS.md) — planner (goals, tags, resolution order, knowledge tables), job kinds, step executors, FailureKinds, recovery ladder, blueprints and params, hand-over, follow and night jobs.
+- [SKILLS.md](SKILLS.md) — per-skill reference: signatures, params, success / failure messages, caveats.
+- [ROADMAP.md](ROADMAP.md) — what's still open (stretch suite, pathfinder master pin, prompt/tool trim, combat/trading/Nether, night paths, live-test gaps) plus deferred features.
+- [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md) — pinned answers on Agent SDK behavior (model, thinking/effort, strict MCP, side sessions, caching).
+- `v2/` — [DECISIONS.md](v2/DECISIONS.md) (D1–D17, add superseding entries rather than editing history), [EVAL.md](v2/EVAL.md), [SCENARIOS.md](v2/SCENARIOS.md), [TEST_SERVER.md](v2/TEST_SERVER.md), [PLANNER.md](v2/PLANNER.md) (original design note), [STATUS.md](v2/STATUS.md), `reports/` (per-slice reports and reviews; read when you need the why behind a fix).
+- Turn cap: `src/agent/limits.ts` (`MAX_TURNS_PER_EVENT`, shared by the backend and the report's flags).
+
+Direct server config (e.g. `server.properties`, `paper-global.yml`) lives in `./data/` and can be edited while the server is stopped.
