@@ -62,6 +62,8 @@ export interface ObserveSurroundingsState {
     lastOpened?: number;
     lastOpenedBy?: string;
     contents?: Array<{ item: string; count: number }>;
+    /** Seen but never opened: contents unknown. */
+    seen?: boolean;
   }>;
   knownUtilities: Array<{
     type: string;
@@ -169,6 +171,7 @@ export async function observeSurroundings(
       if (c.last_opened !== undefined) entry.lastOpened = c.last_opened;
       if (c.last_opened_by !== undefined) entry.lastOpenedBy = c.last_opened_by;
       if (c.contents !== undefined) entry.contents = c.contents;
+      if (c.seen) entry.seen = true;
       return entry;
     })
     .sort((a, b) => a.dist - b.dist);

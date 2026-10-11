@@ -752,6 +752,8 @@ async function digCreative(bot: Bot, block: Block, blockNameForMsg: string): Pro
 export interface PlaceBlockParams {
   type: string;
   position: Coords;
+  /** Reference-face labels (bottom/top/north/south/west/east) to try last: a retry after the server refused a click on them. */
+  avoidFaces?: string[];
 }
 
 /**
@@ -764,10 +766,10 @@ export interface PlaceBlockParams {
  */
 export async function placeBlock(
   bot: Bot,
-  { type, position }: PlaceBlockParams,
+  { type, position, avoidFaces }: PlaceBlockParams,
 ): Promise<SkillResult> {
   if (!position) return { ok: false, message: "position is required" };
-  return placeSingleBlock(bot, type, position);
+  return placeSingleBlock(bot, type, position, avoidFaces);
 }
 
 export interface PlaceBlocksParams {
@@ -841,6 +843,7 @@ async function placeSingleBlock(
   bot: Bot,
   type: string,
   position: Coords,
+  avoidFaces: readonly string[] = [],
 ): Promise<SkillResult> {
   const r = resolveItem(bot, type);
   if (!r.ok) return { ok: false, message: `type ${r.message}` };
@@ -885,6 +888,7 @@ async function placeSingleBlock(
   type Ref = { block: Block; face: Vec3; label: string };
   let reference: Ref | null = null;
   let fallback: Ref | null = null;
+  let avoided: Ref | null = null; // faces a retry was asked to skip: used only when nothing else is left
   for (const offset of FACE_OFFSETS) {
     const neighborPos = target.plus(offset.vec);
     const neighbor = bot.blockAt(neighborPos);
@@ -892,6 +896,10 @@ async function placeSingleBlock(
     // Face vector points from the reference block toward the target — the
     // opposite of the offset we used to find the neighbor.
     const candidate = { block: neighbor, face: offset.vec.scaled(-1), label: offset.label };
+    if (avoidFaces.includes(offset.label)) {
+      avoided ??= candidate;
+      continue;
+    }
     if (INTERACTIVE_RE.test(neighbor.name)) {
       fallback ??= candidate;
       continue;
@@ -901,6 +909,9 @@ async function placeSingleBlock(
   }
   const sneakToPlace = !reference && fallback !== null;
   reference ??= fallback;
+  if (!reference && avoided) {
+    reference = avoided;
+  }
   if (!reference) {
     return {
       ok: false,
@@ -973,6 +984,7 @@ async function placeSingleBlock(
     return {
       ok: false,
       message: `place failed at ${fmt(target.x, target.y, target.z)} (against ${reference.block.name} ${reference.label}): ${message}`,
+      state: { face: reference.label },
     };
   } finally {
     if (sneakToPlace) bot.setControlState("sneak", false);

@@ -27,6 +27,7 @@ import {
   survivalTick,
   trackSurvivalState,
 } from "../skills/auto-behaviors.js";
+import { rememberSeenContainers } from "../skills/containers.js";
 import { isFlying, stopFlyingNow } from "../skills/flight.js";
 import { currentGameMode, type GameMode } from "../skills/game-mode.js";
 import type { BotState } from "../state/index.js";
@@ -191,6 +192,13 @@ export function attachBotEventHooks(
   const utilityIds = collectUtilityIds(bot);
   const utilityScan = setInterval(() => {
     void scanForUtilityBlocks(bot, username, tag, utilityIds);
+    // Chests in plain sight are remembered too (seen-only, no contents): "put them in the chest" still works after walking off.
+    rememberSeenContainers(bot).then(
+      (n) => {
+        if (n > 0) console.log(`${tag} auto-container: remembered ${n} seen container(s)`);
+      },
+      (err) => console.warn(`${tag} seen-container write failed:`, err),
+    );
     // Retry armor upgrades picked up while a skill was busy.
     maybeEquipArmor(bot, state);
   }, UTILITY_SCAN_INTERVAL_MS);

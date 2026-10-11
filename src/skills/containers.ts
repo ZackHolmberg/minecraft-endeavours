@@ -7,6 +7,7 @@
 import type { Bot } from "mineflayer";
 import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
+import { syncSeenContainers } from "../memory/world-knowledge.js";
 
 /** Live scan radius for containers in plain sight. */
 export const CONTAINER_SCAN_RADIUS = 16;
@@ -51,4 +52,24 @@ export function findNearbyContainers(bot: Bot, radius = CONTAINER_SCAN_RADIUS, m
     if (out.length >= max) break;
   }
   return out.sort((a, b) => a.dist - b.dist);
+}
+
+/**
+ * Proximity-scan capture (called from the 5 s scan in `mineflayer-glue/event-hooks.ts`): write the containers
+ * in plain sight to world memory as seen-only entries (no contents) so they are still known after the bot
+ * walks away, and drop seen-only entries whose block is loaded within scan range and no longer a container.
+ * Returns the number of newly remembered containers.
+ */
+export async function rememberSeenContainers(bot: Bot): Promise<number> {
+  if (!bot.entity) return 0;
+  const seen = findNearbyContainers(bot, CONTAINER_SCAN_RADIUS, 12).map((c) => ({ type: c.name, position: c.pos }));
+  const me = bot.entity.position;
+  const range = CONTAINER_SCAN_RADIUS - 2;
+  const gone = (c: { position: { x: number; y: number; z: number } }): boolean => {
+    const p = new Vec3(c.position.x, c.position.y, c.position.z);
+    if (p.distanceTo(me) > range) return false;
+    const b = bot.blockAt(p);
+    return b !== null && !isContainerName(b.name);
+  };
+  return syncSeenContainers(bot.username, seen, gone);
 }
