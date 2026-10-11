@@ -19,11 +19,13 @@
 ## In flight (2026-10-10 evening)
 - Nothing running. `v2` @ `4147b21` (361 tests). Worktrees idle: `../mcv2-dev` (v2-fixes), `../mcv2-build` (v2-build), `../mcv2-bench` (frozen @ `6d5af8b`), `../mcv2-live` (@ `4147b21`).
 
-## Next steps
-1. Full core run on `4147b21` (quick shelter + follow job + live fixes), incl. new `conv.chat_while_following` → `v2-s5`.
-2. Small fixes from v2-s4: build placement retry when the server refuses a block; remember seen chests beyond 16 blocks (followup_chest).
-3. Independent review of 2c-A/2c-B/quick shelter/follow job (not yet reviewed).
-4. Owner decisions pending (Open questions). Then: stretch suite (iron kit, diamonds), pathfinder master pin, prompt/tool-surface trim, breadth (combat, trading, Nether).
+## Next steps — toward promotion (D17)
+1. Full core run on the current `v2` HEAD → `v2-s5` (incl. `conv.chat_while_following`).
+2. v2-s4 small fixes: build placement retry on server refusal; remember seen chests beyond 16 blocks.
+3. Independent review of 2c-A, 2c-B, quick shelter, follow job → fixes.
+4. Panel security review of v2 `src/web/**` diff (Events.tsx display-only so far).
+5. Docs for a cold-start Claude: fold v2 into ARCHITECTURE/SKILLS/ROADMAP + CLAUDE.md (gitignored; update the main checkout's copy at cutover).
+6. Cutover per D17. Done so far: security fix on main (`bd32483`), `v2` + `v1` tag pushed.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
@@ -49,6 +51,5 @@
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
-- **SECURITY (D16):** live `Steve_AI` on `main` loads the account's claude.ai connectors (no `strictMcpConfig`); one-line hotfix needs owner approval.
-- Push `v2` branch + `v1` tag to GitHub? Targets OK? Continue climbing?
-- None yet. (Pushing the `v1` tag / `v2` branch to GitHub: will ask before doing it.)
+- Push local `main` (security fix `bd32483`)? (Not requested yet.)
+- At cutover: confirm the panel UI rebuild + launchd restart (internet-facing) — plan in D17.
