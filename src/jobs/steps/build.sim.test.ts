@@ -59,7 +59,10 @@ vi.mock("../../skills/game-mode.js", () => ({ isCreative: () => sim.creative }))
 vi.mock("../../skills/inventory.js", () => ({ pickUpNearby: async () => ({ ok: true, message: "" }) }));
 vi.mock("../../skills/creative.js", () => ({
   getItems: async (_b: unknown, { items }: { items: Array<{ name: string; count: number }> }) => {
-    for (const i of items) sim.inv[i.name] = Math.max(sim.inv[i.name] ?? 0, i.count);
+    for (const i of items) {
+      sim.inv[i.name] = Math.max(sim.inv[i.name] ?? 0, i.count);
+      sim.log.push({ op: "get", at: i.name, block: String(i.count) });
+    }
     return { ok: true, message: "got" };
   },
 }));
@@ -179,7 +182,7 @@ async function runPortal(opts: { ctxOver?: Partial<BuildRunContext>; setup?: (ab
   return { deps, prep, ctx: c, saved, abort };
 }
 
-async function runKind(blueprint: "house" | "portal" | "farm" | "shelter", params: Record<string, unknown>, inv: Record<string, number>, creative = false, extra: Record<string, string> = {}, loseDrops = 0) {
+async function runKind(blueprint: "house" | "portal" | "farm" | "shelter" | "pixelart", params: Record<string, unknown>, inv: Record<string, number>, creative = false, extra: Record<string, string> = {}, loseDrops = 0) {
   sim = { world: new Map(Object.entries(extra)), inv: { ...inv }, pos: new Vec3(0.5, 64, 0.5), creative, log: [], box: null, loseDrops };
   const { createBuildDeps } = await import("./build.js");
   const bot = fakeBot();
@@ -457,5 +460,58 @@ describe("scaffold persistence and clean-up (H2)", () => {
     const farm = await runKind("farm", { size: 5 }, { wooden_hoe: 1, wheat_seeds: 16, water_bucket: 1 });
     expect(farm.prep.ok && farm.prep.reserve).toEqual(expect.arrayContaining(["wheat_seeds", "water_bucket", "wooden_hoe"]));
   });
-});
 
+  describe("pixel art", () => {
+    const COLS = ["red_concrete", "white_concrete", "blue_concrete"];
+    const design = async (w: number, h: number, orientation: "wall" | "flat") => {
+      const { encodeDesign } = await import("../../pixelart/design.js");
+      const cells = Array.from({ length: h }, (_, r) => Array.from({ length: w }, (_, c) => (r === 0 && c % 7 === 3 ? null : COLS[(r * 2 + c) % 3]!)));
+      return { d: encodeDesign({ w, h, cells }, { orientation, title: "Test" }), cells };
+    };
+
+    it("creative wall: every block lands, bottom-up, fetched per colour just in time (one batch per colour, not per stack)", async () => {
+      const { d, cells } = await design(21, 13, "wall");
+      const { prep, out } = await runKind("pixelart", { design: d }, {}, true);
+      expect(prep.ok && prep.missing).toEqual([]);
+      const total = cells.flat().filter(Boolean).length;
+      expect(out, JSON.stringify(out)).toMatchObject({ ok: true, placed: total, total });
+      // the picture in the world matches the design, reading from the facing side
+      const o = (prep as { origin: { x: number; y: number; z: number } }).origin;
+      const f = (prep as { facing: string }).facing;
+      const placedBlocks = [...sim.world.entries()].filter(([, n]) => COLS.includes(n));
+      expect(placedBlocks).toHaveLength(total);
+      expect(Math.min(...placedBlocks.map(([c]) => Number(c.split(",")[1])))).toBe(o.y);
+      expect(Math.max(...placedBlocks.map(([c]) => Number(c.split(",")[1])))).toBe(o.y + 12);
+      expect(["north", "south", "east", "west"]).toContain(f);
+      const gets = sim.log.filter((l) => l.op === "get" && COLS.includes(l.at));
+      expect(gets.length).toBeLessThanOrEqual(6); // ~one batch per colour
+      expect(gets.reduce((n, g) => n + Number(g.block), 0)).toBeLessThanOrEqual(total + 3 * 64);
+      // no scaffolding needed for a wall resting on the ground
+      expect(sim.log.some((l) => l.op === "place" && l.block === "dirt")).toBe(false);
+      const ys = sim.log.filter((l) => l.op === "place").map((l) => Number(l.at.split(",")[1]));
+      expect(ys).toEqual([...ys].sort((a, b) => a - b));
+    });
+
+    it("creative flat: lies on the ground, replaces flowers and grass", async () => {
+      const { d, cells } = await design(12, 9, "flat");
+      const extra: Record<string, string> = {};
+      for (let x = -40; x < 40; x += 2) for (let z = -40; z < 40; z += 2) extra[k(x, 64, z)] = "poppy";
+      const { prep, out } = await runKind("pixelart", { design: d }, {}, true, extra);
+      const total = cells.flat().filter(Boolean).length;
+      expect(out, JSON.stringify(out)).toMatchObject({ ok: true, placed: total, total });
+      const o = (prep as { origin: { x: number; y: number; z: number } }).origin;
+      expect(o.y).toBe(64);
+      expect([...sim.world.entries()].filter(([, n]) => COLS.includes(n)).every(([c]) => Number(c.split(",")[1]) === 64)).toBe(true);
+      expect(sim.log.filter((l) => l.op === "dig").length).toBeGreaterThan(0);
+    });
+
+    it("survival with the materials in the inventory builds a low wall; short of materials the planner gap is reported", async () => {
+      const { d, cells } = await design(10, 3, "wall");
+      const total = cells.flat().filter(Boolean).length;
+      const ok = await runKind("pixelart", { design: d }, { red_concrete: 40, white_concrete: 40, blue_concrete: 40, dirt: 2 });
+      expect(ok.out, JSON.stringify(ok.out)).toMatchObject({ ok: true, placed: total, total });
+      const short = await runKind("pixelart", { design: d }, { red_concrete: 1 });
+      expect(short.prep.ok && short.prep.missing.map((m) => m.item).sort()).toEqual(["blue_concrete", "red_concrete", "white_concrete"]);
+    });
+  });
+});

@@ -456,7 +456,7 @@ class Builder {
       if (!this.creative && itemOverride !== undefined && item === "dirt" && (await this.acquire(item, 1))) {
         // a scaffold we dug up never made it back into the inventory: dug a fresh one
       } else if (this.creative) {
-        const r = await getItems(bot, { items: [{ name: item, count: isDoor ? 1 : 64 }] });
+        const r = await getItems(bot, { items: [{ name: item, count: isDoor ? 1 : this.creativeBatch(item) }] });
         if (!r.ok) {
           this.lastError = r.message;
           return false;
@@ -485,6 +485,26 @@ class Builder {
       else await sleep(150);
     }
     return false;
+  }
+
+  /**
+   * Creative just-in-time stock for `item`. Houses etc: one stack. Pixel art (hundreds of blocks in several colours):
+   * what is still to be placed in that colour, but never more than the free inventory slots can hold once every
+   * other colour still to come has its own slot (plus one for scaffolding), so a batch can never overflow.
+   */
+  private creativeBatch(item: string): number {
+    if (this.prepd.bp.kind !== "pixelart") return 64;
+    const inv = this.inv();
+    const left = new Map<string, number>();
+    for (const p of this.prepd.remaining) if (!p.derived && !placementDone(this.grid, p)) left.set(p.block, (left.get(p.block) ?? 0) + 1);
+    const need = left.get(item) ?? 0;
+    if (need === 0) return 64; // scaffolding / foundation dirt
+    let empty = 0;
+    for (let slot = 9; slot <= 44; slot++) if (!this.bot.inventory.slots[slot]) empty += 1;
+    const others = [...left.keys()].filter((b) => b !== item && (inv[b] ?? 0) === 0).length;
+    const spare = (inv[this.scaffoldItem] ?? 0) > 0 ? 0 : 1;
+    const slots = Math.max(1, empty - others - spare);
+    return Math.max(1, Math.min(need, slots * 64));
   }
 
   // ── retry of refused placements ────────────────────────────────────────

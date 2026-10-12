@@ -387,7 +387,9 @@ export class JobRunner {
       return { ok: false, jobId: null, message: refusal };
     }
     // An unfinished structure of this kind nearby: continue it at its stored origin, never start a second one beside it.
-    const resume = this.deps.buildHistory?.partial(spec) ?? this.partialFromLastJob(spec);
+    const found = this.deps.buildHistory?.partial(spec) ?? this.partialFromLastJob(spec);
+    // Pixel art: only the SAME picture resumes onto an unfinished one; a different picture starts fresh.
+    const resume = found && spec.blueprint === "pixelart" && JSON.stringify(found.params["design"]) !== JSON.stringify(spec.params["design"]) ? null : found;
     if (resume) spec = { ...spec, params: { ...resume.params } };
     const prep = await builder.prepare(spec, resume ? { origin: resume.origin, facing: resume.facing } : null, this.job?.scaffolds);
     if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
