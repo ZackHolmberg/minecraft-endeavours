@@ -12,7 +12,7 @@ import { navFailureOf, navigate } from "./navigation.js";
 import { ensureMovements, withDiggingMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import { PILLAR_MAX_HEIGHT, pickFiller, pillarUpBy, waitForGrounded } from "./pillar.js";
 import { builtStructureReason, fallsOnBot, isNaturalTerrain } from "./structure-guard.js";
-import { fellInfo, isTreeLogName, posKey, rankLogs, type BlockAt } from "./tree-felling.js";
+import { analyzeTree, fellInfo, isTreeLogName, posKey, rankLogs, treeToWriteOff, type BlockAt } from "./tree-felling.js";
 import { creativeGive } from "./creative.js";
 import { findPlaceHoverSpot, flyTo, isFlying } from "./flight.js";
 import { isCreative } from "./game-mode.js";
@@ -269,6 +269,10 @@ async function mineBlocksInner(
   /** Trees (log keys) whose drops we could not collect: skipped from then on so the batch moves to another tree. */
   const abandoned = new Set<string>();
   let abandonedTrees = 0;
+  /** Trees (log keys) written off because their logs have no path (leaves in the way, canopy too high) and the failure count per tree. */
+  const deadTrees = new Set<string>();
+  const treeFails = new Map<string, number>();
+  const deadPositions = (): string[] => [...new Set([...unreachable.keys(), ...deadTrees])];
   /** Tree felling state: the tree just chopped (for stickiness + the per-trunk sweep) and logs refused as out of reach. */
   const fell: FellCtx = { lastTree: null, next: null, tooHigh: 0, underLog: 0 };
   // Positions refused by the structure guard, reported so the agent knows
@@ -321,7 +325,7 @@ async function mineBlocksInner(
         unreachable: unreachable.size,
         unreachableTypes,
         /** "x,y,z" of every block this call gave up on (a job remembers them so the next gather skips them). */
-        unreachablePositions: [...unreachable.keys()],
+        unreachablePositions: deadPositions(),
         position: posOf(bot),
         ...extra,
       },
@@ -333,7 +337,7 @@ async function mineBlocksInner(
       return finish(mined > 0, `mining cancelled${mined > 0 ? ": {summary}" : ""}`, { cancelled: true });
     }
 
-    const skipKeys = abandoned.size > 0 ? new Map<string, unknown>([...unreachable, ...[...abandoned].map((k): [string, unknown] => [k, 1])]) : unreachable;
+    const skipKeys = abandoned.size > 0 || deadTrees.size > 0 ? new Map<string, unknown>([...unreachable, ...[...abandoned, ...deadTrees].map((k): [string, unknown] => [k, 1])]) : unreachable;
     const block = findMineCandidate(bot, idList, maxDistance, allowStructures, protectedSeen, skipKeys, fell, exclude);
     // Done with a trunk (the next target is another tree, or none): sweep its drops before moving on.
     if (fell.lastTree && !creative && (!block || !fell.lastTree.has(posKey(block.position)))) {
@@ -352,7 +356,7 @@ async function mineBlocksInner(
         return {
           ok: false,
           message: `could not reach any ${types.length === 1 ? mineable[0]!.name : "of those blocks"} (${unreachable.size} tried; ${lastFailure}). Walk somewhere with open access to them or pick another spot.${protectedNote()}${reachNote()}`,
-          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, unreachableTypes, unreachablePositions: [...unreachable.keys()], position: posOf(bot) },
+          state: { mined, collected: 0, byType: minedByType, skipped, unreachable: unreachable.size, unreachableTypes, unreachablePositions: deadPositions(), position: posOf(bot) },
         };
       }
       if (mined === 0) {
@@ -397,6 +401,19 @@ async function mineBlocksInner(
         unreachable.set(targetKey, oneResult.message);
         unreachableTypes[thisName] = (unreachableTypes[thisName] ?? 0) + 1;
         lastFailure = oneResult.message;
+        if (isTreeLogName(thisName) && !allowStructures) {
+          // Don't retry the same tree log by log: one failed high log (or two of any) writes off the whole tree.
+          const at: BlockAt = (p) => bot.blockAt(p);
+          const tree = analyzeTree(at, block.position);
+          const root = [...tree.keys].sort()[0]!;
+          const fails = (treeFails.get(root) ?? 0) + 1;
+          treeFails.set(root, fails);
+          const dead = treeToWriteOff(at, block.position, fails);
+          if (dead) {
+            for (const k of dead) deadTrees.add(k);
+            console.log(`[${bot.username}] [mine] tree at ${fmt(block.position.x, block.position.y, block.position.z)} has no path to its logs (${fails} failure(s)); skipping the whole tree (${dead.size} logs)`);
+          }
+        }
         if (unreachable.size >= MAX_UNREACHABLE_SKIPS) {
           return finish(mined > 0, `{summary}${mined > 0 ? "; " : ""}gave up after ${unreachable.size} unreachable ${thisName} blocks (${oneResult.message})`);
         }

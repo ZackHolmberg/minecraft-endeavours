@@ -385,6 +385,27 @@ class Planner {
     return ["wooden", "stone", "iron", "diamond", "netherite"].indexOf(tier);
   }
 
+  /**
+   * Inventory after `steps` ran (gathers add, crafts consume their recipe's ingredients, a placed station is used up).
+   * Only valid right after `run()` (reads the recipes phase A chose). Used to chain a prefix plan before a main plan.
+   */
+  inventoryAfter(steps: readonly Step[]): Record<string, number> {
+    const inv: Record<string, number> = { ...this.view.inventory };
+    const add = (k: string, n: number) => {
+      inv[k] = Math.max(0, (inv[k] ?? 0) + n);
+    };
+    for (const s of steps) {
+      if (s.op === "gather") add(s.item, s.count);
+      else if (s.op === "withdraw") add(s.item, s.count);
+      else if (s.op === "craft") {
+        const m = this.nodes.get(s.item)?.method;
+        if (m?.t === "craft") for (const [ing, n] of Object.entries(m.recipe.ingredients)) add(ing, -n * s.crafts);
+        add(s.item, s.count);
+      } else if (s.op === "place_station") add(s.block, -1);
+    }
+    return inv;
+  }
+
   // ---------------------------------------------------------------- phase B
 
   run(goals: Goal[], opts?: PlanOptions): Plan {
@@ -537,13 +558,67 @@ function summarize(steps: Step[], unresolved: Plan["unresolved"]): string {
   return `${parts.join(" → ")} ${tail}`.slice(0, MAX);
 }
 
+/** Log gathers of at least this many (bare hand ~3 s/log, wooden axe ~1.5 s) make an axe worth crafting first. */
+export const AXE_MIN_LOGS = 6;
+/** The axe may cost at most this many extra logs (and never a non-log gather such as cobblestone). */
+const AXE_MAX_EXTRA_LOGS = 3;
+/** Seconds saved per log by a wooden / stone axe over bare hands (dig ~3.0 s -> 1.5 / 0.75); cost of one extra log (dig + pickup, same tree) and of one craft / station placement. */
+const AXE_SAVE_WOODEN_S = 1.5;
+const AXE_SAVE_STONE_S = 2.25;
+const AXE_LOG_COST_S = 4.5;
+const AXE_STEP_COST_S = 0.8;
+const LOG_ITEM_RE = /_log$/;
+const AXE_ITEM_RE = /_axe$/;
+
+/**
+ * Efficiency (v2 D21 #7): a player chops a pile of logs with an axe. When the plan gathers >= {@link AXE_MIN_LOGS} logs and
+ * the bot holds no axe, put "craft a wooden (or, if the stone is already in the bag, stone) axe" in front of it when that
+ * is cheap: at most 3 extra logs, no other gather, and the seconds saved on the logs exceed the seconds it costs (so from
+ * an empty bag it pays from ~13 logs; with planks / a table / cobblestone at hand from 6). The main plan is re-made from the
+ * inventory the axe prefix leaves behind, so leftovers (planks, sticks, the table) are not double-counted.
+ */
+function withAxe(book: RecipeBook, view: WorldView, goals: Goal[], opts: PlanOptions | undefined, base: Plan): Plan {
+  if (base.unresolved.length > 0) return base;
+  const logs = base.steps.reduce((n, s) => (s.op === "gather" && LOG_ITEM_RE.test(s.item) ? n + s.count : n), 0);
+  if (logs < AXE_MIN_LOGS) return base;
+  if (Object.entries(view.inventory).some(([k, v]) => v > 0 && AXE_ITEM_RE.test(k))) return base;
+  if (base.steps.some((s) => s.op === "craft" && AXE_ITEM_RE.test(s.item))) return base;
+  let best: { prefix: Plan; view: WorldView; extraLogs: number; axe: string } | null = null;
+  for (const axe of ["stone_axe", "wooden_axe"]) {
+    if (axe === "stone_axe" && !["cobblestone", "cobbled_deepslate", "blackstone"].some((m) => (view.inventory[m] ?? 0) >= 3)) continue;
+    const ap = new Planner(book, view);
+    const prefix = ap.run([{ item: axe, count: 1 }], opts);
+    if (prefix.unresolved.length > 0 || prefix.steps.length === 0) continue;
+    const gathers = prefix.steps.filter((s) => s.op === "gather");
+    if (gathers.some((s) => s.op === "gather" && !LOG_ITEM_RE.test(s.item))) continue;
+    const extraLogs = gathers.reduce((n, s) => n + (s.op === "gather" ? s.count : 0), 0);
+    if (extraLogs > AXE_MAX_EXTRA_LOGS) continue;
+    // "cheap" = the time it saves on the logs beats the time it costs (logs gathered for it + its crafting steps)
+    const cost = extraLogs * AXE_LOG_COST_S + (prefix.steps.length - gathers.length) * AXE_STEP_COST_S;
+    if (logs * (axe === "stone_axe" ? AXE_SAVE_STONE_S : AXE_SAVE_WOODEN_S) <= cost) continue;
+    const placedTable = prefix.steps.some((s) => s.op === "place_station" && s.block === "crafting_table");
+    const v2: WorldView = { ...view, inventory: ap.inventoryAfter(prefix.steps), stations: { ...view.stations, crafting_table: view.stations.crafting_table || placedTable } };
+    if (!best || extraLogs < best.extraLogs) best = { prefix, view: v2, extraLogs, axe };
+  }
+  if (!best) return base;
+  const main = new Planner(book, best.view).run(goals, opts);
+  if (main.unresolved.length > 0) return base;
+  const steps = mergeSteps([...best.prefix.steps, ...main.steps]);
+  if (steps.length > (opts?.maxSteps ?? DEFAULT_MAX_STEPS)) return base;
+  const rawNeeds: Record<string, number> = {};
+  for (const s of steps) if (s.op === "gather" || s.op === "withdraw") rawNeeds[s.item] = (rawNeeds[s.item] ?? 0) + s.count;
+  return { goals: base.goals, steps, rawNeeds, unresolved: [], summary: summarize(steps, []) };
+}
+
 export const plan: PlanFn = (goals, view, opts) => {
-  const planner = new Planner(getRecipeBook(), view);
+  const book = getRecipeBook();
+  const planner = new Planner(book, view);
   const resolved = planner.resolveGoals(goals);
   if (view.gameMode === "creative") {
     return { goals: resolved.goals, steps: [], rawNeeds: {}, unresolved: resolved.bad, summary: "creative: use getItems" };
   }
-  const result = planner.run(resolved.goals, opts);
+  let result = planner.run(resolved.goals, opts);
+  if (resolved.bad.length === 0) result = withAxe(book, view, resolved.goals, opts, result);
   if (resolved.bad.length === 0) return result;
   const unresolved = [...resolved.bad, ...result.unresolved];
   return { ...result, unresolved, summary: summarize(result.steps, unresolved) };

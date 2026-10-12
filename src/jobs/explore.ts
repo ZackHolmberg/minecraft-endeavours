@@ -344,15 +344,36 @@ export function createRelocator(bot: Bot): RelocateFn {
   };
 }
 
-class Explorer {
+export interface ExplorerOpts {
+  /** "Found" scan radius after every surface hop (default 40). */
+  surfaceFoundRadius?: number;
+  /** ... and every few tunnel cells (default 10). The `find` job scans wider: loaded chunks show buried ore. */
+  tunnelFoundRadius?: number;
+  /** Where the whole search began: the 250-block cap is measured from here (default: the bot's position when the Explorer is made). */
+  origin?: Vec3;
+}
+
+export class Explorer {
   private readonly start: Vec3;
+  private readonly surfaceFound: number;
+  private readonly tunnelFound: number;
+  private readonly origin: Vec3;
 
   constructor(
     private readonly bot: Bot,
     private readonly ids: number[],
     private readonly ctx: StepRunContext,
+    opts: ExplorerOpts = {},
   ) {
     this.start = bot.entity.position.clone();
+    this.surfaceFound = opts.surfaceFoundRadius ?? FOUND_RADIUS;
+    this.tunnelFound = opts.tunnelFoundRadius ?? TUNNEL_FOUND_RADIUS;
+    this.origin = opts.origin ?? this.start;
+  }
+
+  /** Horizontal distance from where the whole search began (the cap, see {@link MAX_FROM_START}). */
+  private fromOrigin(p: { x: number; z: number } = this.bot.entity.position): number {
+    return horizontalDistance(p, this.origin);
   }
 
   private get aborted(): boolean {
@@ -461,7 +482,7 @@ class Explorer {
     const t0 = Date.now();
     const start = this.start.clone();
     const ores = this.dryOres(128);
-    const ranked = rankRelocations(this.surfaceAt, start, regions, { origin: start, ores });
+    const ranked = rankRelocations(this.surfaceAt, start, regions, { origin: this.origin, ores });
     const picks = distinctCandidates(ranked, RELOCATE_MAX_TRIES);
     if (picks.length === 0) return { moved: false, detail: "no dry land to relocate to within range (water / unloaded chunks all around)" };
     let note = "";
@@ -506,11 +527,11 @@ class Explorer {
         if (Date.now() - t0 > SURFACE_MAX_MS) return { found: false, detail: `surface search timed out after ${travelled} blocks` };
         const p = this.bot.entity.position;
         const hop = Math.min(SURFACE_HOP, leg.length - walked);
-        if (this.fromStart({ x: p.x + leg.dx * hop, z: p.z + leg.dz * hop }) > MAX_FROM_START) break; // too far out: turn
+        if (this.fromOrigin({ x: p.x + leg.dx * hop, z: p.z + leg.dz * hop }) > MAX_FROM_START) break; // too far out: turn
         const moved = await this.walkTo(p.x + leg.dx * hop, p.z + leg.dz * hop, `explore leg ${i + 1}`);
         if (!moved) break; // blocked: next leg turns
         travelled += hop;
-        if (this.targetNear(FOUND_RADIUS)) {
+        if (this.targetNear(this.surfaceFound)) {
           this.log(`target in range after ${travelled} blocks (leg ${i + 1})`);
           return { found: true, detail: `target block in range after walking ~${travelled} blocks` };
         }
@@ -560,7 +581,7 @@ class Explorer {
         dir = adv.dir;
         steps += 1;
         cells += 3;
-        if (steps % RESCAN_EVERY === 0 && this.targetNear(TUNNEL_FOUND_RADIUS)) {
+        if (steps % RESCAN_EVERY === 0 && this.targetNear(this.tunnelFound)) {
           return { found: true, detail: `target ore near the staircase at y=${Math.floor(this.bot.entity.position.y)}` };
         }
       }
@@ -588,8 +609,8 @@ class Explorer {
       heading = adv.dir;
       dug += 1;
       along += 1;
-      if (dug % RESCAN_EVERY === 0 && this.targetNear(TUNNEL_FOUND_RADIUS)) {
-        return { found: true, detail: `target ore within ${TUNNEL_FOUND_RADIUS} blocks of the tunnel at y=${y}` };
+      if (dug % RESCAN_EVERY === 0 && this.targetNear(this.tunnelFound)) {
+        return { found: true, detail: `target ore within ${this.tunnelFound} blocks of the tunnel at y=${y}` };
       }
       if (along >= BRANCH_SEGMENT) {
         // shift sideways BRANCH_SHIFT cells, then run the next tunnel back the other way
@@ -607,6 +628,46 @@ class Explorer {
     return { found: false, detail: `dug ${dug} cells of branch tunnel at y=${y} without finding it` };
   }
 
+  /**
+   * Dig toward a buried target the way a player does: a staircase down (never straight down; when the target is closer in
+   * plan than it is deep, the stairs first run away from it so the descent fits), then a level 2-high tunnel to within
+   * `within` blocks of it. Every cell goes through the same checks as the explore tunnels (natural blocks only, no liquid
+   * beside any cell, structure guard, solid floor). Returns why it stopped when it cannot get there.
+   */
+  async tunnelToward(target: Vec3, within = 3.2, maxMs = UNDERGROUND_MAX_MS): Promise<{ ok: boolean; detail: string }> {
+    const t0 = Date.now();
+    const center = target.offset(0.5, 0.5, 0.5);
+    const near = (): boolean => this.bot.entity.position.offset(0, 1, 0).distanceTo(center) <= within;
+    let steps = 0;
+    const startFeet = this.bot.entity.position.floored();
+    const run0 = Math.abs(target.x - startFeet.x) + Math.abs(target.z - startFeet.z); // stairs run along the axes: Manhattan
+    const drop0 = Math.max(0, startFeet.y - (Math.floor(target.y) + 1));
+    // the descent needs `drop0` stair steps; if the target is nearer than that in plan, go away first and come back
+    let away = run0 < drop0 ? Math.ceil((drop0 - run0) / 2) : 0;
+    const maxSteps = Math.ceil(run0 + drop0 + 2 * away) + 24;
+    this.log(`tunnelling to (${target.x}, ${target.y}, ${target.z}): ${run0} across, ${drop0} down`);
+    while (!near()) {
+      if (this.aborted) return { ok: false, detail: "cancelled" };
+      if (Date.now() - t0 > maxMs) return { ok: false, detail: "ran out of time tunnelling" };
+      if (steps++ > maxSteps) return { ok: false, detail: `tunnelled ${steps} steps without getting there` };
+      const feet = this.bot.entity.position.floored();
+      const dx = target.x - feet.x;
+      const dz = target.z - feet.z;
+      const below = feet.y > Math.floor(target.y) + 1;
+      let pref: { dx: number; dz: number };
+      if (dx === 0 && dz === 0) pref = this.initialDirection();
+      else pref = Math.abs(dx) >= Math.abs(dz) ? { dx: Math.sign(dx), dz: 0 } : { dx: 0, dz: Math.sign(dz) };
+      if (below && away > 0) {
+        pref = { dx: -pref.dx, dz: -pref.dz };
+        away -= 1;
+      }
+      if (!below && Math.floor(target.y) - feet.y > 2) return { ok: false, detail: `the target is ${Math.floor(target.y) - feet.y} blocks above the tunnel` };
+      const adv = await this.advance(pref, below);
+      if (!adv.ok) return { ok: false, detail: adv.reason };
+    }
+    return { ok: true, detail: `tunnelled to within ${within} blocks` };
+  }
+
   private initialDirection(): { dx: number; dz: number } {
     const yaw = this.bot.entity.yaw;
     // mineflayer yaw 0 = -z (north); east = -pi/2
@@ -620,7 +681,7 @@ class Explorer {
     preferred: { dx: number; dz: number },
     down: boolean,
   ): Promise<{ ok: true; dir: { dx: number; dz: number } } | { ok: false; reason: string }> {
-    if (this.fromStart() > MAX_FROM_START) return { ok: false, reason: `${MAX_FROM_START} blocks from the start` };
+    if (this.fromOrigin() > MAX_FROM_START) return { ok: false, reason: `${MAX_FROM_START} blocks from the start` };
     const feet = this.bot.entity.position.floored();
     let firstReason = "";
     for (const d of directionOrder(preferred)) {

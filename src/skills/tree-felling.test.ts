@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Vec3 } from "vec3";
-import { fellInfo, posKey, rankLogs, speciesViewScore, type BlockAt } from "./tree-felling.js";
+import { fellInfo, HIGH_LOG_HEIGHT, posKey, rankLogs, speciesViewScore, treeToWriteOff, type BlockAt } from "./tree-felling.js";
 
 /** Tiny world: stone floor at y=0, everything else air unless set. */
 function world(blocks: Record<string, string>): BlockAt {
@@ -76,5 +76,28 @@ describe("rankLogs", () => {
     for (let y = 8; y <= 12; y++) b[`0,${y},0`] = "jungle_log"; // floating canopy limb
     const at = world(b);
     expect(speciesViewScore(at, [new Vec3(0, 8, 0)], new Vec3(0, 1, 0))).toBeNull();
+  });
+});
+
+describe("tree nav traps (live 2026-10-11: 13 no_path failures at 3 tree clusters)", () => {
+  it("one failed log at the edge of reach writes off the whole tree; a low log needs two failures", () => {
+    const b: Record<string, string> = {};
+    trunk(b, 0, 0, 9, "oak_log");
+    const lowTree: Record<string, string> = { ...b };
+    for (let y = 1; y < 1 + HIGH_LOG_HEIGHT; y++) delete b[`0,${y},0`]; // the three lowest are felled: the next log is at the edge of reach
+    const high = treeToWriteOff(world(b), new Vec3(0, 1 + HIGH_LOG_HEIGHT, 0), 1);
+    expect(high).not.toBeNull();
+    expect(high!.size).toBe(9 - HIGH_LOG_HEIGHT);
+    expect(high!.has("0,9,0")).toBe(true);
+    expect(treeToWriteOff(world(lowTree), new Vec3(0, 1, 0), 1)).toBeNull();
+    expect(treeToWriteOff(world(lowTree), new Vec3(0, 1, 0), 2)!.size).toBe(9);
+  });
+  it("a log at the edge of reach ranks behind a lower log of an equally near tree", () => {
+    const b: Record<string, string> = {};
+    trunk(b, 5, 0, 3, "oak_log");
+    trunk(b, -5, 0, 7, "oak_log");
+    for (let y = 1; y <= 3; y++) delete b[`-5,${y},0`];
+    const r = rankLogs(world(b), [new Vec3(5, 1, 0), new Vec3(-5, 4, 0)], new Vec3(0, 1, 0));
+    expect(r.ranked[0]!.pos.x).toBe(5);
   });
 });

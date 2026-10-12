@@ -25,7 +25,7 @@ All 41 registered tools are shipped. Pending (low value, see [ROADMAP.md](ROADMA
 
 | Group | Tools | Notes |
 |---|---|---|
-| **Jobs (v2)** | `achieve`, `build`, `surviveNight`, `cancelJob`, `followPlayer` | Start/stop background jobs and return at once. See [Job tools](#job-tools-v2). |
+| **Jobs (v2)** | `achieve`, `build`, `surviveNight`, `find`, `cancelJob`, `followPlayer` | Start/stop background jobs and return at once. See [Job tools](#job-tools-v2). |
 | Perception / chat | `observeSurroundings`, `checkInventory`, `say`, `whisper` | |
 | Movement | `goTo`, `stop`, `pillarUp` | `goTo`: natural-terrain-only pathing, no placing. |
 | World | `mineBlock`, `mineBlocks`, `placeBlock`, `placeBlocks` | v2: counts what lands in the inventory. |
@@ -597,7 +597,7 @@ Composite: `goTo(player)` via pathfinder `GoalNear(reach=2)`, then `lookAt` the 
 
 ## Job tools (v2)
 
-These start/stop background jobs ([JOBS.md](JOBS.md)) and **return at once**; the tool result ends with "reply briefly and end your turn — you'll get a [job finished]/[job failed] message". Calling any movement/mining/crafting tool while a job runs cancels it (exempt: `say whisper observeSurroundings checkInventory remember setTaskQueue advanceTaskQueue achieve build surviveNight cancelJob`). `state` is the `AchieveResult` `{ ok, jobId, message, rawNeeds?, unresolved? }`.
+These start/stop background jobs ([JOBS.md](JOBS.md)) and **return at once**; the tool result ends with "reply briefly and end your turn — you'll get a [job finished]/[job failed] message". Calling any movement/mining/crafting tool while a job runs cancels it (exempt: `say whisper observeSurroundings checkInventory remember setTaskQueue advanceTaskQueue achieve build surviveNight find cancelJob`). `state` is the `AchieveResult` `{ ok, jobId, message, rawNeeds?, unresolved? }`.
 
 ### `achieve` — get items via a planned background job
 
@@ -641,6 +641,19 @@ Sleeps in a bed within reach, else digs a sealed 1x2 pocket into the ground or a
 |---|---|
 | Success | `night job started: <summary>. It runs in the background (digging in or building, then waiting inside until dawn); …`; ends `[job finished] survived the night — <detail>` |
 | Failures | `creative mode: mobs can't hurt you, so there is nothing to survive. Just carry on.` · `it's daytime (time <t>); there is nothing to shelter from. Night starts around 12500 (dusk ~11000).` · `the job runner isn't available right now` · hut refusals (`no_site`, ledger) · `[job failed]` kinds `died` / `timeout` / `no_site` / `build_incomplete` |
+
+### `find` — locate a block (ore) and point it out / mine it / report it
+
+```ts
+find(bot, { block: string, action?: "point" | "mine" | "report", count?: number /* mine: 1..16 */ }): Promise<SkillResult>
+```
+
+`block` = a block id (`diamond_ore`, `oak_log`) or an ore word (`diamond`, `iron`); ores expand to the stone + deepslate variants. Starts a `find` job (JOBS.md *Find job*): remembered sightings, then everything in the loaded chunks, then exploring (deep ores: a staircase down to the ore's Y band + branch tunnel, relocating off water first; surface blocks: a spiral walk); max 250 blocks from the start, ~10 min. `point` (default) = stand next to it, don't mine; `mine` = mine `count`; `report` = coordinates only. Works in creative (where `achieve` just `getItems`).
+
+| | |
+|---|---|
+| Success | `find started: point out diamond_ore (…). It runs in the background …`; ends `[job finished] found diamond_ore at x, y, z (…)` |
+| Failures | `"<x>" isn't a block I know (did you mean …)` · `action must be one of point, mine, report` · `the job runner isn't available right now` · later `[job failed] find … — failure: no_source — no reachable <block> found within 250 blocks of where I started …` / `missing_tool` (found it, can't mine it: needs the right pickaxe; the message has the coordinates) |
 
 ### `cancelJob` — abandon the running job
 

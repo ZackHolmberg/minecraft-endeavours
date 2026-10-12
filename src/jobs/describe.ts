@@ -40,6 +40,7 @@ export function goalsText(goals: readonly Goal[]): string {
 /** Short name of what a job is doing: "achieve iron_pickaxe x1", "build house (...)", plus "→ deliver to X". */
 export function jobLabel(job: Job): string {
   if (job.kind === "follow" && job.follow) return `follow ${job.follow.player}`;
+  if (job.kind === "find" && job.find) return `find ${job.find.block} (${job.find.action})`;
   const base = job.kind === "build" && job.build ? `build ${job.build.blueprint}${job.build.summary ? ` (${job.build.summary})` : ""}` : `achieve ${goalsText(job.generic ?? job.goals)}`;
   return job.deliverTo ? `${base} → give to ${job.deliverTo}` : base;
 }
@@ -81,6 +82,26 @@ export function formatJobEvent(job: Job): string | null {
     }
     return null;
   }
+  if (job.kind === "find" && job.find) {
+    const f = job.find;
+    const at = f.found ? `${f.found.x}, ${f.found.y}, ${f.found.z}` : "";
+    if (job.status === "done") {
+      const how =
+        f.action === "point"
+          ? `I'm standing next to it and did not mine it.`
+          : f.action === "mine"
+            ? `${f.result ?? "mined it"}.`
+            : `I did not go there; this is only the location.`;
+      return `[job finished] found ${f.block} at ${at} (${dur}${who}). ${how} Tell them in one short line with the coordinates.`;
+    }
+    if (job.status === "failed" && job.failure) {
+      return (
+        `[job failed] find ${f.block} (${f.action}) — failure: ${job.failure.kind} — ${job.failure.detail}${who}. ` +
+        `Tell them in one short line what stopped you and what you tried; don't call find again with the same arguments unless they ask you to keep looking (or suggest another direction / area).`
+      );
+    }
+    return null;
+  }
   if (job.status === "done") {
     if (job.kind === "build" && job.build) {
       const b = job.build;
@@ -115,6 +136,12 @@ export function jobContextLines(job: Job | null, now = Date.now()): string[] {
     const L = [`following ${job.follow.player} (${formatDuration(now - job.startedAt)})`, `progress: ${job.progress}`];
     if (job.requestedBy) L.push(`requested by: ${job.requestedBy}`);
     L.push("it runs by itself and keeps going while you chat: answer with say/whisper and end your turn. Movement/mining/crafting tools you call cancel it. To stop following call cancelJob (or stop).");
+    return L;
+  }
+  if (job.status === "running" && job.kind === "find" && job.find) {
+    const L = [`looking for ${job.find.block} to ${job.find.action === "mine" ? "mine" : job.find.action === "point" ? "point out" : "report"} (${formatDuration(now - job.startedAt)})`, `progress: ${job.progress}`];
+    if (job.requestedBy) L.push(`requested by: ${job.requestedBy}`);
+    L.push("it runs by itself and keeps going while you chat: answer with say/whisper and end your turn. Movement/mining/crafting tools you call cancel it. To stop call cancelJob (or stop).");
     return L;
   }
   if (job.status === "running") {

@@ -4,7 +4,7 @@ import pathfinderPkg from "mineflayer-pathfinder";
 const { goals } = pathfinderPkg;
 import { Vec3 } from "vec3";
 import { getBotState } from "../state/index.js";
-import { findStandSpotNear, flyTo, land } from "./flight.js";
+import { findStandSpotNear, flyLongTrip, flyTo, land } from "./flight.js";
 import { isCreative } from "./game-mode.js";
 import { resolveBlock } from "./item-naming.js";
 import { navigate } from "./navigation.js";
@@ -14,6 +14,8 @@ import type { GoToTarget, SkillResult } from "./types.js";
 const DEFAULT_REACH = 1;
 /** Creative: targets at least this far above the feet are flown to first. */
 const CREATIVE_FLY_FIRST_DY = 4;
+/** Creative: a trip at least this far (horizontally) is flown over the terrain in hops, then finished on foot. */
+export const CREATIVE_FLY_FAR = 48;
 const SEARCH_RADIUS_FOR_BLOCK = 64;
 const PATH_CHECK_TIMEOUT_MS = 5_000;
 // 3 reads like a person tagging along; 2 has the bot stepping on heels and
@@ -44,6 +46,10 @@ export async function goTo(bot: Bot, { target, reach = DEFAULT_REACH }: GoToPara
   // up here" from a roof) is reached by flying, and flight is the fallback
   // when walking can't get there. Only along a verified-clear line.
   const creative = isCreative(bot);
+  if (creative && Math.hypot(destination.x - bot.entity.position.x, destination.z - bot.entity.position.z) >= CREATIVE_FLY_FAR) {
+    const trip = await flyLongTrip(bot, destination, label);
+    if (trip.flew > 0) console.log(`[${bot.username}] goTo: flew ${trip.flew} blocks toward ${label}${trip.note ? ` (${trip.note})` : ""}`);
+  }
   if (creative && destination.y - bot.entity.position.y >= CREATIVE_FLY_FIRST_DY) {
     const flown = await flyToStand(bot, destination, reach, label);
     if (flown.ok) return flown;

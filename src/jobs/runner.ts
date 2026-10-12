@@ -18,6 +18,7 @@
 import type { Facing } from "../build/types.js";
 import { stepOutputItem, describeStep, goalsText, jobLabel } from "./describe.js";
 import { FOLLOW_MAX_MS } from "./follow.js";
+import { FIND_MAX_MS } from "./find.js";
 import { planReservations } from "./reserve.js";
 import { emptyExhausted, excludeFor, noteExhausted, type ExcludeFn } from "./exhausted.js";
 import { inNightWindow, shelterGeometry, type ShelterGeometry } from "./night.js";
@@ -36,7 +37,7 @@ import { isGoalTag } from "../planner/knowledge/tags.js";
 import type { FailureKind, Goal, PlanFn, Plan, Step, StepFailure, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import type { StopReason } from "../state/cancellation.js";
-import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, FollowOutcome, FollowState, Job, JobStatus, JobStepFailure, ScaffoldCell, StepResult } from "./types.js";
+import type { AchieveResult, BuildOutcome, BuildPrep, BuildSpec, FindOutcome, FindState, FollowOutcome, FollowState, Job, JobStatus, JobStepFailure, ScaffoldCell, StepResult } from "./types.js";
 
 export interface StepRunContext {
   signal: AbortSignal;
@@ -136,6 +137,22 @@ export interface FollowDeps {
   run: (spec: FollowState, ctx: FollowRunContext) => Promise<FollowOutcome>;
 }
 
+export interface FindRunContext {
+  signal: AbortSignal;
+  jobId: string;
+  /** Epoch ms after which the search must wrap up (the job's 10-minute cap). */
+  deadline: number;
+  record: (e: TelemetryInput) => void;
+  /** Live progress line for the context block (persisted with the job). */
+  progress: (text: string) => void;
+}
+
+/** Bot-bound half of a find job (src/jobs/steps/find.ts); injected so the runner stays testable. */
+export interface FindDeps {
+  /** Locate the block, then point / mine / report. Resolves quietly on abort (the runner already ended the job). */
+  run: (spec: FindState, ctx: FindRunContext) => Promise<FindOutcome>;
+}
+
 /** Hand `goals` to player `to`; verifies the hand-over. */
 export type DeliverFn = (to: string, goals: Goal[], ctx: StepRunContext) => Promise<StepResult>;
 
@@ -153,10 +170,14 @@ export interface RunnerDeps {
   deliver?: DeliverFn;
   /** Follow job (live-test fix 2026-10-10): follow a player in the background. Absent => `startFollow` refuses. */
   follow?: FollowDeps;
+  /** Find job (live polish C): locate a block (ore) and point / mine / report it. Absent => `startFind` refuses. */
+  find?: FindDeps;
   /** Slice 2c-B: night survival (sleep / wait in the shelter). Absent ⇒ `surviveNight` refuses. */
   night?: NightDeps;
   /** Inventory count of an item (postcondition baselines). */
   countItem: (item: string) => number;
+  /** Total items held (any kind): the gather no-progress watchdog reads it. Absent => no watchdog. */
+  progress?: () => number;
   /** The bot's position (centre for an exhausted area when a failure reported no positions). Optional: tests may omit. */
   position?: () => { x: number; y: number; z: number };
   /** Ask the running skill to wind down (cancellation flag + pathfinder.stop). */
@@ -198,6 +219,14 @@ const PHASE_STEP: Step = { op: "place_station", block: "crafting_table" };
 const CANCEL_WAIT_MS = 35_000;
 /** After a step's own timeout fires (cooperative stop), how long a skill that ignores it gets before being abandoned. */
 export const STEP_GRACE_MS = 20_000;
+/**
+ * A gather step that gains nothing for this long is stuck (dig-fail / drowning / pit-avoid loops, an unreachable
+ * cluster): it is stopped and reported `unreachable` + `stalled` so the recovery ladder (relocate, widen, explore) runs
+ * long before the step's total cap (4 min + 20 s/item). Any inventory increase resets the clock.
+ */
+export const GATHER_NO_PROGRESS_MS = 60_000;
+/** How often the no-progress watchdog samples the inventory. */
+const PROGRESS_POLL_MS = 2_000;
 
 /** Await `p`, but give up after `ms`; the timer never outlives the race. */
 async function waitUpTo(p: Promise<unknown>, ms: number): Promise<void> {
@@ -286,6 +315,39 @@ export class JobRunner {
     const run = this.chain.then(() => this.startFollowInner(spec, requestedBy));
     this.chain = run.catch(() => undefined);
     return run;
+  }
+
+  /** Start a find job (replaces the running job). Returns at once; the search runs up to 10 minutes. */
+  startFind(spec: FindState, requestedBy: string | null): Promise<AchieveResult> {
+    const run = this.chain.then(() => this.startFindInner(spec, requestedBy));
+    this.chain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async startFindInner(spec: FindState, requestedBy: string | null): Promise<AchieveResult> {
+    if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
+    if (!this.deps.find) return { ok: false, jobId: null, message: "searching isn't available right now" };
+    if (this.isRunning()) await this.cancel("replaced by a new job");
+    await this.settleReclaim();
+    if (this.disposed) return { ok: false, jobId: null, message: "job runner is shut down" };
+    const now = this.now();
+    const summary = `find ${spec.block} (${spec.action})`;
+    const job: Job = {
+      id: newJobId(now),
+      kind: "find",
+      goals: [],
+      requestedBy,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      plan: { goals: [], steps: [], rawNeeds: {}, unresolved: [], summary: "" },
+      stepIndex: 0,
+      replans: 0,
+      progress: `looking for ${spec.block}`,
+      failure: null,
+      find: { ...spec },
+    };
+    return this.launch(job, summary, {}, (j, c) => this.runFindJob(j, c));
   }
 
   private async startFollowInner(spec: FollowState, requestedBy: string | null): Promise<AchieveResult> {
@@ -538,7 +600,7 @@ export class JobRunner {
     this.job = job;
     this.persist(job);
     this.reservePlan(job.plan);
-    this.deps.record({ kind: "job_start", jobId: job.id, goals: job.kind === "build" ? [{ item: `build:${job.build!.blueprint}`, count: 1 }, ...job.goals] : job.kind === "follow" ? [{ item: `follow:${job.follow!.player}`, count: 1 }] : job.goals, steps: job.plan.steps.length + (job.kind === "build" ? 1 : 0) });
+    this.deps.record({ kind: "job_start", jobId: job.id, goals: job.kind === "build" ? [{ item: `build:${job.build!.blueprint}`, count: 1 }, ...job.goals] : job.kind === "follow" ? [{ item: `follow:${job.follow!.player}`, count: 1 }] : job.kind === "find" ? [{ item: `find:${job.find!.block}`, count: 1 }] : job.goals, steps: job.plan.steps.length + (job.kind === "build" ? 1 : 0) });
     const ctrl = new AbortController();
     this.ctrl = ctrl;
     this.loop = body(job, ctrl).catch((err) => {
@@ -585,7 +647,7 @@ export class JobRunner {
       return;
     }
     const step = job.plan.steps[Math.min(job.stepIndex, job.plan.steps.length - 1)] ?? PHASE_STEP; // builds / night holds with no material steps have none
-    const what = job.kind === "follow" ? `following ${job.follow?.player ?? "the player"}` : describeStep(step);
+    const what = job.kind === "follow" ? `following ${job.follow?.player ?? "the player"}` : job.kind === "find" ? `finding ${job.find?.block ?? "a block"}` : describeStep(step);
     const failure: StepFailure =
       reason === "death"
         ? { kind: "died", step, detail: `the bot died during "${what}" (its items dropped where it died)`, attempts: 1 }
@@ -905,7 +967,8 @@ export class JobRunner {
 
   private async runStep(job: Job, step: Step, ctx: StepRunContext): Promise<StepResult> {
     const t0 = this.now();
-    const res = await this.timed(step, describeStep(step), stepTimeoutMs(step), () => this.deps.execute(step, ctx));
+    const watch = step.op === "gather" && this.deps.progress ? { read: this.deps.progress, idleMs: GATHER_NO_PROGRESS_MS } : undefined;
+    const res = await this.timed(step, describeStep(step), stepTimeoutMs(step), () => this.deps.execute(step, ctx), watch);
     this.deps.record({
       kind: "step",
       jobId: job.id,
@@ -923,19 +986,47 @@ export class JobRunner {
    * the skill ignores it, abandon it. `step` is the failure's step (a placeholder
    * for build / deliver phases).
    */
-  private async timed(step: Step, label: string, limit: number, exec: () => Promise<StepResult>): Promise<StepResult> {
+  private async timed(step: Step, label: string, limit: number, exec: () => Promise<StepResult>, watch?: { read: () => number; idleMs: number }): Promise<StepResult> {
     let timedOut = false;
+    let stalled = false;
     let abandonTimer: NodeJS.Timeout | undefined;
     // The runner owns step timeouts (job steps run without the skill watchdog):
     // first a cooperative stop, then, if the skill ignores it, abandon the step.
     const timer = setTimeout(() => {
       timedOut = true;
       this.stopInternal();
+      if (abandonTimer) clearTimeout(abandonTimer);
       abandonTimer = setTimeout(() => {
         this.stopInternal();
         giveUp({ ok: false, failure: { kind: "timeout", step, detail: `${label} did not stop after its ${Math.round(limit / 1000)}s limit and was abandoned`, attempts: 1 } });
       }, STEP_GRACE_MS);
     }, limit);
+    // No-progress watchdog (gather): sampled by counting polls, not by wall clock, so it is deterministic under fake timers.
+    let progressTimer: NodeJS.Timeout | undefined;
+    if (watch) {
+      let last = watch.read();
+      let idle = 0;
+      const poll = (): void => {
+        if (timedOut || stalled) return;
+        const cur = watch.read();
+        if (cur > last) idle = 0;
+        else idle += PROGRESS_POLL_MS;
+        last = cur; // a decrease (auto-eat, a craft) re-baselines without counting as progress
+        if (idle >= watch.idleMs) {
+          stalled = true;
+          this.stopInternal();
+          if (!abandonTimer) {
+            abandonTimer = setTimeout(() => {
+              this.stopInternal();
+              giveUp({ ok: false, failure: { kind: "unreachable", step, detail: `${label} made no progress for ${Math.round(watch.idleMs / 1000)}s and did not stop; abandoned`, attempts: 1, stalled: true } as JobStepFailure });
+            }, STEP_GRACE_MS);
+          }
+          return;
+        }
+        progressTimer = setTimeout(poll, PROGRESS_POLL_MS);
+      };
+      progressTimer = setTimeout(poll, PROGRESS_POLL_MS);
+    }
     let giveUp: (r: StepResult) => void = () => {};
     const abandoned = new Promise<StepResult>((resolve) => {
       giveUp = resolve;
@@ -950,10 +1041,18 @@ export class JobRunner {
       };
     } finally {
       clearTimeout(timer);
+      if (progressTimer) clearTimeout(progressTimer);
       if (abandonTimer) clearTimeout(abandonTimer);
     }
     if (timedOut && !res.ok && res.failure.kind === "cancelled") {
       res = { ok: false, failure: { ...res.failure, kind: "timeout", detail: `${label} timed out after ${Math.round(limit / 1000)}s` } };
+    } else if (stalled && !timedOut && !res.ok && (res.failure.kind === "cancelled" || res.failure.kind === "timeout" || res.failure.kind === "unreachable")) {
+      // Our own stop made the skill return "cancelled": that is a stuck gather, not a player stop. Keep the positions it gave up on.
+      const f = res.failure as JobStepFailure;
+      res = {
+        ok: false,
+        failure: { ...f, kind: "unreachable", stalled: true, detail: `${label}: nothing gained for ${Math.round((watch?.idleMs ?? 0) / 1000)}s (stuck, dig failures or pathing loops)${f.detail && f.kind !== "cancelled" ? ` — ${f.detail}` : ""}`.slice(0, 240) },
+      };
     }
     return res;
   }
@@ -1010,6 +1109,41 @@ export class JobRunner {
     if (job.status !== "running" || ctrl.signal.aborted) return;
     if (out.ok) this.finish(job, "done", null);
     else this.finish(job, "failed", { kind: out.kind, step: PHASE_STEP, detail: out.detail, attempts: 1 });
+  }
+
+  /** Find job body: the bot-bound runner does the work under a hard cap; this maps how it ended onto the job status. */
+  private async runFindJob(job: Job, ctrl: AbortController): Promise<void> {
+    const find = this.deps.find;
+    const spec = job.find!;
+    if (!find) {
+      this.finish(job, "failed", { kind: "internal", step: PHASE_STEP, detail: "searching isn't available", attempts: 1 });
+      return;
+    }
+    let outcome: FindOutcome | null = null;
+    const res = await this.timed(PHASE_STEP, `finding ${spec.block}`, FIND_MAX_MS, async () => {
+      outcome = await find.run(spec, {
+        signal: ctrl.signal,
+        jobId: job.id,
+        deadline: job.startedAt + FIND_MAX_MS,
+        record: (e) => this.deps.record(e),
+        progress: (text) => this.setProgress(job, text),
+      });
+      return outcome.ok
+        ? ({ ok: true, detail: outcome.detail } satisfies StepResult)
+        : ({ ok: false, failure: { kind: outcome.kind, step: PHASE_STEP, detail: outcome.detail, attempts: 1 } } satisfies StepResult);
+    });
+    // Stopped by the player, replaced, or interrupted: the job already ended quietly (no event).
+    if (job.status !== "running" || ctrl.signal.aborted) return;
+    const o = outcome as FindOutcome | null;
+    if (o?.found) spec.found = o.found;
+    if (res.ok) {
+      spec.result = res.detail;
+      this.finish(job, "done", null);
+    } else {
+      const f = res.failure;
+      if (spec.found) f.detail = `${f.detail} (it is at ${spec.found.x}, ${spec.found.y}, ${spec.found.z})`.slice(0, 240);
+      this.finish(job, "failed", f);
+    }
   }
 
   /** Build job body: materials via the normal plan loop, then the builder, retried a couple of times (it resumes). */

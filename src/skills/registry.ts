@@ -25,7 +25,7 @@
 
 import type { Bot } from "mineflayer";
 import { z } from "zod";
-import { achieve, build, cancelJob, followPlayer as followPlayerJob, surviveNight } from "../jobs/tools.js";
+import { achieve, build, cancelJob, find, followPlayer as followPlayerJob, surviveNight } from "../jobs/tools.js";
 import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
@@ -615,6 +615,18 @@ export const SKILL_SPECS: SkillSpec[] = [
       deliverTo: z.string().min(1).optional().describe("Player name to hand the finished items to (they must be nearby)"),
     },
     run: withParams("achieve", achieve, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "find",
+    description:
+      "Go find a block (usually an ore) as a background job and return at once; works in survival and creative. It uses what is already known, scans everything loaded, then explores: for deep ores (diamond, iron, gold, redstone, lapis) it digs a staircase down to the ore's depth and a branch tunnel (never straight down), for surface blocks (logs, coal, sand, ...) it walks a spiral, moving away from water first; max ~250 blocks out and ~10 minutes. action 'point' (default): stand next to it and tell where, without mining it ('find diamonds but don't mine them'); 'mine': mine `count` of it (survival needs the right pickaxe; creative drops nothing); 'report': only give the coordinates. block = a block id (diamond_ore, iron_ore, oak_log) or an ore word (diamond). After it starts reply briefly and end your turn; you get '[job finished]' (with coordinates) or '[job failed]'. Don't call movement/mining tools while it runs (that cancels it).",
+    schema: {
+      block: z.string().min(1).describe("Block id or ore word, e.g. 'diamond_ore', 'diamond', 'iron_ore', 'oak_log'"),
+      action: z.enum(["point", "mine", "report"]).optional().describe("point = stand next to it and say where (default); mine = mine it; report = just the coordinates"),
+      count: z.number().int().min(1).max(16).optional().describe("action mine: how many (default 1)"),
+    },
+    run: withParams("find", find, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
   {

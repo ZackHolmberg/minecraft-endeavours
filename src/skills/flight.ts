@@ -15,8 +15,10 @@
  *    on double-tap jump (best effort).
  *
  * Pathfinder walking stays the default everywhere. Flight is used for:
- * reaching build spots out of reach from the ground (placeBlocks), and goTo
- * targets well above the bot or unreachable on foot ("come up here").
+ * reaching build spots out of reach from the ground (placeBlocks), goTo
+ * targets well above the bot or unreachable on foot ("come up here"), long goTo
+ * trips in creative (`flyLongTrip`), and the follow job when the followed player
+ * is flying (`flyFollowTick`, one 0.5-block step per 50 ms tick).
  * Hovering is left on after a build; `land()` runs before any other skill
  * (harness) and on every `game` event (mode change, respawn).
  */
@@ -166,6 +168,100 @@ export async function flyTo(bot: Bot, dest: Vec3, label: string): Promise<SkillR
     if (r === "timeout") return { ok: false, message: `flight to ${label} timed out` };
   }
   return { ok: true, message: `flew to ${label}` };
+}
+
+export interface FlyFollowResult {
+  /** The bot is within `dist` (+ slack) of the target and hovering. */
+  arrived: boolean;
+  /** The step toward the target was refused: every candidate step would put the body inside a block (or an unloaded chunk). */
+  blocked: boolean;
+}
+
+/** Hover this far inside "arrived" so a player drifting a little does not make the bot jitter. */
+const FOLLOW_ARRIVE_SLACK = 1.0;
+/** Over-the-obstacle detours stop this far above the followed player. */
+const FOLLOW_MAX_CLIMB = 24;
+
+/**
+ * One creative-flight step of the follow job: move <= 0.5 blocks toward the point `dist` blocks from `target` (on the line
+ * to the bot, so it stops beside the player, not inside them), only if the new body volume is free of blocks. A refused
+ * straight step tries up, then each axis alone, then gives up for this tick (`blocked`) and keeps hovering. Takes off on
+ * first use; `land()` / `stopFlyingNow()` ends it. Never flies in survival.
+ */
+export function flyFollowTick(bot: Bot, target: Vec3, dist: number): FlyFollowResult {
+  if (!isCreative(bot) || !bot.entity) return { arrived: false, blocked: true };
+  if (!isFlying(bot)) startFlying(bot);
+  bot.physics.gravity = 0;
+  bot.entity.velocity.set(0, 0, 0);
+  const pos = bot.entity.position;
+  const d = pos.minus(target);
+  const len = d.norm();
+  if (len <= dist + FOLLOW_ARRIVE_SLACK) return { arrived: true, blocked: false };
+  const goal = len > 0 ? target.plus(d.scaled(dist / len)) : target.clone();
+  const toGoal = goal.minus(pos);
+  const gl = toGoal.norm();
+  if (gl < 1e-6) return { arrived: true, blocked: false };
+  const step = toGoal.scaled(Math.min(STEP, gl) / gl);
+  // Straight on; else sideways at the same height (slides along / over an obstacle), each axis alone, then up (over it).
+  // Going down is only ever part of the straight step, so a wall cannot make it bob up and down.
+  const flat = new Vec3(step.x, 0, step.z);
+  const flatLen = flat.norm();
+  const tries = [step, ...(flatLen > 1e-6 ? [flat.scaled(Math.min(STEP, gl) / flatLen)] : []), new Vec3(step.x, 0, 0), new Vec3(0, 0, step.z), new Vec3(0, STEP, 0)];
+  for (const [i, t] of tries.entries()) {
+    if (t.norm() < 1e-6) continue;
+    // climbing over an obstacle is fine, climbing forever is not: stop going up well above the player
+    if (i === tries.length - 1 && pos.y >= target.y + FOLLOW_MAX_CLIMB) continue;
+    const next = pos.plus(t);
+    if (bodyClearAt(bot, next)) {
+      pos.set(next.x, next.y, next.z);
+      return { arrived: false, blocked: false };
+    }
+  }
+  return { arrived: false, blocked: true };
+}
+
+/** y of the first free cell above the topmost solid block of column (x,z) near `aroundY` (feet height to hover at), null when unloaded. */
+export function columnHoverY(bot: Bot, x: number, z: number, aroundY: number, clearance = 2): number | null {
+  const top = Math.min(Math.floor(aroundY) + 40, 318);
+  const bottom = Math.max(Math.floor(aroundY) - 60, -64);
+  for (let y = top; y >= bottom; y--) {
+    const b = bot.blockAt(new Vec3(Math.floor(x), y, Math.floor(z)));
+    if (!b) return null;
+    if (b.boundingBox !== "empty") return y + 1 + clearance;
+  }
+  return null;
+}
+
+/**
+ * Creative long trip: hop toward `dest` at hover height over the terrain (<= 4 hops of <= 80 blocks, along a verified-clear
+ * route each time) until it is within `finishWithin` blocks horizontally, then land so the normal walk/stand logic takes over.
+ * Stops quietly at the first hop that cannot be flown (blocked line, unloaded chunk); the caller walks the rest.
+ * Returns how far it flew.
+ */
+export async function flyLongTrip(bot: Bot, dest: Vec3, label: string, finishWithin = 40): Promise<{ flew: number; note: string }> {
+  if (!isCreative(bot)) return { flew: 0, note: "not creative" };
+  const start = bot.entity.position.clone();
+  let note = "";
+  for (let hop = 0; hop < 4; hop++) {
+    const here = bot.entity.position;
+    const remaining = Math.hypot(dest.x - here.x, dest.z - here.z);
+    if (remaining <= finishWithin) break;
+    const f = Math.min(80, remaining - finishWithin * 0.5) / remaining;
+    const hx = here.x + (dest.x - here.x) * f;
+    const hz = here.z + (dest.z - here.z) * f;
+    const hy = columnHoverY(bot, hx, hz, Math.max(here.y, dest.y));
+    if (hy === null) {
+      note = "chunks ahead not loaded";
+      break;
+    }
+    const r = await flyTo(bot, new Vec3(Math.floor(hx) + 0.5, hy, Math.floor(hz) + 0.5), `${label} (hop ${hop + 1})`);
+    if (!r.ok) {
+      note = r.message;
+      break;
+    }
+  }
+  await land(bot);
+  return { flew: Math.round(Math.hypot(bot.entity.position.x - start.x, bot.entity.position.z - start.z)), note };
 }
 
 function solid(bot: Bot, p: Vec3): boolean {

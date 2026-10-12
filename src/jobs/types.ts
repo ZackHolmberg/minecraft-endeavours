@@ -13,7 +13,7 @@ import type { PocketPlan } from "./pocket.js";
 
 export type JobStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
 
-export type JobKind = "achieve" | "build" | "follow";
+export type JobKind = "achieve" | "build" | "follow" | "find";
 
 /** What a `build` job was asked for (slice 3). `anchor` is the resolved "here" (requester, else bot). */
 export interface BuildSpec {
@@ -33,6 +33,31 @@ export interface FollowState {
   player: string;
   dist: number;
 }
+
+/** What a `find` job should do once it has located the block. */
+export type FindAction = "point" | "mine" | "report";
+
+/** What a `find` job looks for and what it found (persisted with the job; src/jobs/find.ts). */
+export interface FindState {
+  /** Canonical block name ("diamond_ore"). */
+  block: string;
+  /** Every block that counts (stone + deepslate variants). */
+  blocks: string[];
+  action: FindAction;
+  /** action "mine": how many to take (1-16). */
+  count: number;
+  /** Where the search began (the 250-block cap is measured from here). */
+  origin?: Vec3;
+  /** Set when located: the block and where. */
+  found?: { x: number; y: number; z: number; block: string };
+  /** One-line outcome for the job event ("standing next to it", "mined 3"). */
+  result?: string;
+}
+
+/** How a find run ended. */
+export type FindOutcome =
+  | { ok: true; detail: string; found: { x: number; y: number; z: number; block: string } }
+  | { ok: false; kind: FailureKind; detail: string; found?: { x: number; y: number; z: number; block: string } };
 
 /** How a follow run ended on its own (a stop / new job is handled by the runner, not reported). */
 export type FollowOutcome =
@@ -103,6 +128,8 @@ export interface Job {
   build?: BuildState;
   /** Set when kind is "follow". */
   follow?: FollowState;
+  /** Set when kind is "find". */
+  find?: FindState;
   /** Set when the job failed at the hand-over to the player (not at gathering): not a goal-keyed failure for the ledger. */
   handoverFailed?: boolean;
   /** Scaffold blocks placed by a builder and not yet confirmed removed (survives stop/crash/restart; reclaimed by the next build or at boot). */
@@ -138,7 +165,11 @@ export interface AchieveResult {
 }
 
 /** A step failure; gathers also report which block positions they gave up on ("x,y,z"). */
-export type JobStepFailure = StepFailure & { positions?: string[] };
+export type JobStepFailure = StepFailure & {
+  positions?: string[];
+  /** A gather ended by the runner's no-progress watchdog (stuck, not out of sources): the ladder relocates/explores instead of retrying in place. */
+  stalled?: boolean;
+};
 
 /** Outcome of executing one step. */
 export type StepResult = { ok: true; detail: string } | { ok: false; failure: JobStepFailure };

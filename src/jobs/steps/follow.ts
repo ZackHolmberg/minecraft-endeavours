@@ -13,16 +13,22 @@ import type { Bot } from "mineflayer";
 import pathfinderPkg from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import { isSurfacing } from "../../skills/auto-behaviors.js";
+import { flyFollowTick, isFlying, land, stopFlyingNow } from "../../skills/flight.js";
+import { isCreative } from "../../skills/game-mode.js";
 import { navigate } from "../../skills/navigation.js";
 import { ensureMovements, type BotWithPathfinder } from "../../skills/pathfinder-config.js";
 import { getBotState } from "../../state/index.js";
-import { FollowTracker, followProgress, type FollowAction, type FollowObs, type Waypoint } from "../follow.js";
+import { FlightGate, FollowTracker, followProgress, playerAirborne, type FollowAction, type FollowObs, type Waypoint } from "../follow.js";
 import type { FollowDeps, FollowRunContext } from "../runner.js";
 import type { FollowOutcome, FollowState } from "../types.js";
 
 const { goals } = pathfinderPkg;
 
 const TICK_MS = 250;
+/** While flying after a player the position is stepped every 50 ms (0.5 blocks per step = creative fly speed). */
+const FLY_TICK_MS = 50;
+/** Not moving for this long while flying after a player who is not next to us (a wall of terrain between us) => land and let the pathfinder try. */
+const FLY_BLOCKED_LAND_MS = 6_000;
 /** Glance at the followed player while parked next to them. */
 const LOOK_RANGE = 8;
 /** One search leg's hard cap (navigate's own stuck detection usually ends it sooner). */
@@ -55,6 +61,13 @@ async function runFollow(bot: Bot, spec: FollowState, ctx: FollowRunContext): Pr
   ensureMovements(pBot);
 
   const tracker = new FollowTracker({ dist: spec.dist });
+  const gate = new FlightGate();
+  /** Flight stuck watch: where the bot was when it last moved >= 1.5 blocks (or hovered next to the player), and when. Still there after FLY_BLOCKED_LAND_MS => land. */
+  let flyAnchor: Vec3 | null = null;
+  let flyAnchorAt = 0;
+  /** After landing because the air route was blocked, walk for a while before taking off again (no hover/land ping-pong). */
+  let noFlyUntil = 0;
+  let flightNoted = false;
   let goal: InstanceType<typeof goals.GoalFollow> | null = null;
   let goalFor = -1;
   let lastProgress = "";
@@ -102,6 +115,32 @@ async function runFollow(bot: Bot, spec: FollowState, ctx: FollowRunContext): Pr
     }
   };
 
+  /** Creative only: is the followed player in the air (flying)? null = can't tell. */
+  const airborneNow = (): boolean | null => {
+    if (!isCreative(bot)) return false;
+    const e = bot.players[spec.player]?.entity;
+    if (!e) return null;
+    const fx = Math.floor(e.position.x);
+    const fz = Math.floor(e.position.z);
+    const fy = Math.floor(e.position.y - 0.05);
+    // NB: other players' `entity.onGround` is never updated by mineflayer (prismarine-entity initialises it to true): blocks only
+    return playerAirborne(undefined, (dy) => {
+      const b = bot.blockAt(new Vec3(fx, fy - dy + 1, fz));
+      if (!b) return null;
+      if (b.name === "water" || b.name === "lava") return "liquid";
+      return b.boundingBox === "block" ? "solid" : "free";
+    });
+  };
+
+  const landNow = async (why: string): Promise<void> => {
+    if (!isFlying(bot)) return;
+    console.log(`${tag} landing (${why})`);
+    gate.reset();
+    flyAnchor = null;
+    if (why.startsWith("blocked")) noFlyUntil = Date.now() + 20_000;
+    await land(bot);
+  };
+
   /** One search leg: walk to a waypoint, abandoning it the moment the player is back, gone, or the budget is spent. */
   const searchLeg = async (wp: Waypoint): Promise<void> => {
     dropGoal();
@@ -142,7 +181,31 @@ async function runFollow(bot: Bot, spec: FollowState, ctx: FollowRunContext): Pr
         await sleepAbortable(TICK_MS, ctx.signal);
         continue;
       }
-      const act: FollowAction = tracker.step(observe());
+      // Creative: follow a flying player through the air; land when they land (or the controls are taken away).
+      const fly = isCreative(bot) && Date.now() >= noFlyUntil ? gate.update(Date.now(), airborneNow()) : false;
+      if (!fly && isFlying(bot)) await landNow("player is on the ground");
+      if (!isCreative(bot) && isFlying(bot)) stopFlyingNow(bot);
+      const obs = observe();
+      const act: FollowAction = tracker.step(obs);
+      if (isFlying(bot) && (act.kind === "search" || act.kind === "fail")) await landNow("lost sight of the player");
+      if (fly && act.kind === "follow" && obs.target) {
+        if (!flightNoted) {
+          flightNoted = true;
+          console.log(`${tag} ${spec.player} is flying: following through the air`);
+          ctx.record({ kind: "recovery", jobId: ctx.jobId, rung: "fly", detail: `${spec.player} is airborne; flying after them` });
+        }
+        if (pBot.pathfinder.goal) dropGoal();
+        const r = flyFollowTick(bot, new Vec3(obs.target.x, obs.target.y, obs.target.z), spec.dist);
+        progress(r.arrived ? `flying with ${spec.player}` : `flying after ${spec.player}`);
+        if (r.arrived || !flyAnchor || bot.entity.position.distanceTo(flyAnchor) >= 1.5) {
+          flyAnchor = bot.entity.position.clone();
+          flyAnchorAt = Date.now();
+        } else if (Date.now() - flyAnchorAt >= FLY_BLOCKED_LAND_MS) {
+          await landNow("blocked in the air");
+        }
+        await sleepAbortable(FLY_TICK_MS, ctx.signal);
+        continue;
+      }
       const lostS = Math.round(tracker.lostForMs(Date.now()) / 1000);
       switch (act.kind) {
         case "fail":
@@ -180,5 +243,7 @@ async function runFollow(bot: Bot, spec: FollowState, ctx: FollowRunContext): Pr
     return { ok: true, detail: "stopped" };
   } finally {
     dropGoal();
+    // stopped, replaced or failed while airborne: come down (a cancelled job's next skill lands first anyway; this covers `say`-only turns)
+    if (isFlying(bot)) stopFlyingNow(bot);
   }
 }
