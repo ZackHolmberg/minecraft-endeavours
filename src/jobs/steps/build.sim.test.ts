@@ -1,0 +1,461 @@
+/**
+ * Executor simulation: the real Builder against an in-memory world. The skills it
+ * calls (placeBlock, navigate, activateBlock) are replaced by physics-lite fakes
+ * that enforce what the server would: reach, a solid neighbour, not placing into
+ * the bot's own body. Checks sequencing, the door-from-outside rule, scaffold
+ * removal and the block count, in survival and creative.
+ */
+import { describe, expect, it, vi } from "vitest";
+import type { Bot } from "mineflayer";
+import { Vec3 } from "vec3";
+import { prepare } from "../../build/prepare.js";
+import type { BuildRunContext } from "../runner.js";
+
+// ── fake world + bot ─────────────────────────────────────────────────────────
+type World = Map<string, string>;
+const k = (x: number, y: number, z: number): string => `${x},${y},${z}`;
+const SOLIDISH = (n: string): boolean => !/^(air|short_grass|poppy|water|wheat|nether_portal|fire)$/.test(n);
+
+interface Sim {
+  world: World;
+  inv: Record<string, number>;
+  pos: Vec3;
+  creative: boolean;
+  log: Array<{ op: string; at: string; botInside?: boolean; block?: string }>;
+  box: { x0: number; z0: number; x1: number; z1: number } | null;
+  /** The next N dug-up `dirt` blocks (scaffolds) drop nothing the bot can get. */
+  loseDrops: number;
+  /** Called after every successful placement (tests abort / throw from here). */
+  onPlace?: (type: string) => void;
+  /** Digging `dirt` throws (scaffold removal fails). */
+  failDig?: boolean;
+  health?: number;
+  /** Server-side refusal hook: return a message to make this placement fail (face = the reference face a real placeBlock would report). */
+  refuse?: (p: { x: number; y: number; z: number }, avoidFaces: string[]) => { message: string; face: string } | null;
+  /** Entities the bot can see (a mob / player standing in a cell). */
+  entities?: () => Array<{ type: string; position: Vec3; width: number; height: number; username?: string }>;
+  chats?: string[];
+}
+let sim: Sim;
+
+function nameAt(x: number, y: number, z: number): string {
+  const o = sim.world.get(k(x, y, z));
+  if (o !== undefined) return o;
+  if (Math.abs(x) > 60 || Math.abs(z) > 60) return "air";
+  return y === 63 ? "grass_block" : y < 63 ? "dirt" : "air";
+}
+const fakeBlock = (x: number, y: number, z: number) => {
+  const name = nameAt(x, y, z);
+  const solid = SOLIDISH(name);
+  return { name, position: new Vec3(x, y, z), boundingBox: solid ? "block" : "empty" };
+};
+const insideBox = (x: number, z: number): boolean => !!sim.box && x >= sim.box.x0 && x <= sim.box.x1 && z >= sim.box.z0 && z <= sim.box.z1;
+
+vi.mock("./util.js", () => ({ tracked: (_b: unknown, _n: string, p: unknown, fn: (p: unknown) => Promise<unknown>) => fn(p) }));
+vi.mock("../../state/index.js", () => ({ getBotState: () => undefined }));
+vi.mock("../../skills/pathfinder-config.js", () => ({ ensureMovements: () => {} }));
+vi.mock("../../skills/flight.js", () => ({ flyTo: async () => ({ ok: true, message: "" }), isFlying: () => false, land: async () => {} }));
+vi.mock("../../skills/game-mode.js", () => ({ isCreative: () => sim.creative }));
+vi.mock("../../skills/inventory.js", () => ({ pickUpNearby: async () => ({ ok: true, message: "" }) }));
+vi.mock("../../skills/creative.js", () => ({
+  getItems: async (_b: unknown, { items }: { items: Array<{ name: string; count: number }> }) => {
+    for (const i of items) sim.inv[i.name] = Math.max(sim.inv[i.name] ?? 0, i.count);
+    return { ok: true, message: "got" };
+  },
+}));
+vi.mock("../../skills/navigation.js", () => ({
+  navigate: async (_b: unknown, goal: { x: number; y: number; z: number; rangeSq?: number }) => {
+    // GoalNear (near a possibly solid block): stand on top of it
+    if (goal.rangeSq !== undefined && SOLIDISH(nameAt(goal.x, goal.y, goal.z))) {
+      const g = goal;
+      const free = [[0, 1, 0], [0, 2, 0], [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1], [2, 1, 0], [-2, 1, 0]]
+        .map(([dx, dy, dz]) => ({ x: g.x + dx!, y: g.y + dy!, z: g.z + dz! }))
+        .find((c) => !SOLIDISH(nameAt(c.x, c.y, c.z)) && !SOLIDISH(nameAt(c.x, c.y + 1, c.z)));
+      if (free) goal = free;
+    }
+    const dest = new Vec3(goal.x + 0.5, goal.y, goal.z + 0.5);
+    if (SOLIDISH(nameAt(goal.x, goal.y, goal.z)) || SOLIDISH(nameAt(goal.x, goal.y + 1, goal.z))) return { ok: false, message: "no path" };
+    sim.pos = dest;
+    sim.log.push({ op: "nav", at: k(goal.x, goal.y, goal.z) });
+    return { ok: true, message: "arrived" };
+  },
+}));
+vi.mock("../../skills/world.js", () => ({
+  placeBlock: async (_b: unknown, { type, position: p, avoidFaces }: { type: string; position: { x: number; y: number; z: number }; avoidFaces?: string[] }) => {
+    // creative: the real placeBlock flies to a hover spot when out of reach
+    if (sim.creative && sim.pos.offset(0, 1.62, 0).distanceTo(new Vec3(p.x + 0.5, p.y + 0.5, p.z + 0.5)) > 4.5) sim.pos = new Vec3(p.x + 0.5, p.y + 2, p.z + 0.5);
+    const eye = sim.pos.offset(0, 1.62, 0);
+    if (eye.distanceTo(new Vec3(p.x + 0.5, p.y + 0.5, p.z + 0.5)) > 5.2) return { ok: false, message: `out of reach (${p.x},${p.y},${p.z})` };
+    if (sim.pos.x + 0.3 > p.x && sim.pos.x - 0.3 < p.x + 1 && sim.pos.z + 0.3 > p.z && sim.pos.z - 0.3 < p.z + 1 && sim.pos.y + 1.8 > p.y && sim.pos.y < p.y + 1) return { ok: false, message: "standing in that cell" };
+    if (SOLIDISH(nameAt(p.x, p.y, p.z))) return { ok: false, message: "occupied" };
+    const nb = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1]].some(([dx, dy, dz]) => {
+      const n = nameAt(p.x + dx!, p.y + dy!, p.z + dz!);
+      return SOLIDISH(n) && !/_door$/.test(n);
+    });
+    if (!nb) return { ok: false, message: "no solid neighbour" };
+    if (!sim.creative && (sim.inv[type] ?? 0) < 1) return { ok: false, message: `no ${type} in inventory` };
+    const refused = sim.refuse?.(p, avoidFaces ?? []);
+    if (refused) return { ok: false, message: `place failed: ${refused.message}`, state: { face: refused.face } };
+    if (!sim.creative) sim.inv[type] = (sim.inv[type] ?? 0) - 1;
+    sim.world.set(k(p.x, p.y, p.z), type);
+    if (/_door$/.test(type)) sim.world.set(k(p.x, p.y + 1, p.z), type);
+    sim.log.push({ op: "place", at: k(p.x, p.y, p.z), block: type, botInside: insideBox(Math.floor(sim.pos.x), Math.floor(sim.pos.z)) });
+    sim.onPlace?.(type);
+    return { ok: true, message: "placed" };
+  },
+}));
+vi.mock("../../skills/interaction.js", () => ({
+  activateBlock: async (_b: unknown, { position: p, with: item }: { position: { x: number; y: number; z: number }; with?: string }) => {
+    const n = nameAt(p.x, p.y, p.z);
+    if (item?.endsWith("_hoe") && /^(grass_block|dirt)$/.test(n) && nameAt(p.x, p.y + 1, p.z) === "air") sim.world.set(k(p.x, p.y, p.z), "farmland");
+    else if (item === "wheat_seeds" && n === "farmland") {
+      sim.world.set(k(p.x, p.y + 1, p.z), "wheat");
+      sim.inv["wheat_seeds"] = (sim.inv["wheat_seeds"] ?? 0) - 1;
+    } else if (item === "water_bucket") sim.world.set(k(p.x, p.y + 1, p.z), "water");
+    else if (item === "flint_and_steel" && n === "obsidian") {
+      // light: fill the interior above the bottom frame row if the frame is complete
+      for (const dx of [0, 1, 2, -1]) if (nameAt(p.x + dx, p.y + 1, p.z) === "air" && nameAt(p.x + dx, p.y, p.z) === "obsidian") sim.world.set(k(p.x + dx, p.y + 1, p.z), "nether_portal");
+      for (const dz of [0, 1, 2, -1]) if (nameAt(p.x, p.y + 1, p.z + dz) === "air" && nameAt(p.x, p.y, p.z + dz) === "obsidian") sim.world.set(k(p.x, p.y + 1, p.z + dz), "nether_portal");
+    }
+    sim.log.push({ op: "act", at: k(p.x, p.y, p.z), block: item });
+    return { ok: true, message: "ok" };
+  },
+}));
+
+function fakeBot(): Bot {
+  return {
+    username: "bot",
+    registry: { itemsByName: new Proxy({}, { get: () => ({}) }) },
+    get entity() {
+      return { position: sim.pos };
+    },
+    get entities() {
+      return Object.fromEntries((sim.entities?.() ?? []).map((e, i) => [String(i), e]));
+    },
+    chat: (m: string) => {
+      (sim.chats ??= []).push(m);
+    },
+    get inventory() {
+      const slots: Array<{ name: string; count: number } | null> = new Array(9).fill(null);
+      for (const [name, count] of Object.entries(sim.inv)) if (count > 0) slots.push({ name, count });
+      return {
+        slots,
+        items: () => slots.filter(Boolean).map((s) => ({ ...s!, type: 1 })),
+      };
+    },
+    blockAt: (p: Vec3) => fakeBlock(p.x, p.y, p.z),
+    get health() {
+      return sim.health;
+    },
+    dig: async (b: { position: Vec3; name: string }) => {
+      if (sim.failDig && b.name === "dirt") throw new Error("dig refused");
+      const drop = b.name === "grass_block" ? "dirt" : b.name;
+      if (b.name === "dirt" && sim.loseDrops > 0) sim.loseDrops--;
+      else if (/^(dirt|cobblestone|netherrack)$/.test(drop)) sim.inv[drop] = (sim.inv[drop] ?? 0) + 1;
+      sim.world.set(k(b.position.x, b.position.y, b.position.z), "air");
+      sim.log.push({ op: "dig", at: k(b.position.x, b.position.y, b.position.z) });
+    },
+    equip: async () => {},
+  } as unknown as Bot;
+}
+
+const records: unknown[] = [];
+const ctx = (): BuildRunContext => ({ signal: new AbortController().signal, radius: 64, baseline: 0, jobId: "j", record: (e) => records.push(e), progress: () => {}, scaffolds: [], setScaffolds: () => {} });
+const A = { x: 0, y: 64, z: 0 };
+
+const dirtCount = (): number => [...sim.world.values()].filter((n) => n === "dirt").length;
+
+/** Portal run with hooks; returns the scaffold lists the builder persisted. */
+async function runPortal(opts: { ctxOver?: Partial<BuildRunContext>; setup?: (abort: () => void) => void; inv?: Record<string, number> } = {}) {
+  sim = { world: new Map(), inv: { obsidian: 10, flint_and_steel: 1, dirt: 1, ...(opts.inv ?? {}) }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+  const { createBuildDeps } = await import("./build.js");
+  const deps = createBuildDeps(fakeBot());
+  const prep = await deps.prepare({ blueprint: "portal", params: {}, anchor: A, avoid: [A] }, null);
+  if (!prep.ok) throw new Error("no prep");
+  const abort = new AbortController();
+  const saved: Array<Array<{ x: number; y: number; z: number; item: string }>> = [];
+  opts.setup?.(() => abort.abort());
+  const c: BuildRunContext = { ...ctx(), signal: abort.signal, setScaffolds: (l) => saved.push(l.map((x) => ({ ...x }))), ...opts.ctxOver };
+  return { deps, prep, ctx: c, saved, abort };
+}
+
+async function runKind(blueprint: "house" | "portal" | "farm" | "shelter", params: Record<string, unknown>, inv: Record<string, number>, creative = false, extra: Record<string, string> = {}, loseDrops = 0) {
+  sim = { world: new Map(Object.entries(extra)), inv: { ...inv }, pos: new Vec3(0.5, 64, 0.5), creative, log: [], box: null, loseDrops };
+  const { createBuildDeps } = await import("./build.js");
+  const bot = fakeBot();
+  const deps = createBuildDeps(bot);
+  const spec = { blueprint, params, anchor: A, avoid: [A] };
+  let prep = await deps.prepare(spec, null);
+  if (!prep.ok) return { prep, out: null };
+  sim.box = { x0: prep.origin.x, z0: prep.origin.z, x1: prep.origin.x + (prep.payload as { bp: { size: { x: number } } }).bp.size.x - 1, z1: prep.origin.z + (prep.payload as { bp: { size: { z: number } } }).bp.size.z - 1 };
+  const out = await deps.run(prep, ctx());
+  return { prep, out, bot };
+}
+
+describe("Builder simulation", () => {
+  it("survival house: every blueprint block lands, nothing placed from a spot the bot occupies, door last and from outside", async () => {
+    const { prep, out } = await runKind("house", { wall: "oak_planks" }, { oak_planks: 64, oak_door: 1, glass: 4 });
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out).toMatchObject({ ok: true, placed: 57, total: 57 });
+    const planks = [...sim.world.values()].filter((n) => n === "oak_planks").length;
+    expect(planks).toBe(53);
+    expect([...sim.world.values()].filter((n) => n === "glass")).toHaveLength(2);
+    expect(sim.inv["oak_planks"]).toBe(64 - 53);
+    // door is the very last placement, made with the bot outside the footprint
+    const places = sim.log.filter((l) => l.op === "place");
+    expect(places.at(-1)!.block).toBe("oak_door");
+    expect(places.at(-1)!.botInside).toBe(false);
+    // bottom-up: layer order never goes down (door excepted)
+    const ys = places.slice(0, -1).map((p) => Number(p.at.split(",")[1]));
+    expect(ys).toEqual([...ys].sort((a, b) => a - b));
+    // the door gap stayed open until the door
+    expect(prep.ok && records.some((r) => (r as { op?: string }).op === "layer")).toBe(true);
+  });
+
+  it("survival shelter (dirt, door-less): 55 blocks land, the doorway stays open for the bot to walk in, 2 dirt kept for the plug", async () => {
+    const { prep, out } = await runKind("shelter", { wall: "dirt", door: false }, { dirt: 70 });
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out, JSON.stringify(out)).toMatchObject({ ok: true, placed: 55, total: 55 });
+    const o = (prep as { origin: { x: number; y: number; z: number } }).origin;
+    const keys = [...sim.world.entries()].filter(([, n]) => n === "dirt").map(([c]) => c);
+    // roof is complete (25 cells) and the ring has exactly the 2-cell doorway missing
+    let roof = 0;
+    for (let x = 0; x < 5; x++) for (let z = 0; z < 5; z++) if (sim.world.get(k(o.x + x, o.y + 2, o.z + z)) === "dirt") roof++;
+    expect(roof).toBe(25);
+    let ringLow = 0;
+    for (let x = 0; x < 5; x++) for (let z = 0; z < 5; z++) if ((x === 0 || x === 4 || z === 0 || z === 4) && sim.world.get(k(o.x + x, o.y, o.z + z)) === "dirt") ringLow++;
+    expect(ringLow).toBe(15);
+    expect(keys.length).toBeGreaterThanOrEqual(55);
+    expect(sim.inv["dirt"]).toBeGreaterThanOrEqual(70 - 55 - 3); // plug blocks (and any scaffold reuse) are still in the inventory
+  });
+
+  it("dirt shelter with an empty inventory: digs ~58 dirt from the ground around, spread over many columns, then builds", async () => {
+    const { prep, out } = await runKind("shelter", { wall: "dirt", door: false }, {});
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out, JSON.stringify(out)).toMatchObject({ ok: true, placed: 55, total: 55 });
+    const digs = sim.log.filter((l) => l.op === "dig");
+    expect(digs.length).toBeGreaterThanOrEqual(57);
+    // no column dug deeper than 2 blocks (spread out, not one pit)
+    const perCol = new Map<string, number>();
+    for (const d of digs) {
+      const [x, , z] = d.at.split(",");
+      perCol.set(`${x},${z}`, (perCol.get(`${x},${z}`) ?? 0) + 1);
+    }
+    expect(Math.max(...perCol.values())).toBeLessThanOrEqual(2);
+    expect(sim.inv["dirt"]).toBeGreaterThanOrEqual(2); // the plug blocks are left over
+  });
+
+  it("survival portal: 10 obsidian, scaffolds placed and all removed again, lit", async () => {
+    const { out } = await runKind("portal", {}, { obsidian: 10, flint_and_steel: 1, dirt: 1 });
+    expect(out).toMatchObject({ ok: true, placed: 11, total: 11 });
+    expect([...sim.world.values()].filter((n) => n === "obsidian")).toHaveLength(10);
+    expect([...sim.world.values()].filter((n) => n === "nether_portal").length).toBeGreaterThan(0);
+    expect([...sim.world.values()].filter((n) => n === "dirt")).toHaveLength(0); // scaffolds gone (air overrides)
+    expect(sim.log.filter((l) => l.op === "place" && l.block === "dirt")).toHaveLength(3); // one dirt, reused three times
+    expect(sim.inv["dirt"]).toBe(1); // every scaffold was dug up again
+  });
+
+  it("portal with no dirt: digs the dirt it needs from the ground itself (no planner gather)", async () => {
+    const { prep, out } = await runKind("portal", {}, { obsidian: 10, flint_and_steel: 1 });
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out).toMatchObject({ ok: true, placed: 11 });
+    expect(sim.log.filter((l) => l.op === "dig").length).toBeGreaterThanOrEqual(1 + 3); // 1 for the dirt + 3 scaffold removals
+    expect([...sim.world.values()].filter((n) => n === "obsidian")).toHaveLength(10);
+  });
+
+  it("portal: a scaffold whose drop is lost is replaced by digging a fresh dirt (no failed placements)", async () => {
+    const { out } = await runKind("portal", {}, { obsidian: 10, flint_and_steel: 1, dirt: 1 }, false, {}, 1);
+    expect(out).toMatchObject({ ok: true, placed: 11, total: 11 });
+    expect([...sim.world.values()].filter((n) => n === "obsidian")).toHaveLength(10);
+    expect(sim.log.filter((l) => l.op === "dig").length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("survival farm with a bucket: tills, centre water, plants up to the seeds it has", async () => {
+    const { out, prep } = await runKind("farm", { size: 5 }, { wooden_hoe: 1, wheat_seeds: 16, water_bucket: 1 });
+    expect(prep.ok && prep.params.water).toBe("center");
+    expect(out).toMatchObject({ ok: true });
+    const vals = [...sim.world.values()];
+    expect(vals.filter((n) => n === "farmland")).toHaveLength(24);
+    expect(vals.filter((n) => n === "water")).toHaveLength(1);
+    expect(vals.filter((n) => n === "wheat")).toHaveLength(16);
+  });
+
+  it("farm next to existing water uses it (no bucket needed)", async () => {
+    const { out, prep } = await runKind("farm", { size: 5 }, { wooden_hoe: 1, wheat_seeds: 16 }, false, { [k(4, 63, 4)]: "water" });
+    expect(prep.ok && prep.missing).toEqual([]);
+    expect(out).toMatchObject({ ok: true });
+    expect([...sim.world.values()].filter((n) => n === "wheat")).toHaveLength(16);
+  });
+
+  it("retry: a player standing in a wall cell is waited out (and asked once), then the placement lands at the end of the layer", async () => {
+    const { RETRY_TUNING } = await import("./build.js");
+    Object.assign(RETRY_TUNING, { rounds: 3, entityWaitMs: 3_000, layerBudgetMs: 20_000 });
+    const target = { x: 0, y: 64, z: 0 };
+    let until = 0;
+    // a wall cell on the east side; the origin is known after prepare
+    sim = { world: new Map(), inv: { oak_planks: 64, oak_door: 1, glass: 4 }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const { createBuildDeps } = await import("./build.js");
+    const deps = createBuildDeps(fakeBot());
+    const prep = await deps.prepare({ blueprint: "house", params: { wall: "oak_planks" }, anchor: A, avoid: [A] }, null);
+    if (!prep.ok) throw new Error("no prep");
+    const o = prep.origin;
+    Object.assign(target, { x: o.x + 4, y: o.y + 1, z: o.z + 1 });
+    sim.box = { x0: o.x, z0: o.z, x1: o.x + 4, z1: o.z + 4 };
+    until = Date.now() + 1_500;
+    sim.entities = () => (Date.now() < until ? [{ type: "player", username: "Tester", position: new Vec3(target.x + 0.5, target.y, target.z + 0.5), width: 0.6, height: 1.8 }] : []);
+    sim.refuse = (p) => (Date.now() < until && p.x === target.x && p.y === target.y && p.z === target.z ? { message: "Server refused to place oak_planks: the block is still air", face: "bottom" } : null);
+    const out = await deps.run(prep, ctx());
+    expect(out).toMatchObject({ ok: true });
+    expect(sim.world.get(k(target.x, target.y, target.z))).toBe("oak_planks");
+    expect(sim.chats).toHaveLength(1);
+  });
+
+  it("retry: a refused click on one face is retried against another face", async () => {
+    const { RETRY_TUNING } = await import("./build.js");
+    Object.assign(RETRY_TUNING, { rounds: 3, entityWaitMs: 200, layerBudgetMs: 20_000 });
+    sim = { world: new Map(), inv: { oak_planks: 64, oak_door: 1, glass: 4 }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const { createBuildDeps } = await import("./build.js");
+    const deps = createBuildDeps(fakeBot());
+    const prep = await deps.prepare({ blueprint: "house", params: { wall: "oak_planks" }, anchor: A, avoid: [A] }, null);
+    if (!prep.ok) throw new Error("no prep");
+    const o = prep.origin;
+    const cell = { x: o.x + 4, y: o.y + 1, z: o.z + 1 };
+    sim.box = { x0: o.x, z0: o.z, x1: o.x + 4, z1: o.z + 4 };
+    const faces: string[][] = [];
+    // the (first-choice) "bottom" face is always refused; the mock reports it and honours avoidFaces
+    sim.refuse = (p, avoid) => {
+      if (p.x !== cell.x || p.y !== cell.y || p.z !== cell.z) return null;
+      faces.push(avoid);
+      return avoid.includes("bottom") ? null : { message: "Server refused to place oak_planks", face: "bottom" };
+    };
+    const out = await deps.run(prep, ctx());
+    expect(out).toMatchObject({ ok: true });
+    expect(faces.length).toBeGreaterThan(2); // two first-pass tries without an avoid list, then the retry with "bottom" avoided
+    expect(faces.at(-1)).toContain("bottom");
+  });
+
+  it("retry: a permanent refusal still fails the build after the bounded retries", async () => {
+    const { RETRY_TUNING } = await import("./build.js");
+    Object.assign(RETRY_TUNING, { rounds: 2, entityWaitMs: 200, layerBudgetMs: 5_000 });
+    sim = { world: new Map(), inv: { oak_planks: 64, oak_door: 1, glass: 4 }, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const { createBuildDeps } = await import("./build.js");
+    const deps = createBuildDeps(fakeBot());
+    const prep = await deps.prepare({ blueprint: "house", params: { wall: "oak_planks" }, anchor: A, avoid: [A] }, null);
+    if (!prep.ok) throw new Error("no prep");
+    const o = prep.origin;
+    const cell = { x: o.x + 4, y: o.y + 1, z: o.z + 1 };
+    sim.box = { x0: o.x, z0: o.z, x1: o.x + 4, z1: o.z + 4 };
+    let tries = 0;
+    sim.refuse = (p) => (p.x === cell.x && p.y === cell.y && p.z === cell.z ? (tries++, { message: "Server refused to place oak_planks", face: "top" }) : null);
+    const out = await deps.run(prep, ctx());
+    expect(out).toMatchObject({ ok: false, kind: "build_incomplete" });
+    expect(tries).toBe(2 + 2 * 2); // first pass 2 tries + 2 retry rounds x 2 tries
+  });
+
+  it("creative house: materials come from getItems, same result", async () => {
+    const { out } = await runKind("house", { wall: "spruce_planks", height: 4, width: 7, depth: 6 }, {}, true);
+    expect(out, JSON.stringify(out)).toMatchObject({ ok: true });
+    expect([...sim.world.values()].filter((n) => n === "spruce_planks").length).toBeGreaterThan(80);
+    expect([...sim.world.values()].some((n) => n === "spruce_door")).toBe(true);
+  });
+
+  it("stops placing when the materials run out and reports how far it got", async () => {
+    const { out } = await runKind("house", { wall: "oak_planks", windows: 0 }, { oak_planks: 30, oak_door: 1 });
+    // prepare would have asked the planner for the shortfall; force the run anyway
+    expect(out).toMatchObject({ ok: false, kind: "build_incomplete" });
+    expect((out as { detail: string }).detail).toMatch(/no oak_planks left/);
+    expect((out as { placed: number }).placed).toBe(30);
+  });
+});
+
+describe("scaffold persistence and clean-up (H2)", () => {
+  it("persists each scaffold before placing it and ends with an empty list on success", async () => {
+    const { deps, prep, ctx: c, saved } = await runPortal();
+    if (!prep.ok) return;
+    const out = await deps.run(prep, c);
+    expect(out).toMatchObject({ ok: true });
+    expect(saved.some((l) => l.length === 1 && l[0]!.item === "dirt")).toBe(true);
+    expect(saved.at(-1)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("a stop mid-build still takes the scaffolds down (the abort that ended the run does not block clean-up)", async () => {
+    let abortFn: () => void = () => {};
+    const { deps, prep, ctx: c, saved } = await runPortal({ setup: (a) => (abortFn = a) });
+    if (!prep.ok) return;
+    sim.onPlace = (type) => {
+      if (type === "dirt") abortFn(); // stop lands right after the first scaffold went in
+    };
+    const out = await deps.run(prep, c);
+    expect(out).toMatchObject({ ok: false, kind: "cancelled" });
+    expect(saved.some((l) => l.length >= 1)).toBe(true);
+    expect(saved.at(-1)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+    expect(sim.inv["dirt"]).toBe(1); // got the block back
+  });
+
+  it("a thrown error also strips them (finally)", async () => {
+    const { deps, prep, ctx: c, saved } = await runPortal();
+    if (!prep.ok) return;
+    sim.onPlace = (type) => {
+      if (type === "dirt") throw new Error("boom");
+    };
+    await expect(deps.run(prep, c)).rejects.toThrow();
+    sim.onPlace = undefined;
+    expect(saved.at(-1)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("entries whose removal failed stay on the list (never cleared) and the next run reclaims them", async () => {
+    const { deps, prep, ctx: c, saved } = await runPortal();
+    if (!prep.ok) return;
+    sim.failDig = true;
+    await deps.run(prep, c); // the portal itself completes; the blocks it could not take down stay on the books
+    const left = saved.at(-1)!;
+    expect(left.length).toBeGreaterThan(0);
+    expect(left.every((x) => x.item === "dirt")).toBe(true);
+    expect(dirtCount()).toBe(left.length);
+    // next attempt: the leftovers are known, not terrain; removal works now
+    sim.failDig = false;
+    const again = await deps.reclaim!(left, new AbortController().signal);
+    expect(again).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("known scaffold cells are not terrain for prepare (masked as air), only while they still hold the item", async () => {
+    const { maskScaffolds, gridOf } = await import("./build.js");
+    sim = { world: new Map([[k(5, 64, 5), "dirt"], [k(6, 64, 5), "dirt"]]), inv: {}, pos: new Vec3(0.5, 64, 0.5), creative: false, log: [], box: null, loseDrops: 0 };
+    const g = maskScaffolds(gridOf(fakeBot()), [{ x: 5, y: 64, z: 5, item: "dirt" }, { x: 7, y: 64, z: 5, item: "dirt" }]);
+    expect(g.blockAt(5, 64, 5)).toBe("air"); // our scaffold
+    expect(g.blockAt(6, 64, 5)).toBe("dirt"); // unrelated dirt stays terrain
+    expect(g.blockAt(7, 64, 5)).toBe("air"); // already gone
+  });
+
+  it("a dead bot skips clean-up and keeps the list for the next build", async () => {
+    let abortFn: () => void = () => {};
+    const { deps, prep, ctx: c, saved } = await runPortal({ setup: (a) => (abortFn = a) });
+    if (!prep.ok) return;
+    sim.onPlace = (type) => {
+      if (type === "dirt") {
+        sim.health = 0;
+        abortFn();
+      }
+    };
+    await deps.run(prep, c);
+    expect(saved.at(-1)!.length).toBeGreaterThan(0);
+    expect(dirtCount()).toBeGreaterThan(0);
+    // alive again (next boot): reclaim removes it
+    sim.health = 20;
+    sim.onPlace = undefined;
+    expect(await deps.reclaim!(saved.at(-1)!, new AbortController().signal)).toEqual([]);
+    expect(dirtCount()).toBe(0);
+  });
+
+  it("reserves the build's materials, scaffold item, tools and door for the whole job", async () => {
+    const { prep } = await runKind("house", { wall: "oak_planks" }, { oak_planks: 64, oak_door: 1, glass: 4, dirt: 2 });
+    expect(prep.ok && prep.reserve).toEqual(expect.arrayContaining(["oak_planks", "glass", "oak_door"]));
+    const farm = await runKind("farm", { size: 5 }, { wooden_hoe: 1, wheat_seeds: 16, water_bucket: 1 });
+    expect(farm.prep.ok && farm.prep.reserve).toEqual(expect.arrayContaining(["wheat_seeds", "water_bucket", "wooden_hoe"]));
+  });
+});
+

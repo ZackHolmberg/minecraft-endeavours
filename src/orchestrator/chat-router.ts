@@ -8,7 +8,8 @@
  *  - `/msg <bot>` (mineflayer's `whisper` event) → that bot wakes.
  *  - `@all` → every bot wakes.
  *  - Name matching also accepts the "base" name with a trailing AI/Bot/NPC
- *    suffix stripped (`Steve_AI` answers to "steve") — players address NPCs
+ *    suffix stripped (`Steve_AI` answers to "steve") plus any `aliases:` from
+ *    config/bots.yml (`Steve_v2` answers to "steve") — players address NPCs
  *    the way they'd address a friend, not by their full username.
  *  - Conversation continuity: if a bot recently asked a player a question
  *    (~45s window) and the same player chats again, route to that bot even
@@ -26,9 +27,16 @@
 // maybe re-read the question) regularly takes longer than 30s.
 const QUESTION_TTL_MS = 45 * 1000;
 // Window after any bot reply in which the same player's un-named chat still
-// routes back. Short on purpose — this is the most false-positive-prone path.
-const FOLLOW_UP_TTL_MS = 20 * 1000;
+// routes back. Was 20s; the 2026-10-10 live test showed players replying to
+// the bot ~30–60s later ("I don't see the furnace", "are you stuck?") and being
+// ignored. Still the most false-positive-prone path, so bounded.
+const FOLLOW_UP_TTL_MS = 60 * 1000;
 const ADDRESSED_TTL_MS = 5 * 60 * 1000;
+// Cost bound (review M2): max routed UN-NAMED chats (continuation / follow-up / job-requester) per player per bot per minute.
+export const UNNAMED_CAP_PER_MIN = 6;
+const UNNAMED_WINDOW_MS = 60 * 1000;
+// Loop bound (review L2): after this many consecutive follow-up routes, a bot reply no longer renews the window.
+export const MAX_FOLLOWUP_CHAIN = 3;
 
 interface AddressedEntry {
   player: string;
@@ -42,6 +50,10 @@ interface QuestionEntry {
 const lastAddressed = new Map<string, AddressedEntry>();
 const recentQuestions = new Map<string, QuestionEntry>();
 const recentReplies = new Map<string, QuestionEntry>();
+/** Consecutive follow-up-routed chats per bot|player (reset by any other route). */
+const followUpChain = new Map<string, number>();
+/** Timestamps of routed un-named chats per bot|player (sliding window for the cap). */
+const unnamedRoutes = new Map<string, number[]>();
 
 function questionKey(bot: string, player: string): string {
   return `${bot}|${player}`;
@@ -60,7 +72,8 @@ export type RouteReason =
   | "all-mention"
   | "whisper"
   | "continuation"
-  | "follow-up";
+  | "follow-up"
+  | "job-requester";
 
 export interface RouteMatch {
   channel: ChatChannel;
@@ -83,10 +96,45 @@ export function isAddressed(
 ): RouteMatch | null {
   if (event.sender === botUsername) return null;
 
-  const match = computeMatch(botUsername, allBots, event);
+  const raw = computeMatch(botUsername, allBots, event);
+  const match = raw && applyChainAndCap(botUsername, event, raw);
   if (match) {
     noteBotAddressed(botUsername, event.sender);
   }
+  return match;
+}
+
+/**
+ * Route this chat WITHOUT side effects (no cap accounting, no chain bookkeeping, no partner note): which route would
+ * apply. Used by the stop pre-empt, which must know whether a "stop" arrived via the job-requester route.
+ */
+export function peekRoute(botUsername: string, allBots: readonly string[], event: ChatEvent): RouteMatch | null {
+  return computeMatch(botUsername, allBots, event);
+}
+
+/** True when the route is one of the un-named ones (the bot wasn't addressed by name, whisper or @all). */
+function isUnnamedRoute(reason: RouteReason): boolean {
+  return reason === "continuation" || reason === "follow-up" || reason === "job-requester";
+}
+
+/**
+ * Side effects of a computed route: follow-up chain counting (L2) and the per-player cap on un-named routes (M2).
+ * A bare stop command through a non-job route is never capped (stop must always work).
+ */
+function applyChainAndCap(botUsername: string, event: ChatEvent, match: RouteMatch): RouteMatch | null {
+  const key = questionKey(botUsername, event.sender);
+  if (match.reason === "follow-up") followUpChain.set(key, (followUpChain.get(key) ?? 0) + 1);
+  else followUpChain.delete(key);
+  if (!isUnnamedRoute(match.reason)) return match;
+  const now = Date.now();
+  const recent = (unnamedRoutes.get(key) ?? []).filter((t) => now - t < UNNAMED_WINDOW_MS);
+  if (recent.length >= UNNAMED_CAP_PER_MIN && !(match.reason !== "job-requester" && isStopCommand(botUsername, event.message))) {
+    unnamedRoutes.set(key, recent);
+    console.warn(`[${botUsername}] un-named chat cap (${UNNAMED_CAP_PER_MIN}/min) reached for ${event.sender}; not routing`);
+    return null;
+  }
+  recent.push(now);
+  unnamedRoutes.set(key, recent);
   return match;
 }
 
@@ -126,19 +174,87 @@ function computeMatch(
     return { channel: "chat", reason: "follow-up" };
   }
 
+  // While the bot is running a job for this player, they're working together:
+  // their un-named chat is for the bot.
+  if (jobRequesterProbes.get(botUsername)?.() === event.sender) {
+    return { channel: "chat", reason: "job-requester" };
+  }
+
   return null;
 }
 
+/** Per bot: who the running job was requested by (null if none). Set by src/jobs/wire.ts. */
+const jobRequesterProbes = new Map<string, () => string | null>();
+
+export function registerJobRequesterProbe(botUsername: string, probe: (() => string | null) | null): void {
+  if (probe) jobRequesterProbes.set(botUsername, probe);
+  else jobRequesterProbes.delete(botUsername);
+}
+
+/** Configured aliases (config/bots.yml `aliases:`), by bot username. */
+const configuredAliases = new Map<string, string[]>();
+
+/** Set a bot's configured aliases (called by loadConfig). Replaces any previous set. */
+export function registerBotAliases(botUsername: string, aliases: readonly string[]): void {
+  configuredAliases.set(botUsername, [...aliases]);
+}
+
 /**
- * Names a player might use for this bot: the full username plus, when it
- * ends in an AI/Bot/NPC suffix, the base name (`Steve_AI` → `Steve`). The
- * base must be ≥3 chars so `AI_Bot`-style names don't collapse to noise.
+ * Names a player might use for this bot: the full username, the base name
+ * when it ends in an AI/Bot/NPC suffix (`Steve_AI` → `Steve`; the base must be
+ * ≥3 chars so `AI_Bot`-style names don't collapse to noise), and any aliases
+ * configured in bots.yml (`Steve_v2` + `aliases: [steve]`). Also used for the
+ * "another bot is named → not for me" check, so aliases apply there too.
  */
-function nameAliases(botUsername: string): string[] {
+export function nameAliases(botUsername: string): string[] {
   const aliases = [botUsername];
-  const base = botUsername.replace(/[_-]?(?:ai|bot|npc)$/i, "");
-  if (base !== botUsername && base.length >= 3) aliases.push(base);
+  const humans = onlineHumanNames(botUsername);
+  const add = (a: string): void => {
+    const lower = a.toLowerCase();
+    if (aliases.some((x) => x.toLowerCase() === lower)) return;
+    // A human who is literally named "Steve" must not have their name read as
+    // addressing the bot (the full username is never dropped).
+    if (humans.has(lower)) return;
+    aliases.push(a);
+  };
+  const base = derivedBaseName(botUsername);
+  if (base) add(base);
+  for (const extra of configuredAliases.get(botUsername) ?? []) add(extra);
   return aliases;
+}
+
+/** `Steve_AI` -> `Steve`; null when there is no AI/Bot/NPC suffix or the base would be < 3 chars. */
+export function derivedBaseName(botUsername: string): string | null {
+  const base = botUsername.replace(/[_-]?(?:ai|bot|npc)$/i, "");
+  return base !== botUsername && base.length >= 3 ? base : null;
+}
+
+/**
+ * Per-bot callback returning the usernames currently online (mineflayer's
+ * `bot.players` keys), registered by `attachBotEventHooks`. Used only to keep
+ * a derived/configured alias from claiming a human player's own name.
+ */
+const onlinePlayers = new Map<string, () => Iterable<string>>();
+
+export function registerOnlinePlayers(botUsername: string, getNames: () => Iterable<string>): void {
+  onlinePlayers.set(botUsername, getNames);
+}
+
+/** Lower-cased usernames online that are not configured bots. */
+function onlineHumanNames(botUsername: string): Set<string> {
+  const out = new Set<string>();
+  const get = onlinePlayers.get(botUsername);
+  if (!get) return out;
+  const bots = new Set([...configuredAliases.keys()].map((b) => b.toLowerCase()));
+  try {
+    for (const n of get()) {
+      const lower = n.toLowerCase();
+      if (!bots.has(lower)) out.add(lower);
+    }
+  } catch {
+    // best-effort
+  }
+  return out;
 }
 
 function mentionsName(text: string, botUsername: string): boolean {
@@ -211,7 +327,11 @@ export function hasRecentQuestion(botUsername: string, playerName: string): bool
 
 /** Record that the bot just said something to `playerName` (opens the follow-up window). */
 export function noteBotRepliedTo(botUsername: string, playerName: string): void {
-  recentReplies.set(questionKey(botUsername, playerName), { at: Date.now() });
+  const key = questionKey(botUsername, playerName);
+  // L2: an exchange that has run on follow-ups alone for more than MAX_FOLLOWUP_CHAIN turns stops renewing the
+  // window (it expires 60 s after its last renewal), so an auto-replying player/bot can't sustain a loop.
+  if ((followUpChain.get(key) ?? 0) > MAX_FOLLOWUP_CHAIN && hasRecentReply(botUsername, playerName)) return;
+  recentReplies.set(key, { at: Date.now() });
 }
 
 export function hasRecentReply(botUsername: string, playerName: string): boolean {
@@ -229,4 +349,9 @@ export function resetChatRouter(): void {
   lastAddressed.clear();
   recentQuestions.clear();
   recentReplies.clear();
+  followUpChain.clear();
+  unnamedRoutes.clear();
+  configuredAliases.clear();
+  onlinePlayers.clear();
+  jobRequesterProbes.clear();
 }

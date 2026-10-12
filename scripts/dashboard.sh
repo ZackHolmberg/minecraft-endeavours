@@ -6,11 +6,13 @@
 set -e
 cd "$(dirname "$0")/.."
 
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
 PID_FILE=".bot-runtime/bot.pid"
 SNAPSHOT_FILE=".bot-runtime/snapshot.json"
 
-if ! nc -z localhost 25565 2>/dev/null; then
-  echo "dashboard: Minecraft server is not running on localhost:25565 — start it with ./scripts/start.sh."
+if ! nc -z "${MC_HOST:-localhost}" "${MC_PORT:-25565}" 2>/dev/null; then
+  echo "dashboard: Minecraft server is not running on ${MC_HOST:-localhost}:${MC_PORT:-25565} — start it with ./scripts/start.sh."
   exit 1
 fi
 

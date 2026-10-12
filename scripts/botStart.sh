@@ -26,8 +26,8 @@ fi
 
 # Refuse to start if the MC server isn't reachable — the bot would just spin
 # in its reconnect loop and dump confusing errors into the log.
-if ! nc -z localhost 25565 2>/dev/null; then
-  echo "botStart: Minecraft server is not reachable on localhost:25565."
+if ! nc -z "${MC_HOST:-localhost}" "${MC_PORT:-25565}" 2>/dev/null; then
+  echo "botStart: Minecraft server is not reachable on ${MC_HOST:-localhost}:${MC_PORT:-25565}."
   echo "botStart: Start it first with ./scripts/start.sh, then re-run this."
   exit 1
 fi

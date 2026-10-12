@@ -298,6 +298,11 @@ export function currentTaskId(bot: string): string | null {
   return sinks.get(bot)?.task?.taskId ?? null;
 }
 
+/** True once a say/whisper has succeeded during the bot's current task (v2: silent-turn backstop). */
+export function hasReplied(bot: string): boolean {
+  return sinks.get(bot)?.task?.firstReplyAt != null;
+}
+
 /** A say/whisper succeeded: stamps the current task's first-reply time once. */
 export function markReply(bot: string): void {
   const t = sinks.get(bot)?.task;

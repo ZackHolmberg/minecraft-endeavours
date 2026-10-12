@@ -14,15 +14,21 @@ import {
   getCurrentConversationPartner,
   isAddressed,
   isStopCommand,
+  peekRoute,
+  registerOnlinePlayers,
   type ChatEvent,
 } from "../orchestrator/chat-router.js";
 import {
   defendTick,
   idleLookTick,
+  inferHurtCause,
   maybeAutoEat,
   maybeEquipArmor,
   noteHurt,
+  survivalTick,
+  trackSurvivalState,
 } from "../skills/auto-behaviors.js";
+import { rememberSeenContainers } from "../skills/containers.js";
 import { isFlying, stopFlyingNow } from "../skills/flight.js";
 import { currentGameMode, type GameMode } from "../skills/game-mode.js";
 import type { BotState } from "../state/index.js";
@@ -111,17 +117,20 @@ export function attachBotEventHooks(
 ): void {
   const tag = `[${username}]`;
 
+  // Lets the router drop an alias a human is using as their own username.
+  registerOnlinePlayers(username, () => Object.keys(bot.players ?? {}));
+
   bot.on("chat", (player, message) => {
     if (player === username) return;
     console.log(`${tag} chat <${player}> ${message}`);
-    maybePreempt(tag, username, state, player, message);
+    maybePreempt(tag, username, allBots, state, { channel: "chat", sender: player, message });
     dispatch(tag, username, allBots, { channel: "chat", sender: player, message });
   });
 
   bot.on("whisper", (player, message) => {
     if (player === username) return;
     console.log(`${tag} whisper <${player}> ${message}`);
-    maybePreempt(tag, username, state, player, message);
+    maybePreempt(tag, username, allBots, state, { channel: "whisper", sender: player, message });
     dispatch(tag, username, allBots, { channel: "whisper", sender: player, message });
   });
 
@@ -184,6 +193,13 @@ export function attachBotEventHooks(
   const utilityIds = collectUtilityIds(bot);
   const utilityScan = setInterval(() => {
     void scanForUtilityBlocks(bot, username, tag, utilityIds);
+    // Chests in plain sight are remembered too (seen-only, no contents): "put them in the chest" still works after walking off.
+    rememberSeenContainers(bot).then(
+      (n) => {
+        if (n > 0) console.log(`${tag} auto-container: remembered ${n} seen container(s)`);
+      },
+      (err) => console.warn(`${tag} seen-container write failed:`, err),
+    );
     // Retry armor upgrades picked up while a skill was busy.
     maybeEquipArmor(bot, state);
   }, UTILITY_SCAN_INTERVAL_MS);
@@ -192,9 +208,12 @@ export function attachBotEventHooks(
   // while a skill is in flight, so they never fight the agent for control.
   const reflexTick = setInterval(() => {
     if (!bot.entity) return;
+    // Breath / suffocation first: it preempts whatever skill is moving the bot.
+    survivalTick(bot, state);
     defendTick(bot, state);
     idleLookTick(bot, state);
   }, REFLEX_TICK_MS);
+  trackSurvivalState(bot);
   bot.on("health", () => maybeAutoEat(bot, state));
   bot.on("playerCollect", (collector) => {
     if (collector !== bot.entity) return;
@@ -222,11 +241,13 @@ export function attachBotEventHooks(
     if (entity !== bot.entity) return;
     noteHurt(bot, source);
     const who = source ? source.username ?? source.name ?? "something" : "something";
-    console.log(`${tag} hurt by ${who} (health ${Math.round(bot.health)}/20)`);
+    const cause = inferHurtCause(bot, source);
+    console.log(`${tag} hurt by ${source ? who : cause} (health ${Math.round(bot.health)}/20)`);
     recordEvent(username, {
       kind: "hurt",
       health: Math.round((bot.health ?? 0) * 10) / 10,
       by: source ? source.username ?? source.name ?? null : null,
+      cause,
     });
   });
 
@@ -255,7 +276,7 @@ export function attachBotEventHooks(
     console.warn(`${tag} died at (${position.x}, ${position.y}, ${position.z})`);
     // Abort whatever was running — a mid-path goal or attack loop after
     // respawn would walk the bot somewhere nonsensical.
-    state.cancellation.request();
+    state.cancellation.request("death");
     (bot as Bot & { pathfinder?: { stop(): void } }).pathfinder?.stop();
     deathFlush = setTimeout(flushDeath, DEATH_MESSAGE_WINDOW_MS);
   });
@@ -324,12 +345,15 @@ async function scanForUtilityBlocks(bot: Bot, username: string, tag: string, ids
 function maybePreempt(
   tag: string,
   username: string,
+  allBots: readonly string[],
   state: BotState,
-  sender: string,
-  message: string,
+  event: ChatEvent,
 ): void {
+  const { sender, message } = event;
   const tool = state.currentTool.current();
   if (!tool || !CANCELLABLE_SKILLS.has(tool.name)) return;
+  // An un-named chat that only routes because its sender is the running job's requester must not preempt (review M2).
+  if (peekRoute(username, allBots, event)?.reason === "job-requester") return;
   // Strict whole-message match: "wait, also grab coal" must not preempt.
   if (!isStopCommand(username, message)) return;
   const partner = getCurrentConversationPartner(username);

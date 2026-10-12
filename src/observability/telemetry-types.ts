@@ -25,6 +25,9 @@ export interface TelemetryBase {
 
 export type TaskOutcome = "finished" | "stopped" | "max_turns" | "failed" | "rate_limited";
 
+/** Reflex names. `surface` = drowning/suffocation escape (skills/survival-reflex.ts). */
+export type ReflexName = "look" | "eat" | "armor" | "defend" | "surface";
+
 export type TelemetryEvent =
   // ── Agent / task lifecycle ────────────────────────────────────────────
   | (TelemetryBase & {
@@ -106,6 +109,8 @@ export type TelemetryEvent =
       attempts: number;
       ok: boolean;
       reason: string | null;
+      /** Why the bot pillared (D12): "escape" = out of a pit / water while mining or navigating; "requested" = the pillarUp skill. Absent on v1 events (counts as a violation in the eval). */
+      purpose?: "escape" | "requested";
     })
   | (TelemetryBase & {
       kind: "structure_skip"; // structure guard left player-built blocks alone
@@ -115,10 +120,10 @@ export type TelemetryEvent =
   // ── Reflexes / survival ───────────────────────────────────────────────
   | (TelemetryBase & {
       kind: "reflex";
-      reflex: "look" | "eat" | "armor" | "defend";
+      reflex: ReflexName;
       detail: string;
     })
-  | (TelemetryBase & { kind: "hurt"; health: number; by: string | null })
+  | (TelemetryBase & { kind: "hurt"; health: number; by: string | null; cause?: string })
   | (TelemetryBase & { kind: "death"; pos: Vec; cause: string })
   // ── Chat / routing ────────────────────────────────────────────────────
   | (TelemetryBase & {
@@ -137,6 +142,44 @@ export type TelemetryEvent =
       inWorldMs: number | null;
     })
   | (TelemetryBase & { kind: "loop_lag"; lagMs: number })
+  // ── v2 jobs (src/jobs/): background goals run by the job runner ───────
+  | (TelemetryBase & {
+      kind: "job_start";
+      jobId: string;
+      goals: Array<{ item: string; count: number }>;
+      steps: number;
+    })
+  | (TelemetryBase & {
+      kind: "job_end";
+      jobId: string;
+      /** done | failed | cancelled | interrupted */
+      status: string;
+      durationMs: number;
+      steps: number;
+      replans: number;
+      /** FailureKind of the failure (status failed), else null. */
+      failureKind: string | null;
+      /** Build jobs only: blocks placed vs the blueprint total. */
+      placed?: number;
+      total?: number;
+    })
+  | (TelemetryBase & {
+      kind: "step";
+      jobId: string;
+      /** Step op: gather | craft | smelt | withdraw | place_station | build | layer | scaffold | light | deliver */
+      op: string;
+      item: string;
+      ok: boolean;
+      durationMs: number;
+      failureKind: string | null;
+    })
+  | (TelemetryBase & {
+      kind: "recovery";
+      jobId: string;
+      /** retry | replan | widen | explore | fail */
+      rung: string;
+      detail: string;
+    })
   | (TelemetryBase & {
       kind: "rate_limit";
       status: string;
@@ -202,7 +245,7 @@ export interface TelemetryAggregate {
   doors: { opened: number; closed: number };
   pillar: { runs: number; ok: number; placed: number };
   structureSkips: number;
-  reflexes: Record<"look" | "eat" | "armor" | "defend", number>;
+  reflexes: Record<ReflexName, number>;
   deaths: number;
   chat: { inbound: number; routed: number; outbound: number; stops: number };
   health: { disconnects: number; maxLoopLagMs: number | null; rateLimitEvents: number };

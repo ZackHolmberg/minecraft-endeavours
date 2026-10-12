@@ -40,9 +40,14 @@ export interface Container {
   /** `chest`, `barrel`, `shulker_box`, etc. */
   type: string;
   position: Pos;
-  last_opened: number;
-  last_opened_by: string;
+  /** Absent on a seen-only entry (never opened). */
+  last_opened?: number;
+  last_opened_by?: string;
   contents?: Array<{ item: string; count: number }>;
+  /** True when the bot only saw this container (proximity scan) and never opened it: no contents known. Cleared by the first open. */
+  seen?: boolean;
+  /** Unix ms of the last proximity scan that saw it (seen-only entries). */
+  last_seen?: number;
 }
 
 export interface Death {
@@ -218,6 +223,63 @@ export async function upsertContainer(
     }
     await writeWorldKnowledge(username, world);
     return { created: idx < 0 };
+  });
+}
+
+/** Seen-only containers kept on disk (oldest `last_seen` dropped first). */
+const MAX_SEEN_CONTAINERS = 40;
+
+export interface SeenContainerInput {
+  type: string;
+  position: Pos;
+}
+
+/**
+ * Proximity-scan capture: remember containers the bot has SEEN (not opened) so a chest 30 blocks away is
+ * still known after the bot walks off. Never overwrites an opened entry (that one has contents); skips
+ * the other half of a double chest already recorded; refreshes `last_seen`. `shouldPrune` is asked about
+ * every seen-only entry and returns true when the container is verifiably gone (broken), dropping it.
+ * One read, at most one write. Returns the number of newly added entries.
+ */
+export async function syncSeenContainers(
+  username: string,
+  seen: SeenContainerInput[],
+  shouldPrune: (c: Container) => boolean = () => false,
+): Promise<number> {
+  return withWorldLock(username, async () => {
+    const world = await readWorldKnowledge(username);
+    const now = Date.now();
+    let dirty = false;
+    let added = 0;
+    const before = world.containers.length;
+    world.containers = world.containers.filter((c) => !(c.seen && shouldPrune(c)));
+    if (world.containers.length !== before) dirty = true;
+    for (const input of seen) {
+      const { x, y, z } = input.position;
+      const same = world.containers.find((c) => c.position.x === x && c.position.y === y && c.position.z === z);
+      if (same) {
+        // refresh the timestamp at most once a minute (don't rewrite the file every 5s scan)
+        if (same.seen && now - (same.last_seen ?? 0) > 60_000) {
+          same.last_seen = now;
+          dirty = true;
+        }
+        continue;
+      }
+      const isChest = input.type === "chest" || input.type === "trapped_chest";
+      const half = isChest && world.containers.some((c) => c.type === input.type && c.position.y === y && Math.abs(c.position.x - x) + Math.abs(c.position.z - z) === 1);
+      if (half) continue;
+      world.containers.push({ type: input.type, position: { x, y, z }, seen: true, last_seen: now });
+      added += 1;
+      dirty = true;
+    }
+    const seenOnly = world.containers.filter((c) => c.seen);
+    if (seenOnly.length > MAX_SEEN_CONTAINERS) {
+      const drop = new Set(seenOnly.sort((a, b) => (a.last_seen ?? 0) - (b.last_seen ?? 0)).slice(0, seenOnly.length - MAX_SEEN_CONTAINERS));
+      world.containers = world.containers.filter((c) => !drop.has(c));
+      dirty = true;
+    }
+    if (dirty) await writeWorldKnowledge(username, world);
+    return added;
   });
 }
 

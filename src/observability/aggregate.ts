@@ -12,6 +12,7 @@
 
 import type {
   Percentiles,
+  ReflexName,
   SkillStats,
   TaskOutcome,
   TelemetryAggregate,
@@ -97,7 +98,7 @@ export function aggregate(
   const doors = { opened: 0, closed: 0 };
   const pillar = { runs: 0, ok: 0, placed: 0 };
   let structureSkips = 0;
-  const reflexes: Record<"look" | "eat" | "armor" | "defend", number> = { look: 0, eat: 0, armor: 0, defend: 0 };
+  const reflexes: Record<ReflexName, number> = { look: 0, eat: 0, armor: 0, defend: 0, surface: 0 };
   let deaths = 0;
   const chat = { inbound: 0, routed: 0, outbound: 0, stops: 0 };
   const health = { disconnects: 0, maxLoopLagMs: null as number | null, rateLimitEvents: 0 };

@@ -10,6 +10,7 @@ import { isCreative } from "./game-mode.js";
 import { resolveItem } from "./item-naming.js";
 import { goTo } from "./movement.js";
 import { navigate } from "./navigation.js";
+import { isFreeableTreeBlock } from "./structure-guard.js";
 import type { SkillResult } from "./types.js";
 
 const PICKUP_DEFAULT_RADIUS = 8;
@@ -37,18 +38,103 @@ export interface PickUpNearbyParams {
   maxDist?: number;
 }
 
+/** Item name -> total count across all inventory stacks. */
+export function inventoryCounts(bot: Bot): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const it of bot.inventory.items()) m.set(it.name, (m.get(it.name) ?? 0) + it.count);
+  return m;
+}
+
+/** Per-item positive gain of `after` over `before`. */
+export function inventoryGain(before: Map<string, number>, after: Map<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [name, n] of after) {
+    const d = n - (before.get(name) ?? 0);
+    if (d > 0) out[name] = d;
+  }
+  return out;
+}
+
+const DROP_SPAWN_WAIT_MS = 600;
+const DROP_RESCAN_MS = 120;
+const DROP_NEAR_RADIUS = 2.5;
+
+/** Ids of the item entities currently loaded (take BEFORE breaking a block). */
+export function snapshotItemIds(bot: Bot): Set<number> {
+  const out = new Set<number>();
+  for (const id of Object.keys(bot.entities)) {
+    const e = bot.entities[id];
+    if (e && e.name === "item") out.add(e.id);
+  }
+  return out;
+}
+
+function hasNewItemEntityNear(bot: Bot, pos: Vec3, radius: number, known: ReadonlySet<number>): boolean {
+  for (const id of Object.keys(bot.entities)) {
+    const e = bot.entities[id];
+    if (e && e.name === "item" && !known.has(e.id) && e.position.distanceTo(pos) <= radius) return true;
+  }
+  return false;
+}
+
+/**
+ * After breaking a block, the item entity arrives a few ticks later (server
+ * packet), so a scan immediately after `bot.dig` sees nothing. Resolves true
+ * as soon as a NEW item entity (one not in `knownIds`) is within ~2.5 blocks
+ * of `pos` (entitySpawn event, with a short re-scan fallback in case the spawn
+ * raced the listener), false after `timeoutMs`. Items that were already lying
+ * there don't count: pass the `snapshotItemIds` taken before the dig as
+ * `knownIds` (defaults to a snapshot taken now). Never throws.
+ */
+export function waitForDropNear(
+  bot: Bot,
+  pos: Vec3,
+  timeoutMs = DROP_SPAWN_WAIT_MS,
+  knownIds: ReadonlySet<number> = snapshotItemIds(bot),
+): Promise<boolean> {
+  if (hasNewItemEntityNear(bot, pos, DROP_NEAR_RADIUS, knownIds)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      bot.removeListener("entitySpawn", onSpawn);
+      resolve(v);
+    };
+    const onSpawn = (e: { id: number; name?: string; position: Vec3 }): void => {
+      if (e.name === "item" && !knownIds.has(e.id) && e.position.distanceTo(pos) <= DROP_NEAR_RADIUS) finish(true);
+    };
+    const timer = setTimeout(() => finish(hasNewItemEntityNear(bot, pos, DROP_NEAR_RADIUS, knownIds)), timeoutMs);
+    const poll = setInterval(() => {
+      if (hasNewItemEntityNear(bot, pos, DROP_NEAR_RADIUS, knownIds)) finish(true);
+    }, DROP_RESCAN_MS);
+    bot.on("entitySpawn", onSpawn);
+  });
+}
+
 /**
  * Walk to every dropped item within `maxDist` and let natural ~1.5-block
  * auto-collect fire. Used both as a standalone skill ("pick up what I just
- * dropped") and internally by `mineBlock` to backstop the unreliable
- * post-dig auto-collect that the slice-3 smoke test surfaced.
+ * dropped") and internally by `mineBlock(s)` to collect drops.
  *
- * Snapshots the item list at entry so newly-spawned drops mid-sweep don't
- * loop forever; the skill returns and Claude can call it again if needed.
+ * "Collected" is the INVENTORY delta across the call (state.gained, by item
+ * name), not "the entity vanished" (another player or despawn also makes it
+ * vanish). Snapshots the item list at entry, then makes one more pass for
+ * drops that spawned mid-sweep; the skill returns and Claude can call it
+ * again if needed.
  */
+/** Internal options (not part of the Haiku-facing params). */
+export interface PickUpOptions {
+  /** Log gathering only: break the natural tree block an item is stuck on. Off by default. */
+  freeStuck?: boolean;
+}
+
 export async function pickUpNearby(
   bot: Bot,
   { maxDist = PICKUP_DEFAULT_RADIUS }: PickUpNearbyParams = {},
+  opts: PickUpOptions = {},
 ): Promise<SkillResult> {
   if (maxDist < 1 || maxDist > PICKUP_MAX_RADIUS) {
     return { ok: false, message: `maxDist must be between 1 and ${PICKUP_MAX_RADIUS}, got ${maxDist}` };
@@ -56,44 +142,115 @@ export async function pickUpNearby(
 
   const targets = collectDroppedItemPositions(bot, maxDist);
   if (targets.length === 0) {
-    return { ok: true, message: `no dropped items within ${maxDist} blocks` };
+    return { ok: true, message: `no dropped items within ${maxDist} blocks`, state: { walked: 0, collected: 0, gained: {} } };
   }
 
-  let collected = 0;
+  const before = inventoryCounts(bot);
   const cancellation = getBotState(bot.username)?.cancellation;
-  for (const target of targets) {
-    // Honour a stop between drops (also when called inside mineBlock(s)).
-    if (cancellation?.isRequested()) break;
-    // Re-check that the item still exists — natural pickup may have already
-    // claimed it while we were walking to a previous one.
-    const stillThere = bot.entities[target.entityId];
-    if (!stillThere || stillThere.name !== "item") continue;
+  const visited = new Set<number>();
+  let walked = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    const batch = pass === 0 ? targets : collectDroppedItemPositions(bot, maxDist).filter((t) => !visited.has(t.entityId));
+    for (const target of batch) {
+      visited.add(target.entityId);
+      // Honour a stop between drops (also when called inside mineBlock(s)).
+      if (cancellation?.isRequested()) break;
+      // Re-check that the item still exists — natural pickup may have already
+      // claimed it while we were walking to a previous one.
+      const stillThere = bot.entities[target.entityId];
+      if (!stillThere || stillThere.name !== "item") continue;
 
-    const result = await goTo(bot, {
-      target: { kind: "coords", coords: { x: target.pos.x, y: target.pos.y, z: target.pos.z } },
-      reach: 1,
-    });
-    if (!result.ok) {
-      // Path failures on individual drops are tolerable — keep sweeping.
-      continue;
+      const result = await goTo(bot, {
+        target: { kind: "coords", coords: { x: target.pos.x, y: target.pos.y, z: target.pos.z } },
+        reach: 1,
+      });
+      if (!result.ok) {
+        // Path failures on individual drops are tolerable — keep sweeping.
+        continue;
+      }
+      walked += 1;
+      await sleep(POST_GOTO_PICKUP_WAIT_MS);
+      await sleep(PICKUP_PER_ITEM_WAIT_MS);
     }
-    await sleep(POST_GOTO_PICKUP_WAIT_MS);
-    if (!bot.entities[target.entityId]) collected += 1;
-    await sleep(PICKUP_PER_ITEM_WAIT_MS);
+    if (cancellation?.isRequested()) break;
   }
+  // Items still lying around after two sweeps are usually perched where we can't stand:
+  // on a stump/trunk top or on leaves. Break the natural block they rest on.
+  // Only while felling trees (opt-in from the log-gathering paths): never on a generic pickup.
+  if (opts.freeStuck && !cancellation?.isRequested()) await freeStuckDrops(bot, maxDist);
 
+  const gained = inventoryGain(before, inventoryCounts(bot));
+  const collected = Object.values(gained).reduce((a, b) => a + b, 0);
   if (collected === 0) {
     return {
       ok: false,
-      message: `walked to ${targets.length} dropped item(s) within ${maxDist} blocks but collected none`,
-      state: { walked: targets.length, collected: 0 },
+      message: `walked to ${walked} of ${targets.length} dropped item(s) within ${maxDist} blocks but collected none${bot.inventory.emptySlotCount() === 0 ? " (inventory is full)" : ""}`,
+      state: { walked: targets.length, collected: 0, gained },
     };
   }
+  const gainedText = Object.entries(gained).map(([n, c]) => `${c} ${n}`).join(", ");
   return {
     ok: true,
-    message: `picked up ${collected} dropped item stack(s) within ${maxDist} blocks`,
-    state: { walked: targets.length, collected },
+    message: `picked up ${gainedText} from the ground within ${maxDist} blocks`,
+    state: { walked: targets.length, collected, gained },
   };
+}
+
+const STUCK_MAX_PER_CALL = 4;
+const TREE_DROP_RE = /(_log|_wood|_sapling|_propagule|^stick$|^apple$|^golden_apple$|^azalea$|^flowering_azalea$|^vine$|_leaves$)/;
+const STUCK_DIG_TIMEOUT_MS = 8_000;
+const STUCK_SETTLE_MS = 700;
+
+/**
+ * For each dropped item still present: if it rests on leaves or on a natural
+ * tree log (a stump top, a trunk, low canopy), walk within reach, break that
+ * block (natural, so fair game), let the item fall and collect it. Bounded to
+ * {@link STUCK_MAX_PER_CALL} items per call; every failure is swallowed.
+ */
+async function freeStuckDrops(bot: Bot, maxDist: number): Promise<void> {
+  const cancellation = getBotState(bot.username)?.cancellation;
+  let freed = 0;
+  const verdicts = new Map<string, boolean>();
+  for (const t of collectDroppedItemPositions(bot, maxDist)) {
+    if (freed >= STUCK_MAX_PER_CALL || cancellation?.isRequested()) return;
+    const e = bot.entities[t.entityId];
+    if (!e || e.name !== "item") continue;
+    if (!TREE_DROP_RE.test(t.itemName)) continue; // only things a felled tree drops
+    const support = bot.blockAt(new Vec3(Math.floor(e.position.x), Math.floor(e.position.y - 0.3), Math.floor(e.position.z)));
+    if (!support || !isFreeableTreeBlock((p) => bot.blockAt(p), support.position, verdicts)) continue;
+    freed += 1;
+    try {
+      await goTo(bot, { target: { kind: "coords", coords: { x: support.position.x, y: support.position.y, z: support.position.z } }, reach: 3 });
+      const fresh = bot.blockAt(support.position);
+      if (!fresh || fresh.name !== support.name || !bot.canDigBlock(fresh)) continue;
+      const pf = (bot as Bot & { pathfinder?: { bestHarvestTool?(b: unknown): Item | null } }).pathfinder;
+      const tool = pf?.bestHarvestTool?.(fresh);
+      if (tool && bot.heldItem?.type !== tool.type) await bot.equip(tool, "hand").catch(() => {});
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          bot.dig(fresh),
+          new Promise<never>((_, rej) => {
+            timer = setTimeout(() => {
+              try { bot.stopDigging?.(); } catch { /* best-effort */ }
+              rej(new Error("dig timeout"));
+            }, STUCK_DIG_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      console.log(`[${bot.username}] [pickup] broke ${support.name} at (${support.position.x}, ${support.position.y}, ${support.position.z}) to free a ${t.itemName}`);
+      await sleep(STUCK_SETTLE_MS);
+      const again = bot.entities[t.entityId];
+      if (again && again.name === "item") {
+        await goTo(bot, { target: { kind: "coords", coords: { x: again.position.x, y: again.position.y, z: again.position.z } }, reach: 1 });
+        await sleep(POST_GOTO_PICKUP_WAIT_MS + PICKUP_PER_ITEM_WAIT_MS);
+      }
+    } catch (err) {
+      console.log(`[${bot.username}] [pickup] could not free ${t.itemName}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
 }
 
 interface DropTarget {

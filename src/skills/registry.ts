@@ -25,7 +25,8 @@
 
 import type { Bot } from "mineflayer";
 import { z } from "zod";
-import { runSkill } from "./harness.js";
+import { achieve, build, cancelJob, followPlayer as followPlayerJob, surviveNight } from "../jobs/tools.js";
+import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
   activateBlock,
@@ -42,7 +43,6 @@ import {
   equipLoadout,
   fish,
   flee,
-  followPlayer,
   getItems,
   giveItemsTo,
   giveItemTo,
@@ -95,16 +95,25 @@ export interface SkillSpec {
 function withParams<P>(
   name: string,
   fn: (bot: Bot, params: P) => Promise<SkillResult>,
+  opts?: RunSkillOptions,
 ): (bot: Bot, args: unknown) => Promise<SkillResult> {
-  return (bot, args) => runSkill(bot, name, args, (p) => fn(bot, p as P));
+  return (bot, args) => runSkill(bot, name, args, (p) => fn(bot, p as P), opts);
 }
 
 function noParams(
   name: string,
   fn: (bot: Bot) => Promise<SkillResult>,
+  opts?: RunSkillOptions,
 ): (bot: Bot, args: unknown) => Promise<SkillResult> {
-  return (bot) => runSkill(bot, name, undefined, () => fn(bot));
+  return (bot) => runSkill(bot, name, undefined, () => fn(bot), opts);
 }
+
+/**
+ * Read-only / conversational / job-control tools: they never clear the stop
+ * flag or overwrite the current-tool slot, so they are safe to call while a
+ * v2 job step runs (keep in sync with JOB_EXEMPT_TOOLS in jobs/tools.ts).
+ */
+const READ_ONLY: RunSkillOptions = { readOnly: true };
 
 // Reused schema fragments (moved verbatim from skill-tools.ts).
 const posSchema = z.object({ x: z.number(), y: z.number(), z: z.number() });
@@ -131,7 +140,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     schema: {
       radius: z.number().int().min(1).max(64).optional().describe("Search radius in blocks (default 16)"),
     },
-    run: withParams("observeSurroundings", observeSurroundings),
+    run: withParams("observeSurroundings", observeSurroundings, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -139,7 +148,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Detailed inventory: every item with counts, tool durability, and what's equipped in armor / off-hand slots. Item counts are already in the world snapshot on each message; call this when you need durability or equipment details, or fresh counts after a lot of crafting/mining.",
     schema: {},
-    run: noParams("checkInventory", checkInventory),
+    run: noParams("checkInventory", checkInventory, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -165,7 +174,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Say something in public chat — the ONLY way players hear you (besides whisper). Use it to reply to public-chat messages. Write like a friendly player: one short casual line, plain text, no markdown. Don't narrate each step of a task; ack, then report the result. Max 256 chars.",
     schema: { message: z.string().min(1) },
-    run: withParams("say", say),
+    run: withParams("say", say, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -173,13 +182,13 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Private message to one player. Use it to reply when a player whispered you (/msg). Same style as say: one short casual line. Fails if the player is offline.",
     schema: { player: z.string().min(1), message: z.string().min(1) },
-    run: withParams("whisper", whisper),
+    run: withParams("whisper", whisper, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
     name: "goTo",
     description:
-      "Walk to a target. Target is one of: { kind: 'coords', coords: { x, y, z } } | { kind: 'entity', entity: '<player or mob name>' } | { kind: 'block', block: '<block id>' }. Optional `reach` (default 1) is the stop distance. Wooden doors, fence gates and the like open automatically on the way (iron doors and trapdoors don't); it never digs through blocks. Gives up within ~20s if stuck or there's no path, returning state.position. If you can't reach a spot inside a building, goTo its door or ask the player — never mine or place blocks to get in.",
+      "Walk to a target. Target is one of: { kind: 'coords', coords: { x, y, z } } | { kind: 'entity', entity: '<player or mob name>' } | { kind: 'block', block: '<block id>' }. Optional `reach` (default 1) is the stop distance. Wooden doors, fence gates and the like open automatically on the way (iron doors and trapdoors don't). It never digs through blocks and never places any (no bridging, no stairs, no towering up): if the only way is over a gap, up a cliff or through a wall, you get a no-path error, returning state.position. Gives up within ~20s if stuck. If you can't reach a spot inside a building, goTo its door or ask the player — never mine or place blocks to get in.",
     schema: {
       target: goToTargetSchema,
       reach: z.number().int().min(0).max(16).optional(),
@@ -198,18 +207,18 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "followPlayer",
     description:
-      "Follow a player at `dist` blocks (default 3), indefinitely, until they say stop (or you call stop). It doesn't return until then, so use it only when the player asked you to follow them — for 'come here' use goTo with the player as the target instead.",
+      "Follow a player at `dist` blocks (default 3), until they say stop (or you call stop / cancelJob), for up to 30 minutes. Starts a background job and returns at once: reply briefly (say) and end your turn. The follow keeps running while the player chats — answer them with say/whisper only; any movement/mining/crafting tool you call cancels it. If the player walks out of view the bot searches for them (last position, then the way they were heading) for ~45s before giving up with a [job failed] message. Use it only when the player asked you to follow them — for 'come here' use goTo with the player as the target instead.",
     schema: {
       player: z.string().min(1),
       dist: z.number().int().min(1).max(16).optional().describe("Follow distance in blocks (default 3)"),
     },
-    run: withParams("followPlayer", followPlayer),
+    run: withParams("followPlayer", followPlayerJob, READ_ONLY),
     surfaces: EXECUTOR,
   },
   {
     name: "mineBlock",
     description:
-      "Gather `count` blocks of ONE natural block type (nearest first), picking up the drops. For logs it reaches high logs itself — don't climb. For cobblestone, mine 'stone'. Blocks that look player-built are left alone (reported in the result) — don't retry with allowStructures unless a player asked you to demolish that thing. For several ore types in one trip use mineBlocks. In creative it only clears blocks (instant, no drops) — use getItems for materials.",
+      "Gather `count` blocks of ONE natural block type (nearest first) and pick up the drops. Success is counted by what actually lands in your inventory: it keeps going until you have `count` of the drop (or nothing reachable is left) and reports e.g. 'collected 10 oak_log (mined 11)'; use that number. It stands on the ground and takes only blocks within arm's reach (about 4 high), skipping unreachable ones (e.g. the top of a tall tree) and moving to the next; it may tunnel a short way through natural blocks to a buried target, never through player-built ones. For cobblestone, mine 'stone'. Blocks that look player-built are left alone (reported in the result) — don't retry with allowStructures unless a player asked you to demolish that thing. For several ore types in one trip use mineBlocks. In creative it only clears blocks (instant, no drops) — use getItems for materials.",
     schema: {
       type: z.string().min(1).describe("Block ID, e.g. 'oak_log', 'stone', 'iron_ore'"),
       count: z.number().int().min(1).max(64).optional(),
@@ -226,7 +235,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "mineBlocks",
     description:
-      "Mine several natural block types in one sweep, nearest first, until `maxCount` total or nothing is left in range — e.g. ['iron_ore', 'coal_ore', 'diamond_ore'] for 'mine any ores you find'. Types your tools can't harvest are skipped and reported in state.skipped (not fatal). Returns state.mined and state.byType. Like mineBlock, it leaves player-built blocks alone unless allowStructures is set (demolition requests only).",
+      "Mine several natural block types in one sweep, nearest first, until `maxCount` total is collected or nothing reachable is left in range — e.g. ['iron_ore', 'coal_ore', 'diamond_ore'] for 'mine any ores you find'. Types your tools can't harvest are skipped and reported in state.skipped (not fatal). Like mineBlock it counts what actually lands in your inventory (the drop, e.g. iron_ore gives raw_iron) until `maxCount` total, and returns state.collected, state.gained (by item), state.mined (blocks dug) and state.byType. It leaves player-built blocks alone unless allowStructures is set (demolition requests only).",
     schema: {
       types: z
         .array(z.string().min(1))
@@ -298,7 +307,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "pickUpNearby",
     description:
-      "Walk over and pick up dropped items within `maxDist` blocks (e.g. after a fight). mineBlock / mineBlocks already collect their drops, so you rarely need this after mining.",
+      "Walk over and pick up dropped items within `maxDist` blocks (e.g. after a fight). mineBlock / mineBlocks already collect their drops (and report what they collected), so you rarely need this after mining; it reports the items actually picked up.",
     schema: {
       maxDist: z.number().int().min(1).max(32).optional().describe("Search radius in blocks (default 8)"),
     },
@@ -568,7 +577,7 @@ export const SKILL_SPECS: SkillSpec[] = [
       name: z.string().optional(),
       pos: posSchema.optional(),
     },
-    run: withParams("remember", remember),
+    run: withParams("remember", remember, READ_ONLY),
     surfaces: PLANNER_ONLY,
   },
   {
@@ -576,7 +585,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Set a plan of short, concrete steps with counts (e.g. ['mine 16 oak_log', 'craft wooden_pickaxe', 'mine 8 stone', 'give pickaxe to Alex']). Replaces any existing plan. The current and remaining steps show up in your world snapshot every message. Use for any job with 3+ steps.",
     schema: { tasks: z.array(z.string().min(1)).min(1) },
-    run: withParams("setTaskQueue", setTaskQueue),
+    run: withParams("setTaskQueue", setTaskQueue, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
   },
   {
@@ -584,10 +593,71 @@ export const SKILL_SPECS: SkillSpec[] = [
     description:
       "Mark the current plan step done and move to the next. Call right after finishing each step. When it reports the queue is drained, tell the player you're done.",
     schema: {},
-    run: noParams("advanceTaskQueue", advanceTaskQueue),
+    run: noParams("advanceTaskQueue", advanceTaskQueue, READ_ONLY),
     // Executor needs this to drain a planner-authored queue (spikes/mlx-exec-spike.ts);
     // it sits outside the routing-spike curated-15, to be re-validated in Phase B.
     surfaces: EXECUTOR,
+  },
+  {
+    name: "achieve",
+    description:
+      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID, or a generic tag when any kind will do: '#log' (any wood), '#planks', '#wool', '#stone_tool_material' (cobblestone and friends), '#coal', '#sand' — e.g. 'chop 10 logs' = { item: '#log', count: 10 }; it takes whichever species is nearest and counts mixed logs together. This is also THE way to collect N of something (logs, planks, cobblestone, ...): it runs in the background so you can keep chatting. When the player wants the items themselves ('give me', 'get me', 'bring me'), add deliverTo: their name: the job then walks to them and hands the items over (creative: takes them with getItems first; capped at 2 stacks per item, 4 for unstackable items, and never operator items like command blocks). After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. In creative it only works with deliverTo.",
+    schema: {
+      goals: z
+        .array(
+          z.object({
+            item: z.string().min(1).describe("Item ID, e.g. 'iron_pickaxe', 'oak_planks', 'iron_ingot'; or a tag: '#log', '#planks', '#wool', '#stone_tool_material', '#coal', '#sand'"),
+            count: z.number().int().min(1).max(2304).describe("How many you should end up holding"),
+          }),
+        )
+        .min(1)
+        .max(8),
+      deliverTo: z.string().min(1).optional().describe("Player name to hand the finished items to (they must be nearby)"),
+    },
+    run: withParams("achieve", achieve, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "build",
+    description:
+      "Build a house, a nether portal or a wheat farm as a background job and return at once. It picks a level site next to the player (never on top of them or on anyone's build), gets any missing materials (survival: gathers/crafts them; creative: getItems), places everything bottom-up with temporary scaffolding and a door added last, then verifies the block count. blueprint 'house': params width/depth 5-9, height 3-4, wall/roof/floor block ids (default: the planks you hold), windows 0-8 (glass if you have it), door. 'portal': 10 obsidian frame + flint_and_steel. 'farm': size 3-9, needs a hoe + seeds, uses water within 4 or a water bucket. at: 'here' (default) or {x,y,z}. After it starts, reply briefly and end your turn — you get '[job finished]' or '[job failed]'. Don't call movement/building tools while it runs (that cancels it).",
+    schema: {
+      blueprint: z.enum(["house", "portal", "farm"]),
+      params: z
+        .object({
+          width: z.number().int().min(5).max(9).optional(),
+          depth: z.number().int().min(5).max(9).optional(),
+          height: z.number().int().min(3).max(4).optional().describe("Rows including the roof: 3 = a 2-high interior"),
+          wall: z.string().optional().describe("Wall block id, e.g. oak_planks, cobblestone"),
+          roof: z.string().optional().describe("Roof block id (default: same as wall)"),
+          floor: z.string().optional().describe("Optional floor block id"),
+          door: z.boolean().optional(),
+          windows: z.number().int().min(0).max(8).optional(),
+          size: z.number().int().min(3).max(9).optional().describe("Farm plot size"),
+        })
+        .optional(),
+      at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = beside the requesting player (default)"),
+    },
+    run: withParams("build", build, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "surviveNight",
+    description:
+      "Survive the night safely (call it at dusk, or when asked to 'survive the night', 'it's getting dark', 'stay safe tonight'). Background job: sleeps in a bed if one is within reach, otherwise digs itself a 1x2 pocket into the ground or a hillside in seconds (the quick shelter a player makes at dusk), seals it with the dug dirt and waits inside until dawn, then opens up. If no safe spot exists it builds a minimal 3x3 hut instead (next to the player, door or plugged doorway, torch if it has one). Never just stand around outside at night. useBed:false skips the bed (use it if sleeping failed). shelter:'hut' skips digging in and builds the hut (use it if digging in failed). After it starts, reply briefly and end your turn — you get '[job finished]' at dawn or '[job failed]'. Don't call movement/building tools while it runs (that cancels it). Not for creative mode.",
+    schema: {
+      useBed: z.boolean().optional().describe("false = build a shelter even if a bed is at hand"),
+      shelter: z.enum(["dig", "hut"]).optional().describe("hut = build the 3x3 hut instead of digging in (default dig)"),
+    },
+    run: withParams("surviveNight", surviveNight, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "cancelJob",
+    description: "Cancel the running achieve job (if any). Use when the player changes their mind; a new achieve call also replaces the running job.",
+    schema: {},
+    run: noParams("cancelJob", cancelJob, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
   },
 ];
 
