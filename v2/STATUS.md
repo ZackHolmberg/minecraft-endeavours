@@ -3,7 +3,7 @@
 **Resume:** in `~/dev/minecraft-endeavours-v2` (branch `v2`), say "continue v2 per v2/STATUS.md". Never work in `~/dev/minecraft-endeavours` (live panel). Mission: [../V2_KICKOFF_PROMPT.md in the main checkout] — the most competent, comprehensive, efficient Haiku-brained Minecraft bot. Decisions: [DECISIONS.md](DECISIONS.md). Test server: [TEST_SERVER.md](TEST_SERVER.md).
 
 ## Phase
-**Milestone 1 reached (2026-10-10): v2 80% vs v1 45% on core (×2 each); v2-s4 now 95%** — awaiting owner check-in. Meanwhile slice 2c (conversation/autonomy + explore/night) in progress.
+**LIVE (2026-10-11): v2 is the production bot** (`Steve_AI`, `main` @ `7448dac`, D19). Final pre-cutover benchmark `v2-s5`: 58/62 (94%) vs v1 45%; 0 player-build blocks broken, 0 deaths. Next: post-cutover verification + backlog (ROADMAP.md).
 
 ## Done
 - Step 0: tag `v1` (= `b184e5e`, local only, not pushed), worktree + branch `v2`, isolated test server (boots, RCON ok), `Steve_v2` config, port-aware bot scripts. Commit `c1587b0`.
@@ -11,19 +11,13 @@
 - Eval harness `d44eb1c` ([EVAL.md](EVAL.md)). Smoke vs v1: 2/4 — chop_logs 3/10 (mineBlock counts digs not pickups), door_house dug through wall beside door. ~$0.001/task, cache hit 99%.
 - Scenario catalogue spec: `v2/SCENARIOS.md` (33 scenarios, core + stretch).
 
-## LIVE TEST (owner request, 2026-10-10) — session ended
-- `Steve_v2` ran on the real server from worktree `../mcv2-live` (`.env` MC_PORT=25565, docker disabled there); owner: "really impressive… nearly flawless, lightning fast". Owner stopped the live server afterwards; lead stopped the bot and moved `../mcv2-live` to `4147b21` (follow job + quick shelter + live fixes). Backup before the test: `backups/world_2026-10-10_17-05-14.tar.gz` (main checkout). `Steve_v2` is still on the live whitelist.
-- Next live session: start the live server (main checkout `scripts/start.sh`), then `cd ../mcv2-live && ./scripts/botStart.sh`; stop with `./scripts/botStop.sh`.
-- Live findings, all fixed: stuck after a job (claimed "placed", stopped; un-named follow-ups dropped) → `46d6ba9`; missed message while following → follow job `e12f41b`.
+## Live state
+- Live bot runs from the main checkout (`./scripts/botStart.sh` / `botStop.sh` there). Panel restarted on the v2 UI (launchd). Verify on first chat: `grep "sdk init" .bot-runtime/bot.log` should show `foreign=0` and `mcp=[minecraft-skills]` (D16/D18 isolation).
+- Worktrees: `minecraft-endeavours-v2` (branch `v2`, dev), `mcv2-dev` / `mcv2-build` (side branches), `mcv2-bench` (frozen), `minecraft-endeavours-v1base` (frozen v1).
 
-## In flight (2026-10-11) — final pre-cutover run
-- Merged @ `99f1610`: docs (`9255970`), s4 fixes (`b8efdeb`), promotion-review fixes incl. full SDK isolation (`21d66c6`, D18). 401 tests.
-- **Final run `v2/runs/v2-s5`** (core 31 scenarios ×2, bench `../mcv2-bench` @ `99f1610`), log ends CHAIN_DONE.
-- Then cutover per D17 (confirm panel UI rebuild + restart with owner first).
-
-## Next steps — toward promotion (D17)
-1. Read `v2-s5`; if ≥ targets with no regressions → cutover per D17. (Done: s4 fixes, promotion review + fixes, panel security PASS, docs.)
-2. Cutover checklist: delete ROADMAP.md "Before cutover" section; `config/bots.yml` → `Steve_AI` (aliases [steve]); install `v2/CLAUDE.md.next` as the main checkout's CLAUDE.md; backup world; merge into main checkout (no branch switch) + `npm ci`; panel `ui:build` + launchd restart (owner OK); start live bot; push main (owner OK). Done so far: security fix on main (`bd32483`), `v2` + `v1` tag pushed.
+## Next steps
+1. Confirm the `sdk init` isolation line on the live bot's first chat.
+2. Backlog in ROADMAP.md: t2.coal at lake-locked sites, portal scaffold miss, follow lag with fast players, stretch suite (iron kit, diamonds), pathfinder master pin, prompt/tool-surface trim (~13–19k cached tokens/call), combat/trading/Nether.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
@@ -43,12 +37,11 @@
 |---|---|---|---|---|---|---|---|---|---|---|
 | v1 ×2 (baseline + r2) | 27/60 (45%) | 14/16 | 7/16 | 1/10 | 0/6 | 1/4 | 2/4 | 2/4 | 198/pass | 8 broken, 2 deaths |
 | v1-baseline (rep 1) | 12/30 | 7/8 | 4/8 | 0/5 | 0/3 | 0/2 | 1/2 | 0/2 | ~230 | [report](reports/baseline-v1.md); t1.eat + 4 confirm-policy scenarios re-run (D13); cr.build_house flipped PASS→FAIL on re-run (plan only in thinking, never said) — single-repeat noise is real, use repeats for milestone numbers |
-| **v2-s4 (`6d5af8b`, ×2)** | **57/60 (95%)** | 16/16 | 16/16 | 8/10 | 5/6 | 4/4 | 4/4 | 4/4 | 146/pass | 0 broken, 0 pillar, 1 death (survive_night r2, pre quick-shelter); p50 first reply 2.2s; fails: build_house r1 80/82 (server refused 1 placement, no retry), followup_chest r2 (chest >16 blocks away after chopping), survive_night r2 |
+| **v2-s5 (`99f1610`, ×2, final pre-cutover)** | **58/62 (94%)** | 16/16 | 14/16 | 9/10 | 7/8 | 4/4 | 4/4 | 4/4 | 147/pass | 0 broken, 0 pillar, 0 deaths; fails: coal ×2 (lake site timeout), portal r1 (scaffold), chat_while_following r1 (trailed 25 blocks) |
+| v2-s4 (`6d5af8b`, ×2) | **57/60 (95%)** | 16/16 | 16/16 | 8/10 | 5/6 | 4/4 | 4/4 | 4/4 | 146/pass | 0 broken, 0 pillar, 1 death (survive_night r2, pre quick-shelter); p50 first reply 2.2s; fails: build_house r1 80/82 (server refused 1 placement, no retry), followup_chest r2 (chest >16 blocks away after chopping), survive_night r2 |
 | v2-s3 (`110e060`, ×2) | **48/60 (80%)** | 16/16 | 13/16 | 7/10 | 1/6 | 3/4 | 4/4 | 4/4 | 136/pass | [milestone-1](reports/milestone-1.md); 0 broken; deaths 5 |
 | v2-r1 targeted (`3480223`, 8 regressed scenarios) | 6/8 | | | | | | | | | doors ✓ (0 broken), no_grief ✓, wooden/stone pickaxe ✓, not_stop ✓; chop_logs ✗ (jungle drops), coal ✗ (drowned/suffocated) |
 | v2-s2b (`ff27f8d`) | 14/30 | 7/8 | 3/8 | 1/5 | 2/3 | 0/2 | 1/2 | 0/2 | 152 | iron_pickaxe ✓ 5 turns; regressions R1–R4 (pathing timeouts w/o digging, filler eats materials, doors don't open, log hut chopped: 9 broken); builds waited for confirm (D13) |
 
 ## Open questions for the owner
-- Don't start the v1 bot on `main` before cutover (D18 exposure), or approve adding `settingSources: []` to `main` too.
-- Push local `main` (security fix `bd32483`)? (Not requested yet.)
-- At cutover: confirm the panel UI rebuild + launchd restart (internet-facing) — plan in D17.
+- None.
