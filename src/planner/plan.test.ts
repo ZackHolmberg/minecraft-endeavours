@@ -477,7 +477,7 @@ describe("generic goal tags (#log, #planks, ...)", () => {
   const gatherItems = (p: Plan) => find(p, "gather").map((s) => `${s.item}:${s.count}`);
 
   it("#log gathers the species in view (nearest wins) and returns concrete goals", () => {
-    const view = mkView({ near: { birch_log: 9, jungle_log: 4 } });
+    const view = mkView({ near: { birch_log: 9, jungle_log: 4 }, inventory: { iron_axe: 1 } }); // an axe held: no axe prefix
     const p = plan([g("#log", 10)], view);
     expect(p.unresolved).toEqual([]);
     expect(p.goals).toEqual([{ item: "jungle_log", count: 10 }]);
@@ -485,7 +485,7 @@ describe("generic goal tags (#log, #planks, ...)", () => {
   });
 
   it("#log counts logs already held, any species, before gathering", () => {
-    const view = mkView({ near: { birch_log: 5 }, inventory: { oak_log: 3 } });
+    const view = mkView({ near: { birch_log: 5 }, inventory: { oak_log: 3, iron_axe: 1 } });
     const p = plan([g("#log", 10)], view);
     expect(gatherItems(p)).toEqual(["birch_log:7"]);
     expect(p.goals).toEqual(expect.arrayContaining([{ item: "oak_log", count: 3 }, { item: "birch_log", count: 7 }]));
@@ -499,7 +499,7 @@ describe("generic goal tags (#log, #planks, ...)", () => {
   });
 
   it("re-planning the tag goal after a partial gather finishes only the shortfall", () => {
-    const view = mkView({ near: { birch_log: 5 }, inventory: { birch_log: 4 } });
+    const view = mkView({ near: { birch_log: 5 }, inventory: { birch_log: 4, iron_axe: 1 } });
     const p = plan([g("#log", 10)], view);
     expect(gatherItems(p)).toEqual(["birch_log:6"]);
   });
@@ -543,5 +543,58 @@ describe("generic goal tags (#log, #planks, ...)", () => {
   it("creative: tags resolve too (hand-over needs concrete items)", () => {
     const p = plan([g("#log", 3)], mkView({ gameMode: "creative", near: { birch_log: 3 } }));
     expect(p.goals).toEqual([{ item: "birch_log", count: 3 }]);
+  });
+});
+
+describe("axe before big log gathers (efficiency D21 #7)", () => {
+  it("20 logs, empty bag: gathers a few logs, crafts a wooden axe first, then the rest; the whole plan simulates", () => {
+    const view = mkView({ near: { oak_log: 5 } });
+    const p = plan([g("oak_log", 20)], view);
+    expect(p.unresolved).toEqual([]);
+    const o = ops(p);
+    expect(o).toContain("craft:wooden_axe");
+    expect(o.indexOf("craft:wooden_axe")).toBeLessThan(o.lastIndexOf("gather:oak_log"));
+    const gathers = find(p, "gather", "oak_log");
+    expect(gathers.length).toBe(2);
+    expect(gathers[0]!.count).toBeLessThanOrEqual(3);
+    expect(gathers.reduce((n, s) => n + s.count, 0)).toBe(20 + gathers[0]!.count);
+    const inv = simulate(p, view);
+    expect(inv["wooden_axe"]).toBe(1);
+    expect(inv["oak_log"]).toBeGreaterThanOrEqual(20);
+  });
+
+  it("10 logs from an empty bag: the axe would cost more time than it saves, so no axe", () => {
+    expect(ops(plan([g("oak_log", 10)], mkView({ near: { oak_log: 5 } })))).not.toContain("craft:wooden_axe");
+  });
+
+  it("not for small gathers, with an axe already held (any tier), or in creative", () => {
+    const near = { near: { oak_log: 5 } };
+    expect(ops(plan([g("oak_log", 5)], mkView({ ...near, inventory: { oak_planks: 8 }, stations: { crafting_table: true, furnace: false } })))).not.toContain("craft:wooden_axe");
+    expect(ops(plan([g("oak_log", 20)], mkView({ ...near, inventory: { iron_axe: 1 } })))).not.toContain("craft:wooden_axe");
+    expect(ops(plan([g("oak_log", 20)], mkView({ ...near, inventory: { stone_axe: 1 } })))).not.toContain("craft:wooden_axe");
+    expect(plan([g("oak_log", 20)], mkView({ ...near, gameMode: "creative" })).steps).toEqual([]);
+  });
+
+  it("uses a nearby table, and held planks make it cheaper", () => {
+    const view = mkView({ near: { oak_log: 5 }, stations: { crafting_table: true, furnace: false }, inventory: { oak_planks: 8 } });
+    const p = plan([g("oak_log", 8)], view);
+    expect(ops(p)).toContain("craft:wooden_axe");
+    expect(ops(p)).not.toContain("place:crafting_table");
+    expect(simulate(p, view)["wooden_axe"]).toBe(1);
+  });
+
+  it("takes a stone axe when the cobblestone is already held", () => {
+    const view = mkView({ near: { oak_log: 5 }, inventory: { cobblestone: 5 }, stations: { crafting_table: true, furnace: false } });
+    const p = plan([g("oak_log", 10)], view);
+    expect(ops(p)).toContain("craft:stone_axe");
+    expect(ops(p)).not.toContain("craft:wooden_axe");
+    expect(simulate(p, view)["stone_axe"]).toBe(1);
+  });
+
+  it("does not add a second table or axe when the goal already needs one (iron_pickaxe)", () => {
+    const view = mkView({ near: { oak_log: 5, stone: 8, iron_ore: 12, coal_ore: 9 } });
+    const p = plan([g("iron_pickaxe", 1)], view);
+    expect(find(p, "craft", "wooden_axe")).toHaveLength(0);
+    expect(simulate(p, view)["iron_pickaxe"]).toBe(1);
   });
 });

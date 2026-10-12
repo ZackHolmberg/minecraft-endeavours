@@ -34,6 +34,11 @@ export const REACHABLE_LOG_BONUS = 0.4;
 export const REACHABLE_BONUS_CAP = 10;
 /** Bonus for staying on the tree we just chopped (finish a trunk before wandering). */
 export const SAME_TREE_BONUS = 8;
+/** Logs this high above the floor are the edge of arm's reach: leaves around the trunk often leave no standing cell ("no_path"), so try lower logs and other trees first. */
+export const HIGH_LOG_HEIGHT = 3;
+export const HIGH_LOG_PENALTY = 5;
+/** A tree whose logs failed to path this many times (or one failure at {@link HIGH_LOG_HEIGHT}+) is written off as a whole. */
+export const TREE_UNREACHABLE_FAILS = 2;
 /** Tie-break toward the lower log of a tree. */
 const LOWER_LOG_WEIGHT = 0.3;
 const FLOOR_SCAN_DEPTH = 12;
@@ -177,7 +182,7 @@ export function rankLogs(blockAt: BlockAt, positions: Vec3[], from: Vec3, lastTr
       trees.set(k, tree);
     }
     const score =
-      pos.distanceTo(from) + tree.penalty + LOWER_LOG_WEIGHT * fell.height - (lastTree?.has(k) ? SAME_TREE_BONUS : 0);
+      pos.distanceTo(from) + tree.penalty + LOWER_LOG_WEIGHT * fell.height + (fell.height >= HIGH_LOG_HEIGHT ? HIGH_LOG_PENALTY : 0) - (lastTree?.has(k) ? SAME_TREE_BONUS : 0);
     ranked.push({ pos, score, tree, fell });
   }
   ranked.sort((a, b) => a.score - b.score);
@@ -194,4 +199,16 @@ export function speciesViewScore(blockAt: BlockAt, positions: Vec3[], from: Vec3
   const best = r.ranked[0];
   if (!best) return null;
   return { count: r.ranked.length, score: Math.max(best.pos.distanceTo(from), best.score) };
+}
+
+/**
+ * A log just proved unreachable (no path). Retrying its neighbours costs ~10 s each and fails the same way (live
+ * session 2026-10-11: 13 nav failures at 3 tree clusters), so once a tree has failed {@link TREE_UNREACHABLE_FAILS} times, or
+ * a log {@link HIGH_LOG_HEIGHT}+ above the floor failed once, return every log of that tree to skip. `null` = keep trying
+ * the rest of this tree.
+ */
+export function treeToWriteOff(blockAt: BlockAt, failed: Vec3, failsInTree: number): Set<string> | null {
+  const high = fellInfo(blockAt, failed).height >= HIGH_LOG_HEIGHT;
+  if (!high && failsInTree < TREE_UNREACHABLE_FAILS) return null;
+  return analyzeTree(blockAt, failed).keys;
 }

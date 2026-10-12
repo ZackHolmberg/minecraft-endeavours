@@ -57,7 +57,9 @@ export async function gatherStep({ bot, ctx }: StepEnv, step: Gather): Promise<S
     // until the count is met or a call makes none; only a call that gained nothing fails the step.
     if (gained <= 0) {
       const kind = classifyFailure(r.message, r.state, "unreachable");
-      return fail(step, kind, `${r.message} (have ${have() - ctx.baseline}/${step.count} ${step.item})`, 1, kind === "unreachable" ? unreachableBlocksOf(r.state, step.blocks) : undefined, kind === "unreachable" ? unreachablePositionsOf(r.state) : undefined);
+      // "cancelled" also reports what it gave up on: the runner may have stopped this gather itself (no-progress watchdog)
+      const giveUp = kind === "unreachable" || kind === "cancelled";
+      return fail(step, kind, `${r.message} (have ${have() - ctx.baseline}/${step.count} ${step.item})`, 1, giveUp ? unreachableBlocksOf(r.state, step.blocks) : undefined, giveUp ? unreachablePositionsOf(r.state) : undefined);
     }
     // progress but short ("no more within N blocks"): loop; the next call reports no_source cleanly if empty
   }

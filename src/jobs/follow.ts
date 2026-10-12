@@ -233,3 +233,62 @@ export function followProgress(player: string, a: FollowAction, lostForS: number
       return `following ${player}`;
   }
 }
+
+// ── creative flight (the followed player is airborne) ────────────────────────
+
+/** The player must look airborne this long before the bot takes off (jumps, short falls and elytra glitches don't count). */
+export const FLY_TAKEOFF_MS = 1_200;
+/** ... and look supported this long before the bot lands again. */
+export const FLY_LAND_MS = 1_500;
+/** Blocks below the player's feet that count as "standing on something" (a flying player over a hillside is not airborne). */
+export const SUPPORT_DEPTH = 3;
+
+/**
+ * Takeoff / landing hysteresis for following a flying player in creative. Feed it one observation per tick:
+ * `true` = the player is airborne, `false` = supported, `null` = unknown (out of view; keeps the current mode).
+ */
+export class FlightGate {
+  private flying = false;
+  private since: number | null = null;
+
+  get isFlying(): boolean {
+    return this.flying;
+  }
+
+  update(now: number, airborne: boolean | null): boolean {
+    if (airborne === null) return this.flying;
+    // the opposite of the current mode, observed continuously, flips it
+    const wantsChange = airborne !== this.flying;
+    if (!wantsChange) {
+      this.since = null;
+      return this.flying;
+    }
+    this.since ??= now;
+    if (now - this.since >= (airborne ? FLY_TAKEOFF_MS : FLY_LAND_MS)) {
+      this.flying = airborne;
+      this.since = null;
+    }
+    return this.flying;
+  }
+
+  /** Leave flight mode at once (job end, mode change, the bot lost the controls). */
+  reset(): void {
+    this.flying = false;
+    this.since = null;
+  }
+}
+
+/**
+ * Is a player at feet position `p` airborne? Not when `onGround` is true (callers pass undefined for other players: mineflayer never updates it), and not when anything solid or
+ * liquid is within {@link SUPPORT_DEPTH} blocks below their feet. `blockBelow(dy)` returns "solid" / "liquid" / "free" for
+ * the cell `dy` blocks under the feet cell, or null when unloaded (=> unknown).
+ */
+export function playerAirborne(onGround: boolean | undefined, blockBelow: (dy: number) => "solid" | "liquid" | "free" | null): boolean | null {
+  if (onGround === true) return false;
+  for (let dy = 1; dy <= SUPPORT_DEPTH; dy++) {
+    const b = blockBelow(dy);
+    if (b === null) return null;
+    if (b !== "free") return false;
+  }
+  return true;
+}

@@ -12,6 +12,7 @@ import type { SkillResult } from "../skills/types.js";
 import { isOperatorItem } from "../skills/creative.js";
 import { isCreative } from "../skills/game-mode.js";
 import { followPlayer as followPlayerBlocking } from "../skills/movement.js";
+import { FIND_ACTIONS, FIND_MAX_COUNT, resolveFindTarget } from "./find.js";
 import { FOLLOW_DEFAULT_DIST, FOLLOW_MAX_DIST } from "./follow.js";
 import { holdsDoor, pickShelterWall } from "./night.js";
 import { goalsText, jobLabel } from "./describe.js";
@@ -19,7 +20,7 @@ import { findPlayer } from "./steps/deliver.js";
 import { inventoryTotals } from "./world-view.js";
 import { ledgerFor } from "./ledger.js";
 import { getJobRunner } from "./registry.js";
-import type { AchieveResult, BuildSpec } from "./types.js";
+import type { AchieveResult, BuildSpec, FindAction } from "./types.js";
 
 /** Tools that never disturb a running job: reads, talk, notes, job control. Everything else is a new instruction. */
 export const JOB_EXEMPT_TOOLS: ReadonlySet<string> = new Set([
@@ -33,6 +34,7 @@ export const JOB_EXEMPT_TOOLS: ReadonlySet<string> = new Set([
   "achieve",
   "build",
   "surviveNight",
+  "find",
   "cancelJob",
 ]);
 
@@ -231,6 +233,41 @@ export async function followPlayer(bot: Bot, { player, dist = FOLLOW_DEFAULT_DIS
     ok: res.ok,
     message: res.ok
       ? `now following ${who} (~${dist} blocks) as a background job. It keeps running while you chat: reply briefly with say and end your turn. It ends when they say stop, you call cancelJob/stop, or you start a movement/mining tool; if they leave or I lose them for ~45s you get a [job failed] message.`
+      : res.message,
+    state: res,
+  };
+}
+
+export interface FindParams {
+  /** What to look for: a block ("diamond_ore", "oak_log") or an ore word ("diamond", "iron"). */
+  block: string;
+  /** point = stand next to it and say where; mine = mine it; report = only say where it is. Default point. */
+  action?: FindAction;
+  /** action mine: how many to take (default 1, max 16). */
+  count?: number;
+}
+
+/**
+ * `find`: locate a block as a background job (known sightings, then a scan, then exploring: a staircase down for ores,
+ * a spiral walk for surface blocks) and point it out / mine it / report it. Works in creative and survival. Returns at once.
+ */
+export async function find(bot: Bot, { block, action = "point", count = 1 }: FindParams): Promise<SkillResult> {
+  const runner = getJobRunner(bot.username);
+  if (!runner) return { ok: false, message: "the job runner isn't available right now" };
+  if (!FIND_ACTIONS.includes(action)) return { ok: false, message: `action must be one of ${FIND_ACTIONS.join(", ")}, got "${action}"` };
+  const target = resolveFindTarget(block, (b) => bot.registry.blocksByName[b] !== undefined);
+  if (!target) {
+    const r = resolveItem(bot, block);
+    const hint = r.ok ? ` (did you mean the block for ${r.normalized}? use the block name, e.g. "${r.normalized}_ore" or a *_log)` : "";
+    return { ok: false, message: `"${block}" isn't a block I know${hint}. Use a block id such as diamond_ore, iron_ore, oak_log, or an ore word like diamond.` };
+  }
+  const requester = getCurrentConversationPartner(bot.username) ?? null;
+  const n = Math.max(1, Math.min(FIND_MAX_COUNT, Math.floor(count)));
+  const res = await runner.startFind({ block: target.name, blocks: target.blocks, action, count: n }, requester);
+  return {
+    ok: res.ok,
+    message: res.ok
+      ? `find started: ${action === "mine" ? `mine ${n} ${target.name}` : action === "point" ? `point out ${target.name} (stand next to it, don't mine it)` : `report where ${target.name} is`}. It runs in the background (up to ~10 minutes: checks what's known, then explores — digging a staircase down for ores); reply briefly and end your turn — you get '[job finished]' or '[job failed]'. Don't call movement/mining tools while it runs (that cancels it).`
       : res.message,
     state: res,
   };

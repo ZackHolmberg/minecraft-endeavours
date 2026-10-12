@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { plan as realPlan } from "../planner/plan.js";
 import type { FailureKind, Goal, Plan, Step, WorldView } from "../planner/types.js";
 import type { TelemetryInput } from "../observability/telemetry.js";
-import { JobRunner, STEP_GRACE_MS, type ExploreOutcome, type RelocateOutcome, type RunnerDeps, type StepRunContext } from "./runner.js";
+import { GATHER_NO_PROGRESS_MS, JobRunner, STEP_GRACE_MS, type ExploreOutcome, type RelocateOutcome, type RunnerDeps, type StepRunContext } from "./runner.js";
 import type { Job, StepResult } from "./types.js";
 
 const gatherStep = (item: string, count: number, extra: Partial<Extract<Step, { op: "gather" }>> = {}): Step => ({
@@ -40,6 +40,7 @@ function harness(opts: {
   load?: Job | null;
   buildView?: RunnerDeps["buildView"];
   onPlan?: (view: WorldView) => void;
+  progress?: () => number;
 }): Harness {
   const h: Harness = { events: [], ended: [], saved: [], stops: 0, plans: [...opts.plans], calls: [], inv: {}, runner: null as never };
   let n = 0;
@@ -58,6 +59,7 @@ function harness(opts: {
     ...(opts.relocate ? { relocate: async (step: Step) => opts.relocate!(step) } : {}),
     position: () => ({ x: 10, y: 64, z: 20 }),
     countItem: (item) => h.inv[item] ?? 0,
+    ...(opts.progress ? { progress: opts.progress } : {}),
     requestStop: () => {
       h.stops++;
     },
@@ -557,5 +559,84 @@ describe("explore-elsewhere recovery (relocate)", () => {
     await until(() => h.ended.length === 1);
     expect(h.runner.current()!.status).toBe("done");
     expect(rungs(h)[0]).toBe("relocate");
+  });
+});
+
+describe("gather no-progress watchdog", () => {
+  /** A gather that hangs until the runner asks it to stop, then returns "cancelled" like mineBlocks does. */
+  const stuckUntilStopped = (h: () => Harness) => (s: Step): Promise<StepResult> =>
+    new Promise((resolve) => {
+      const t0 = h().stops;
+      const poll = (): void => (h().stops > t0 ? resolve(failRes(s, "cancelled", "mining cancelled", { positions: ["1,60,2"] })) : void setTimeout(poll, 100));
+      poll();
+    });
+
+  it("stops a gather that gains nothing for 60 s, reports unreachable+stalled, and relocates instead of waiting for the 400 s cap", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let relocated = 0;
+      const h: Harness = harness({
+        plans: [mkPlan([gatherStep("coal", 8)]), mkPlan([gatherStep("coal", 8)]), mkPlan([])],
+        script: (s, n) => (n === 0 ? stuckUntilStopped(() => h)(s) : okRes()),
+        relocate: () => (relocated++, { moved: true, detail: "moved 60 blocks" }),
+        progress: () => 5, // inventory never grows
+      });
+      await h.runner.start([{ item: "coal", count: 8 }], null);
+      await vi.advanceTimersByTimeAsync(GATHER_NO_PROGRESS_MS - 4_000);
+      expect(h.stops).toBe(0);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(h.stops).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const step = h.events.find((e) => e.kind === "step") as { ok: boolean; failureKind: string; durationMs: number };
+      expect(step).toMatchObject({ ok: false, failureKind: "unreachable" });
+      expect(rungs(h)).toContain("relocate");
+      expect(relocated).toBe(1);
+      expect(h.calls[0]!.ctx.signal.aborted).toBe(false); // a stall is not a job cancel
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("any inventory gain resets the clock (slow but moving gathers are left alone)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let inv = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const h = harness({
+        plans: [mkPlan([gatherStep("oak_log", 8)]), mkPlan([])],
+        script: async () => (await gate, okRes()),
+        progress: () => inv,
+      });
+      await h.runner.start([{ item: "oak_log", count: 8 }], null);
+      for (let i = 0; i < 6; i++) {
+        await vi.advanceTimersByTimeAsync(40_000); // 240 s in total, but a log lands every 40 s
+        inv += 1;
+      }
+      expect(h.stops).toBe(0);
+      release();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(h.events.find((e) => e.kind === "step")).toMatchObject({ ok: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a stalled ore gather is never retried in place and relocates even with fewer than 3 dead positions", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h: Harness = harness({
+        plans: [mkPlan([gatherStep("coal", 3, { blocks: ["coal_ore"] })]), mkPlan([])],
+        script: (s) => stuckUntilStopped(() => h)(s),
+        relocate: () => ({ moved: false, detail: "no dry land" }),
+        progress: () => 0,
+      });
+      await h.runner.start([{ item: "coal", count: 3 }], null);
+      await vi.advanceTimersByTimeAsync(GATHER_NO_PROGRESS_MS + 6_000);
+      expect(rungs(h)[0]).toBe("relocate");
+      expect(rungs(h)).not.toContain("retry");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

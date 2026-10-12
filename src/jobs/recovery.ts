@@ -5,6 +5,7 @@
  *   0. unreachable gather: remember the unreachable positions + area (`exhausted.ts`); first RELOCATE (bounded surface
  *      walk >= 48 blocks away over dry land, then rescan and retry), only then re-plan at once with the unreachable
  *      block types avoided (`WorldView.avoidBlocks`: deep variants / shafts)
+ *      (a gather stalled by the no-progress watchdog relocates at once, whatever the position count, and is never retried in place)
  *   1. retry once          (transient: unreachable / timeout / station / internal)
  *   2. rebuild view + re-plan   (max MAX_REPLANS per job; plan drifted or nothing in view)
  *   3. no_source: widen the scan 64 → 96 → 160
@@ -99,7 +100,10 @@ export function decideRecovery(
 
   // Everything in this area is unreachable (ore behind a lake, under sand beside a flooded pocket): leave the area
   // for dry land and rescan before settling for a deep variant. Logs keep the cheaper re-plan (another species).
-  if (kind === "unreachable" && step.op === "gather" && relocationsLeft > 0 && (failure.positions?.length ?? 0) >= RELOCATE_MIN_POSITIONS && !step.blocks.every((b) => b.endsWith("_log"))) {
+  // A stalled gather (the runner's no-progress watchdog) is "stuck here": do not retry in place, leave the area at once.
+  const stalled = failure.stalled === true;
+  if (stalled && step.op === "gather") ep.retried = true;
+  if (kind === "unreachable" && step.op === "gather" && relocationsLeft > 0 && ((failure.positions?.length ?? 0) >= RELOCATE_MIN_POSITIONS || stalled) && !step.blocks.every((b) => b.endsWith("_log"))) {
     return { rung: "relocate", detail: `${step.item} unreachable here; trying another area on dry land` };
   }
   // The step's blocks were seen but unreachable (e.g. jungle logs up in the canopy). Retrying the same
