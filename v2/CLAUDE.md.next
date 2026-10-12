@@ -95,7 +95,7 @@ Bot must be on the server whitelist to actually join. `./scripts/console.sh` the
 
 ### Test server isolation (important)
 
-Never point experiments, the eval or a second bot at the live server. Development and the benchmark use a git worktree whose gitignored, non-secret `.env` sets `COMPOSE_FILE=docker-compose.test.yml`, `COMPOSE_PROJECT_NAME=mcv2test`, `MC_PORT=25566`, `RCON_PORT=25576`, so `docker compose`, `start.sh`, `stop.sh`, `console.sh` and `botStart.sh` there act on the test server only. The eval refuses the live checkout and benchmarks a frozen checkout (never the one being edited). The dev bot there is `Steve_v2`. Details: [v2/TEST_SERVER.md](v2/TEST_SERVER.md); decisions D1/D2/D11 in [v2/DECISIONS.md](v2/DECISIONS.md).
+Never point experiments, the eval or a second bot at the live server. Development and the benchmark use a git worktree whose gitignored, non-secret `.env` sets `COMPOSE_FILE=docker-compose.test.yml`, `COMPOSE_PROJECT_NAME=mcv2test`, `MC_PORT=25566`, `RCON_PORT=25576`, so `docker compose`, `start.sh`, `stop.sh`, `console.sh` and `botStart.sh` there act on the test server only. The eval refuses the live checkout and benchmarks a frozen checkout (never the one being edited). The bot there uses the same `config/bots.yml` (`Steve_AI`) — fine, the test server is a separate server (`Steve_v2` was the pre-cutover dev name). Details: [v2/TEST_SERVER.md](v2/TEST_SERVER.md); decisions D1/D2/D11 in [v2/DECISIONS.md](v2/DECISIONS.md).
 
 ## Project docs
 - [ARCHITECTURE.md](ARCHITECTURE.md) — design + as-shipped reference: layer stack, jobs, movement policy, routing, memory, telemetry & eval, web panel, creative mode, decisions table.

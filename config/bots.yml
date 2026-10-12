@@ -2,14 +2,14 @@ bots:
   # Steve_AI runs on Claude Haiku (claude-haiku-5-5) via the plain Claude backend — the standing
   # default for the foreseeable future. Don't switch to the local model
   # (backend: local / hybrid) or another Claude tier without sign-off.
-  - username: Steve_v2
+  - username: Steve_AI
     aliases: [steve]         # extra names players can use to address the bot (in addition to the username)
     model_hint: haiku
     backend: claude
     session_mode: per_task   # fresh Haiku session per task; `persistent` = one long-lived session (rollback)
 
 # Not in use — kept for reference. Hybrid (Claude plans / Qwen executes):
-#   - username: Steve_v2
+#   - username: Steve_AI
 #     backend: hybrid
 #     planner:
 #       model_hint: sonnet

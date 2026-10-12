@@ -7,18 +7,9 @@ What is still open, with enough context to pick items up cold. State as of v2 `0
 - **v0.1** Paper + DuckDNS. **v0.2-v0.5** single Haiku bot with per-step tool calls, dashboard, panel, creative mode (tag `v1`).
 - **v2** goal planner + background jobs + blueprint builder + honest movement primitives + eval harness. Replaces v1 as the live bot at cutover (D17).
 
-## Before cutover (delete this section once done; from `v2/STATUS.md` and D17)
-
-1. Full core run on the final commit (`v2-s5`, incl. `conv.chat_while_following`); expect >= the `v2-s4` numbers and keep 0 protected blocks broken, 0 pillar-to-travel.
-2. `v2-s4` small fixes: **build placement retry** when the server refuses one placement (`build_house` r1 ended 80/82; today only the next whole attempt retries); **remember seen chests beyond 16 blocks** (`conv.followup_chest` r2: the chest was outside the 16 m `nearby containers` scan after chopping).
-3. Independent review of 2c-A, 2c-B, the quick shelter and the follow job: done (`v2/reports/promotion-review.md`); its findings:
-   Findings of `v2/reports/promotion-review.md` (static review of `032b0e4`): fix or consciously defer H1 `settingSources`/`skills` isolation (fix present in the working tree, verify it landed), M1 side reply swallowed requests phrased as '?' (`isStatusQuestion` narrowed to positive status shapes in the working tree; verify it landed), M2 `job-requester` routing has no "not for you" routing note, no per-sender chat cap, and a bare 'stop'-like line from the requester cancels a follow/night job, M3 a pocket job cancelled/timed out while sealed leaves the bot entombed (needs a bounded `climbOut` and a boot check), M4 the hut fallback can dig ~90 dirt blocks from the requester's lawn, L1-L6 (pocket player-made detection, follow-up TTL loop with other bots, side-reply bookkeeping, `sdk-spike.ts` isolation, relocation ignoring POIs, `bots.yml` rename).
-4. Security review of v2's `src/web/**` diff (verdict in the promotion review: PASS; one file, display-only). The panel is internet-facing.
-5. Cutover per D17: merge `v2` into `main` in the main checkout without switching branches (+ `npm ci`); `config/bots.yml` -> `Steve_AI` with `aliases: [steve]` (keeps live identity, whitelist, memory dir); install `v2/CLAUDE.md.next` as `CLAUDE.md`; rebuild the panel UI and restart it via its launchd service (the one live-panel touch); world backup first; start the bot from `main`; push with owner OK. Rollback: revert commit + bot restart.
-
 ## Measured gaps (benchmark & stretch)
 
-- **Core failures left** (`v2-s4`): `build_house` r1 (placement refusal), `conv.followup_chest` r2 (chest beyond 16 m), `t3.survive_night` r2 (death before the quick shelter existed; 2/2 live after). Single runs are noisy: use `--repeat` for any decision.
+- **Core failures left** (`v2-s5`, final pre-cutover run, 58/62): `t2.coal` 0/2 (lake-locked test site; gather times out at the 8-min cap while relocating), `t3.portal` r1 (top obsidian had no scaffold support), `conv.chat_while_following` r1 (replied, but trailed the Tester by 25 blocks). Single runs are noisy: use `--repeat` for any decision.
 - **Stretch suite not yet run on v2:** `t4.iron_kit` (full iron kit; target >= 2/3 runs, < 20 min, <= 10 turns), `t4.diamonds` (target >= 50%; needs underground exploring without torches, lava/cave danger), `t4.portal_scratch` (obsidian from scratch needs a water/lava bucket flow and flint: the planner can make neither). Run at milestones: `npm run eval -- --suite stretch`.
 - Tracked targets (`v2/STATUS.md`): core >= 80% (met), tier 2 >= 85% (100% at `v2-s4`), 0 deaths outside combat scenarios (1 pre-quick-shelter), iron pickaxe from empty < 5 min and <= 6 turns (met: ~130 s, 5 turns), p50 first reply <= 3 s (met: 2.2 s).
 
