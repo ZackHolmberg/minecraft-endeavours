@@ -11,7 +11,7 @@
  */
 
 export type Facing = "north" | "south" | "east" | "west";
-export type BlueprintKind = "house" | "portal" | "farm" | "shelter";
+export type BlueprintKind = "house" | "portal" | "farm" | "shelter" | "pixelart";
 
 export interface Cell {
   x: number;

@@ -60,7 +60,17 @@ export function planOrder(placements: AbsPlacement[], opts: OrderOptions): Order
   const reserved = new Set<string>();
   for (const p of placements) reserved.add(cellKey(p));
   for (const c of opts.keepClear ?? []) reserved.add(cellKey(c));
-  const solid = (c: Cell): boolean => solidPlaced.has(cellKey(c)) || opts.isSolidWorld(c);
+  const worldSolid = new Map<string, boolean>(); // the world doesn't change while we plan: ask it once per cell
+  const solid = (c: Cell): boolean => {
+    const k = cellKey(c);
+    if (solidPlaced.has(k)) return true;
+    let w = worldSolid.get(k);
+    if (w === undefined) {
+      w = opts.isSolidWorld(c);
+      worldSolid.set(k, w);
+    }
+    return w;
+  };
   const supported = (c: Cell): boolean => NEIGH.some((d) => solid(add(c, d)));
 
   const actions: BuildAction[] = [];
@@ -133,14 +143,19 @@ export function planOrder(placements: AbsPlacement[], opts: OrderOptions): Order
   const layers = [...new Set(body.map((p) => p.y))].sort((a, b) => a - b);
   for (const y of layers) {
     let remaining = body.filter((p) => p.y === y);
+    // Placeable-now cells, kept incrementally (a layer can hold thousands of cells: pixel art). Recomputed from scratch
+    // whenever scaffolds change, since taking one down can remove support.
+    const byKey = new Map(remaining.map((p) => [cellKey(p), p]));
+    let ok: Set<AbsPlacement> | null = null;
     while (remaining.length > 0) {
-      const ok = remaining.filter((p) => supported(p));
-      if (ok.length === 0) {
+      if (ok === null) ok = new Set(remaining.filter((p) => supported(p)));
+      if (ok.size === 0) {
         const t = remaining.reduce((a, b) => (dist2(a, cur) <= dist2(b, cur) ? a : b));
         const chain = chainFor(t);
         if (!chain) {
           unplaceable.push(t);
           remaining = remaining.filter((p) => p !== t);
+          byKey.delete(cellKey(t));
           remainingAll = remainingAll.filter((p) => p !== t);
           continue;
         }
@@ -150,19 +165,37 @@ export function planOrder(placements: AbsPlacement[], opts: OrderOptions): Order
           alive.push(s);
         }
         peak = Math.max(peak, alive.length);
+        ok = null;
         continue;
       }
-      const next = ok.reduce((a, b) => {
-        const da = dist2(a, cur);
+      let next: AbsPlacement | undefined;
+      for (const b of ok) {
+        if (!next) {
+          next = b;
+          continue;
+        }
+        const da = dist2(next, cur);
         const db = dist2(b, cur);
-        if (da !== db) return da < db ? a : b;
-        return (a.x - b.x || a.z - b.z) <= 0 ? a : b;
-      });
+        if (da !== db ? db < da : (b.x - next.x || b.z - next.z) < 0) next = b;
+      }
+      if (!next) break;
       actions.push({ op: "place", p: next });
       markPlaced(next);
       remaining = remaining.filter((p) => p !== next);
+      byKey.delete(cellKey(next));
       remainingAll = remainingAll.filter((p) => p !== next);
+      const scaffoldsBefore = alive.length;
       prune();
+      if (alive.length !== scaffoldsBefore) ok = null;
+      else {
+        ok.delete(next);
+        if (isSupportBlock(next.block)) {
+          for (const d of NEIGH) {
+            const n = byKey.get(cellKey(add(next, d)));
+            if (n) ok.add(n);
+          }
+        }
+      }
     }
   }
   for (const d of doors) {

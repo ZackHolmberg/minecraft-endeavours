@@ -5,7 +5,7 @@
  * supplies the grid, inventory and position and executes the result.
  */
 import type { FailureKind, Goal } from "../planner/types.js";
-import { buildBlueprint, normalizeHouseParams, normalizeShelterParams } from "./blueprints.js";
+import { buildBlueprint, normalizeHouseParams, normalizeShelterParams, pixelDesignOf } from "./blueprints.js";
 import { computeNeeds, type BuildNeeds } from "./materials.js";
 import { findSite, isAir, isReplaceable, isWaterName, type WorldGrid } from "./site.js";
 import { isSupportBlock, planOrder, type AbsPlacement, type OrderResult } from "./support.js";
@@ -70,6 +70,16 @@ export function placementDone(grid: WorldGrid, p: AbsPlacement): boolean {
   return n === p.block;
 }
 
+/** Pixel art: a wall stands back from the requester (so the whole picture can be seen), and big pictures search a wider area. */
+export function pixelSiteTuning(kind: BlueprintKind, params: Record<string, unknown>): { radius?: number; standoff?: number } {
+  if (kind !== "pixelart") return {};
+  const d = pixelDesignOf(params);
+  if (!d.ok) return {};
+  const big = Math.max(d.design.w, d.design.h);
+  const standoff = d.design.orientation === "wall" ? Math.min(24, Math.max(3, Math.round(big * 0.4))) : 0;
+  return { radius: Math.min(48, Math.max(20, Math.ceil(big / 2) + standoff + 8)), ...(standoff > 0 ? { standoff } : {}) };
+}
+
 export function shift(p: { x: number; y: number; z: number }, o: Cell): Cell {
   return { x: p.x + o.x, y: p.y + o.y, z: p.z + o.z };
 }
@@ -79,11 +89,15 @@ export function prepare(inp: PrepareInput): Prepared | PrepareFailure {
   let origin: Cell;
   let facing: Facing;
   let params = { ...spec.params };
+  if (spec.blueprint === "pixelart") {
+    const d = pixelDesignOf(params);
+    if (!d.ok) return { ok: false, kind: "internal", detail: `the pixel-art design is unusable: ${d.reason}` };
+  }
   if (inp.existing) {
     origin = inp.existing.origin;
     facing = inp.existing.facing;
   } else {
-    const site = findSite(grid, { kind: spec.blueprint, params, anchor: spec.anchor, avoid: spec.avoid });
+    const site = findSite(grid, { kind: spec.blueprint, params, anchor: spec.anchor, avoid: spec.avoid, ...pixelSiteTuning(spec.blueprint, params) });
     if (!site.ok) return { ok: false, kind: "no_site", detail: `no spot for the ${spec.blueprint}: ${site.reason}. Ask the player where, or try another area.` };
     origin = site.origin;
     facing = site.facing;
@@ -143,7 +157,8 @@ export function prepare(inp: PrepareInput): Prepared | PrepareFailure {
   const real = computeNeeds(pseudo, inp.inv, { creative: inp.creative, scaffolds: order.scaffolds });
   const total = doneList.length + kept.length;
   const missing: Goal[] = inp.creative ? [] : real.missing.map((m) => ({ item: m.item, count: m.count }));
-  const creativeItems = inp.creative
+  // Pixel art can need hundreds of blocks of several colours: the Builder fetches those just in time, in batches that fit the inventory.
+  const creativeItems = inp.creative && spec.blueprint !== "pixelart"
     ? [
         ...Object.entries(real.consumed).map(([name, count]) => ({ name, count })),
         ...real.tools.map((t) => ({ name: t[0]!, count: 1 })),

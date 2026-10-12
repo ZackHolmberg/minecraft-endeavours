@@ -60,6 +60,8 @@ export interface SiteRequest {
   /** Player positions the footprint must not cover (the requester). */
   avoid?: Cell[];
   radius?: number;
+  /** The footprint must stay at least this far (blocks) from the anchor: a big wall has to be viewable from where the requester stands. */
+  standoff?: number;
   /** Rows above the ground that must be free; defaults to the blueprint height. */
   height?: number;
 }
@@ -100,7 +102,7 @@ export function findSite(grid: WorldGrid, req: SiteRequest): SiteChoice | SiteFa
   const height = req.height ?? fp.height;
   const R = req.radius ?? DEFAULT_RADIUS;
   const isFarm = req.kind === "farm";
-  const margin = req.kind === "house" || req.kind === "shelter" ? 1 : req.kind === "portal" ? 2 : 0;
+  const margin = req.kind === "house" || req.kind === "shelter" || req.kind === "pixelart" ? 1 : req.kind === "portal" ? 2 : 0;
   const maxSlope = isFarm ? 0 : 1;
   const yTop = req.anchor.y + height + 6;
   const yBottom = req.anchor.y - 8;
@@ -160,6 +162,7 @@ export function findSite(grid: WorldGrid, req: SiteRequest): SiteChoice | SiteFa
     const z1 = oz + cls.dz - 1;
     // never cover the requester
     if (avoid.some((a) => a.x >= ox - 1 && a.x <= x1 + 1 && a.z >= oz - 1 && a.z <= z1 + 1)) continue;
+    if (req.standoff && Math.hypot(Math.max(ox - req.anchor.x, 0, req.anchor.x - x1), Math.max(oz - req.anchor.z, 0, req.anchor.z - z1)) < req.standoff) continue;
 
     let lo = Infinity;
     let hi = -Infinity;

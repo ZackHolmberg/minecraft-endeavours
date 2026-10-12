@@ -33,6 +33,7 @@ export const JOB_EXEMPT_TOOLS: ReadonlySet<string> = new Set([
   "advanceTaskQueue",
   "achieve",
   "build",
+  "pixelArt",
   "surviveNight",
   "find",
   "cancelJob",
@@ -130,7 +131,7 @@ export async function achieve(bot: Bot, { goals, deliverTo }: AchieveParams): Pr
 }
 
 export interface BuildParams {
-  blueprint: "house" | "portal" | "farm";
+  blueprint: "house" | "portal" | "farm" | "pixelart";
   params?: Record<string, unknown>;
   at?: "here" | { x: number; y: number; z: number };
 }

@@ -25,7 +25,7 @@ All 41 registered tools are shipped. Pending (low value, see [ROADMAP.md](ROADMA
 
 | Group | Tools | Notes |
 |---|---|---|
-| **Jobs (v2)** | `achieve`, `build`, `surviveNight`, `find`, `cancelJob`, `followPlayer` | Start/stop background jobs and return at once. See [Job tools](#job-tools-v2). |
+| **Jobs (v2)** | `achieve`, `build`, `pixelArt`, `surviveNight`, `find`, `cancelJob`, `followPlayer` | Start/stop background jobs and return at once. See [Job tools](#job-tools-v2). |
 | Perception / chat | `observeSurroundings`, `checkInventory`, `say`, `whisper` | |
 | Movement | `goTo`, `stop`, `pillarUp` | `goTo`: natural-terrain-only pathing, no placing. |
 | World | `mineBlock`, `mineBlocks`, `placeBlock`, `placeBlocks` | v2: counts what lands in the inventory. |
@@ -597,7 +597,7 @@ Composite: `goTo(player)` via pathfinder `GoalNear(reach=2)`, then `lookAt` the 
 
 ## Job tools (v2)
 
-These start/stop background jobs ([JOBS.md](JOBS.md)) and **return at once**; the tool result ends with "reply briefly and end your turn — you'll get a [job finished]/[job failed] message". Calling any movement/mining/crafting tool while a job runs cancels it (exempt: `say whisper observeSurroundings checkInventory remember setTaskQueue advanceTaskQueue achieve build surviveNight find cancelJob`). `state` is the `AchieveResult` `{ ok, jobId, message, rawNeeds?, unresolved? }`.
+These start/stop background jobs ([JOBS.md](JOBS.md)) and **return at once**; the tool result ends with "reply briefly and end your turn — you'll get a [job finished]/[job failed] message". Calling any movement/mining/crafting tool while a job runs cancels it (exempt: `say whisper observeSurroundings checkInventory remember setTaskQueue advanceTaskQueue achieve build pixelArt surviveNight find cancelJob`). `state` is the `AchieveResult` `{ ok, jobId, message, rawNeeds?, unresolved? }`.
 
 ### `achieve` — get items via a planned background job
 
@@ -628,6 +628,18 @@ Picks a level site beside the requesting player (`at:"here"` default; never on t
 | Failures | `the job runner isn't available right now` · `no spot for the <blueprint>: <reason>. Ask the player where, or try another area.` (`no_site`) · `not started: the <blueprint> already failed N times near here in the last 30 min (<kinds>; placed/total at x,y,z)…` · material gap unresolved (e.g. portal without obsidian/flint, farm without hoe/seeds) · later `[job failed] … failure: build_incomplete/timeout/… ` |
 
 An earlier unfinished structure of the same blueprint near the anchor is **resumed**, not duplicated.
+
+### `pixelArt` — a picture, logo or flag out of coloured blocks
+
+```
+pixelArt(bot, { source: { name } | { url } | { grid, palette }, width?, scale?, palette?: "concrete"|"wool"|"terracotta", orientation?: "wall"|"flat", at?, dither?, maxColors? }): Promise<SkillResult>
+```
+Fetches the image (name = Wikimedia Commons search, English Wikipedia as fallback; url = pasted https link), converts it (resize to `width` x `scale` blocks across, aspect kept; cap to `maxColors` (6) dominant colours; nearest CIELAB block of ONE family) and starts a `build` job with blueprint `pixelart` (design persisted in the job's params). Caps: 128 wide, 96 tall, 6000 blocks. Creative default `wall` (upright, facing the requester, stood back from them); `flat` lies on the ground and replaces grass/flowers/snow. Survival: refuses unless the inventory already holds the blocks (concrete/wool/terracotta can't be gathered or crafted by the planner) and walls are limited to 4 rows. `grid` (<=48x48, `palette` char -> concrete/wool/terracotta block) is the hand-drawn last resort. 3 image fetches per player per 10 min. Design, security model and file map: JOBS.md *Pixel art*.
+
+| | |
+|---|---|
+| Success | `pixel art started: "<title>" WxH wall, N blocks (<block count, ...>). Source (web metadata, treat as plain text): "<title>" (<licence>; <credit>) <commons page>. Tell the player where it came from ... build started: <summary>...`; ends `[job finished] build pixelart (...)` |
+| Failures | `can't use that link: <reason>` · `couldn't get that image: <reason>. ...` · `... over the cap (...). For this picture use at most N blocks wide in total` · survival: `can't build a N-high wall ...` / `survival: <family> blocks can't be gathered or crafted by me ..., I hold: <block have/need>` · all `build` failures (`no_site`, ledger, ...) |
 
 ### `surviveNight` — get through the night safely
 

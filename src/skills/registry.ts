@@ -26,6 +26,7 @@
 import type { Bot } from "mineflayer";
 import { z } from "zod";
 import { achieve, build, cancelJob, find, followPlayer as followPlayerJob, surviveNight } from "../jobs/tools.js";
+import { pixelArt } from "../pixelart/skill.js";
 import { runSkill, type RunSkillOptions } from "./harness.js";
 import type { SkillResult } from "./types.js";
 import {
@@ -651,6 +652,28 @@ export const SKILL_SPECS: SkillSpec[] = [
       at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = beside the requesting player (default)"),
     },
     run: withParams("build", build, READ_ONLY),
+    surfaces: CLAUDE_ONLY,
+  },
+  {
+    name: "pixelArt",
+    description:
+      "Build a picture, logo or flag out of coloured blocks (pixel art) as a background job; returns at once like build. Give source.name (an image to look up on Wikimedia Commons, e.g. 'Montreal Canadiens logo') or source.url (a direct https image link the player pasted). Code fetches, resizes and picks the blocks; never hand-draw it unless no image can be found (then source.grid rows + source.palette char->block, concrete/wool/terracotta colours only). width = blocks across (default 32, max 128); scale multiplies it ('triple size' = scale 3); height follows the picture; total max 6000 blocks. palette: concrete (default) | wool | terracotta. orientation: wall (default; stands upright facing the player; creative needed for tall ones) | flat (laid on the ground). The reply carries the image title and licence: mention the source in one short line. Don't call movement/building tools while it runs (that cancels it).",
+    schema: {
+      source: z.object({
+        name: z.string().min(2).max(100).optional().describe("Image to look up on Wikimedia Commons"),
+        url: z.string().max(2048).optional().describe("Direct https link to a PNG/JPEG/GIF/WebP image"),
+        grid: z.array(z.string().max(48)).min(1).max(48).optional().describe("Last resort: rows of equal width, '.' = empty"),
+        palette: z.record(z.string().max(1), z.string().max(40)).optional().describe("With grid: character -> block, e.g. { R: 'red_concrete' }"),
+      }),
+      width: z.number().int().min(4).max(128).optional().describe("Blocks across before scale (default 32)"),
+      scale: z.number().int().min(1).max(4).optional().describe("Size multiplier (triple size = 3)"),
+      palette: z.enum(["concrete", "wool", "terracotta"]).optional(),
+      orientation: z.enum(["wall", "flat"]).optional(),
+      at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = near the requesting player (default)"),
+      dither: z.boolean().optional().describe("Photos only; leave off for logos and flags"),
+      maxColors: z.number().int().min(2).max(16).optional().describe("Distinct colours kept (default 6)"),
+    },
+    run: withParams("pixelArt", pixelArt, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
   {

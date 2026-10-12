@@ -5,6 +5,7 @@
  * Canonical frame: the front (door side / portal normal) faces +z (south),
  * footprint x ∈ [0,sx), z ∈ [0,sz). `orient` rotates it to the requested facing.
  */
+import { decodeCells, parseDesign, placedCount, type PixelDesign } from "../pixelart/design.js";
 import type { BlockPlacement, Blueprint, BlueprintKind, Cell, Facing, FarmParams, HouseParams } from "./types.js";
 
 export const HOUSE_LIMITS = { width: [5, 9], depth: [5, 9], height: [3, 4], windows: [0, 8] } as const;
@@ -241,6 +242,47 @@ export function farm(raw: Record<string, unknown> | FarmParams | undefined, _fac
   };
 }
 
+/** The validated design inside pixel-art params (`{ design }`), or why it is unusable. */
+export function pixelDesignOf(params: Record<string, unknown> | undefined): { ok: true; design: PixelDesign } | { ok: false; reason: string } {
+  return parseDesign(params?.design);
+}
+
+/**
+ * Pixel art: the design as a vertical wall facing the viewer (`wall`: image top = highest y) or laid on the ground
+ * (`flat`: image top = far edge). Canonical frame as everywhere here: the viewer stands on the +z side looking -z, so
+ * image column c is x = c (east is on the viewer's right); `orient` only rotates (no mirroring), so the picture reads
+ * correctly from the facing side for all four facings. Transparent cells place nothing.
+ */
+export function pixelart(raw: Record<string, unknown> | undefined, facing: Facing): Blueprint {
+  const parsed = pixelDesignOf(raw);
+  if (!parsed.ok) throw new Error(`pixelart: ${parsed.reason}`);
+  const d = parsed.design;
+  const cells = decodeCells(d);
+  const wall = d.orientation === "wall";
+  const sx = d.w;
+  const sz = wall ? 1 : d.h;
+  const out: BlockPlacement[] = [];
+  for (let r = 0; r < d.h; r++) {
+    for (let c = 0; c < d.w; c++) {
+      const block = cells[r]![c];
+      if (!block) continue;
+      out.push(wall ? { x: c, y: d.h - 1 - r, z: 0, block, role: "wall" } : { x: c, y: 0, z: r, block, role: "floor" });
+    }
+  }
+  const dims = orientedDims(facing, sx, sz);
+  const n = placedCount(d);
+  return {
+    kind: "pixelart",
+    facing,
+    size: { x: dims.x, y: wall ? d.h : 1, z: dims.z },
+    placements: out.map((q) => orient(q, facing, sx, sz)),
+    clear: [],
+    margin: 1,
+    params: { design: d },
+    summary: `pixel art${d.title ? ` "${d.title}"` : ""} ${d.w}x${d.h} ${wall ? "wall" : "flat on the ground"}, ${n} ${d.blocks[0]!.replace(/^[a-z_]+?_(concrete|wool|terracotta)$/, "$1")} blocks in ${d.blocks.length} colour${d.blocks.length === 1 ? "" : "s"}, facing ${facing}`,
+  };
+}
+
 export function buildBlueprint(kind: BlueprintKind, params: Record<string, unknown> | undefined, facing: Facing): Blueprint {
   switch (kind) {
     case "house":
@@ -251,6 +293,8 @@ export function buildBlueprint(kind: BlueprintKind, params: Record<string, unkno
       return farm(params, facing);
     case "shelter":
       return shelter(params, facing);
+    case "pixelart":
+      return pixelart(params, facing);
   }
 }
 
@@ -268,6 +312,11 @@ export function canonicalFootprint(kind: BlueprintKind, params: Record<string, u
     case "farm": {
       const p = normalizeFarmParams(params);
       return { sx: p.size, sz: p.size, height: 1 };
+    }
+    case "pixelart": {
+      const d = pixelDesignOf(params);
+      if (!d.ok) return { sx: 1, sz: 1, height: 1 };
+      return d.design.orientation === "wall" ? { sx: d.design.w, sz: 1, height: d.design.h } : { sx: d.design.w, sz: d.design.h, height: 1 };
     }
   }
 }
