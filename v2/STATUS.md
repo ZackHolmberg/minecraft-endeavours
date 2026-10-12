@@ -15,13 +15,10 @@
 - Live bot runs from the main checkout (`./scripts/botStart.sh` / `botStop.sh` there). Panel restarted on the v2 UI (launchd). Verify on first chat: `grep "sdk init" .bot-runtime/bot.log` should show `foreign=0` and `mcp=[minecraft-skills]` (D16/D18 isolation).
 - Worktrees: `minecraft-endeavours-v2` (branch `v2`, dev), `mcv2-dev` / `mcv2-build` (side branches), `mcv2-bench` (frozen), `minecraft-endeavours-v1base` (frozen v1).
 
-## Next steps — live polish slice (2026-10-12, in flight)
-Three agents, separate worktrees (merge each into `v2`, then full core run, then deploy to `main` with owner OK):
-- **A** `../mcv2-dev` (v2-fixes): silent-turn nudge for continuation, end session after terminal say (−44% calls), measure/remove ~7–8k prefix overhead, trim 12 tools + descriptions, dedupe done-messages, "directive twice → act" → `v2/reports/polish-a.md`.
-- **B** `../mcv2-build` (v2-build): pixel art per D20 (sharp + Lab + palette.json; Wikimedia by name + hardened pasted URLs; `pixelart` blueprint) → `v2/reports/polish-b.md`.
-- **C** `../mcv2-jobs` (v2-jobs): gather no-progress watchdog → recovery (t2.coal), `find` job (works in creative), creative flight in follow/goTo, tree nav traps, axe for big log gathers → `v2/reports/polish-c.md`.
-New scenarios: conv.unnamed_answer, cr.pixel_art, cr.find_diamonds, cr.fly_follow (polish-a/b/c.ts). Evals serialize via the runner lock.
-Backlog after: stretch suite, pathfinder master pin, templated job-success replies (deferred, D21).
+## Next steps — live polish slice (2026-10-12)
+- Merged into `v2` @ `7619083` (640 tests): polish C `55f6bb5` (find job, creative flight, gather watchdog → t2.coal pass, tree write-off, axe plan), polish B `2808e8e` (pixel art per D20: Commons Canadiens logo 554/554 live), polish A `ca70b10` (silent-turn fix, early session end, 12 tools hidden; 16 core: 62→35 API calls, tokens −59%, prefix 20.3k→14.6k).
+- In flight: full core run `v2/runs/v2-s6` (35 scenarios ×2, bench @ `7619083`); independent review → `v2/reports/polish-review.md` (pixel-art SSRF focus).
+- Then: review fixes → deploy to `main` (merge in main checkout, `npm install` for sharp, bot restart) with owner OK.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
