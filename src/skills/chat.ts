@@ -14,7 +14,47 @@ const DUPLICATE_WINDOW_MS = 10_000;
 // bot.chat would execute a leading "/" as a server command.
 const SLASH_REFUSAL = "refused: messages can't start with \"/\" (that would run a server command); rephrase without it";
 
+/**
+ * A long line that restates one just sent (same words, same numbers) within this window is dropped too. Seen live:
+ * "Done, the CH logo is up. Blue background, red C, white H, 15 wide…" then, from a later nudged turn, "The CH logo
+ * is finished: blue background, red C, white H, about 15 wide. Want any changes?". Deliberately narrow: both lines
+ * need >= NEAR_DUP_MIN_WORDS words, so short replies ("on it", "done, 16 oak logs") are never touched, and every
+ * number of the shorter line must reappear, so "16 oak logs" vs "8 oak logs" stays distinct.
+ */
+const NEAR_DUPLICATE_WINDOW_MS = 120_000;
+const NEAR_DUP_MIN_WORDS = 8;
+const NEAR_DUP_OVERLAP = 0.7;
+
+function wordSet(text: string): Set<string> {
+  return new Set(text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 0));
+}
+
+/** True when `a` essentially restates `b` (see NEAR_DUP_*). Pure; exported for tests. */
+export function isNearDuplicate(a: string, b: string): boolean {
+  const wa = wordSet(a);
+  const wb = wordSet(b);
+  if (wa.size < NEAR_DUP_MIN_WORDS || wb.size < NEAR_DUP_MIN_WORDS) return false;
+  // every number in the shorter line must appear in the longer one
+  const [small, big] = wa.size <= wb.size ? [wa, wb] : [wb, wa];
+  for (const w of small) if (/\d/.test(w) && !big.has(w)) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared += 1;
+  return shared / Math.min(wa.size, wb.size) >= NEAR_DUP_OVERLAP;
+}
+
+/**
+ * Bots whose CURRENT task is an orchestrator-generated one (silent-turn nudge, [job ...] report): those run without
+ * the player's message in front of them and are where a restated completion line came from. A reply to a real player
+ * message may legitimately restate the proposal it confirms ("sure, on it: 5x5 oak house…"), so it is never dropped.
+ */
+const nearDupGuard = new Set<string>();
+export function setNearDuplicateGuard(botUsername: string, on: boolean): void {
+  if (on) nearDupGuard.add(botUsername);
+  else nearDupGuard.delete(botUsername);
+}
+
 const lastSent = new Map<string, { text: string; at: number }>();
+const recentSent = new Map<string, Array<{ text: string; at: number }>>();
 
 /** Shared send-side hygiene: suppress exact repeats and pace lines. */
 async function prepareLine(bot: Bot, raw: string): Promise<{ sent: string; truncated: boolean; duplicate: boolean }> {
@@ -26,6 +66,13 @@ async function prepareLine(bot: Bot, raw: string): Promise<{ sent: string; trunc
   if (prev && prev.text === text && now - prev.at < DUPLICATE_WINDOW_MS) {
     return { sent: text, truncated, duplicate: true };
   }
+  const recent = (recentSent.get(bot.username) ?? []).filter((r) => now - r.at < NEAR_DUPLICATE_WINDOW_MS);
+  if (nearDupGuard.has(bot.username) && recent.some((r) => isNearDuplicate(r.text, text))) {
+    recentSent.set(bot.username, recent);
+    return { sent: text, truncated, duplicate: true };
+  }
+  recent.push({ text, at: now });
+  recentSent.set(bot.username, recent.slice(-6));
   if (prev && now - prev.at < MIN_CHAT_GAP_MS) {
     await new Promise((r) => setTimeout(r, MIN_CHAT_GAP_MS - (now - prev.at)));
   }

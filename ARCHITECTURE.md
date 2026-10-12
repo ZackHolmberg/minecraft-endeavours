@@ -15,7 +15,7 @@ Orchestrator            spawns/supervises bots, routes chat (aliases, continuity
        ├─ Jobs          background execution of goals: achieve / build / followPlayer / surviveNight
        │    ├─ Planner  pure: (goals, WorldView) -> ordered steps over minecraft-data + hand tables
        │    └─ Build    pure: blueprint geometry, site choice, support/scaffold order, material math
-       └─ Skills        41 tools = primitives + composites; reflexes run without the LLM
+       └─ Skills        41 tools (29 shown to the model) = primitives + composites; reflexes run without the LLM
             └─ mineflayer + pathfinder (movement policy below)
                  └─ Paper server (docker compose)
 ```
@@ -52,7 +52,8 @@ Per-bot Claude Agent SDK loop on **Claude Haiku 5.5** (`claude-haiku-5-5`), `ses
 - **Guardrails:** 50-turn cap per task (`limits.ts`; then one "tell the player where things stand" follow-up); a **repeat-failure guard** in `skill-tools.ts` (3rd identical failing call refused unrun; after 6 failures a stop-and-report nudge); adaptive thinking with `effort: "medium"` (Haiku 5.5 rejects `budgetTokens`); refusal handling (no fallback model by policy: whisper "can't help with that").
 - **Job-end re-entry:** when a job ends, `wire.ts` queues a synthetic `[job finished]` / `[job failed]` message (`NpcAgent.pushJobEvent`) that starts a fresh Haiku task. Cancelled/interrupted jobs queue none. Capped at **3 synthetic events per 10 min** (`JobEventLimiter`).
 - **Side reply** (`ClaudeBackend.runSideReply`): a directly addressed *pure status question* (`isStatusQuestion` in `coalesce.ts`: a positive status shape such as "how's it going", "what are you doing", "are you almost done", "status", and no request cue like "instead", "also", "what about" or an action verb; a '?' alone is not enough; anything else is queued as a normal task) that arrives while a blocking tool is in flight is answered by a one-turn low-effort Haiku session with the same system prompt and byte-identical tool definitions (cache hit) where every tool except `say`/`whisper` is a refusing stub. It never touches cancellation, current-tool, the task queue or task telemetry. Falls back to the queue if nothing is said in 15 s. Rarely needed now: `achieve` ends the session in ~2 turns, so a status question lands on a fresh job-aware task.
-- **Silent follow-up backstop:** a directly addressed task/job event that ends with no `say`/`whisper` gets ONE nudge (`queueSilentFollowUp`), because plain text is invisible to players.
+- **Silent follow-up backstop:** a task that ends with no `say`/`whisper` gets ONE nudge (`queueSilentFollowUp`) because plain text is invisible to players. "Directly addressed" = name/whisper/@all/job event, plus un-named *continuation* answers and *follow-ups* from the current conversation partner (`expectsReply`); the nudge names the unanswered line and says not to repeat old news. `say` also drops, in nudge / `[job ...]` tasks only, a long line that restates one sent in the last 2 min (`isNearDuplicate`, `skills/chat.ts`).
+- **Early end after a terminal say (live-polish A):** the SDK always makes one more, text-only API call after the last tool result (44% of all calls). `backend/early-end.ts` watches the raw stream (`includePartialMessages`): when an API turn (complete at `message_stop`, all tool results in, none failed) contains only say/whisper plus background launchers (`achieve build followPlayer surviveNight cancelJob stop remember`) with at least one speech tool, the backend `interrupt()`s the query; the resulting `result` (usage intact) is booked as a normal finish (`task_end.subtype = ended_after_say`). Disable with `BOT_NO_EARLY_END=1`. Bot sessions also run in a neutral cwd (`SDK_CWD`), which drops the repo git-status block from every first message.
 - Retained per agent for the dashboard: `sessionUsage`, `lastTurnUsage`, `lastTurnError`, `latestRateLimitInfo`. SDK details: [spikes/SDK_NOTES.md](spikes/SDK_NOTES.md).
 
 ### Jobs (`src/jobs/`, `src/planner/`, `src/build/`): the primary execution model
@@ -118,7 +119,7 @@ bots:
 
 ## Skill catalogue
 
-41 registered tools; per-skill reference (signature, params, success/failure messages, caveats) in [SKILLS.md](SKILLS.md). All return `{ ok, message, state? }`; failure messages are specific enough for Claude to adapt ("no oak_log within 64 blocks").
+41 registered tools (29 exposed to the model; 12 redundant ones are hidden, see SKILLS.md "Hidden from the model"); per-skill reference (signature, params, success/failure messages, caveats) in [SKILLS.md](SKILLS.md). All return `{ ok, message, state? }`; failure messages are specific enough for Claude to adapt ("no oak_log within 64 blocks").
 
 | Category | Tools |
 |---|---|

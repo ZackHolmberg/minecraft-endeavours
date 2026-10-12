@@ -197,7 +197,7 @@ export function formatUserMessage(event: ChatEvent, decision: RouteMatch, interr
       notes.push(reply);
       break;
     case "continuation":
-      notes.push(`not named, but you just asked them a question, so this is probably the answer; ${reply}`);
+      notes.push(`they're answering your question — ${reply} and act on it (don't wait to be named again)`);
       break;
     case "follow-up":
       notes.push(

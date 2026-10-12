@@ -12,15 +12,35 @@
  *    also runs with `tools: []`, so no skill / file tool exists to use them.
  * The `sdk init` log line (init-summary.ts) shows what a session actually loaded.
  */
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 export interface SdkIsolation {
+  /** Neutral, non-git working dir (see SDK_CWD). */
+  cwd: string;
   settingSources: [];
   skills: [];
   settings: { autoMemoryEnabled: false };
   env: Record<string, string | undefined>;
 }
 
+/**
+ * Working directory for bot sessions: an empty directory outside any repo. The session otherwise starts in the
+ * orchestrator's cwd (this checkout) and the SDK injects its git status / environment block into every first message
+ * (~250 tokens per call, measured with `getContextUsage`: 793 -> 538 with a neutral cwd) and shows the operator's
+ * checkout to the model. Every bot `query()` uses the same one so the main and side-reply prefixes stay identical.
+ */
+export const SDK_CWD = join(tmpdir(), "mc-bot-sdk-cwd");
+try {
+  mkdirSync(SDK_CWD, { recursive: true });
+} catch {
+  // best effort: the SDK falls back to its own default when the dir is missing
+}
+
 export function sdkIsolation(baseEnv: NodeJS.ProcessEnv = process.env): SdkIsolation {
   return {
+    cwd: SDK_CWD,
     settingSources: [],
     skills: [],
     settings: { autoMemoryEnabled: false },

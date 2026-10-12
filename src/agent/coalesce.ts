@@ -40,14 +40,33 @@ export function isDirectAddress(message: string): boolean {
 
 
 /**
+ * True when silence is a bug for this routed chat: the player answered the bot's own question ("continuation"), or
+ * continues the exchange with the person the bot is talking to ("follow-up" from the current conversation partner).
+ * The live review (2026-10-11) saw 8 of 28 tasks end mute on exactly these un-named answers.
+ */
+export function expectsReply(route: string | undefined, player: string | undefined, partner: string | null): boolean {
+  if (route === "continuation") return true;
+  return route === "follow-up" && !!player && player === partner;
+}
+
+/** First line of a formatted chat message without its `[public chat]` tag: `<Alex> hello`. */
+function chatLineOf(message: string): string {
+  return (message.split("\n")[0] ?? "").replace(/^\[[^\]]*\]\s*/, "").trim().slice(0, 200);
+}
+
+/**
  * The one-shot nudge sent when a directly-addressed task ended with no say/whisper. It runs as a fresh
  * task with no memory of the silent turn, so the wording must not invite a claim of work that never
- * started (review M8): say only what the tool results / context block show.
+ * started (review M8): say only what the tool results / context block show. `unanswered` are the formatted
+ * player messages that got no reply: naming them keeps the nudge from re-reporting old news (live review: the
+ * nudge repeated "the logo is finished" right after the bot had said exactly that).
  */
-export function silentNudgeText(how: string): string {
+export function silentNudgeText(how: string, unanswered: readonly string[] = []): string {
+  const lines = unanswered.map(chatLineOf).filter((l) => l.length > 0);
+  const heard = lines.length > 0 ? ` (${lines.join(" / ")})` : "";
   return (
-    `[orchestrator note — not a player message] Nobody heard anything from you on the last message: plain text is invisible, only the say/whisper tools reach players. ` +
-    `Using only ${how}, answer them now in one short line. Say only what is TRUE according to the status in your context and your tool results: ` +
+    `[orchestrator note — not a player message] Nobody heard anything from you on the last message${heard}: plain text is invisible, only the say/whisper tools reach players. ` +
+    `Using only ${how}, answer THAT message now in one short line; don't repeat anything you already told them (see the recent conversation). Say only what is TRUE according to the status in your context and your tool results: ` +
     `if no job is running and no tool call succeeded, you have NOT started anything, so don't say you are doing it or "on it". ` +
     `Instead say what you can do, give your proposal, or ask your one question. Never claim work that hasn't begun. Don't call any other tool this turn.`
   );

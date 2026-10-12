@@ -1,6 +1,6 @@
 # Skills
 
-Reference for the v2 skill layer (41 registered tools; `src/skills/registry.ts` is the source of truth for schemas and the descriptions Haiku sees). Every skill is a plain async function:
+Reference for the v2 skill layer (41 registered tools, of which 29 are exposed to the Haiku bot — see [Hidden from the model](#hidden-from-the-model); `src/skills/registry.ts` is the source of truth for schemas and the descriptions Haiku sees). Every skill is a plain async function:
 
 ```ts
 (bot: Bot, params: P) => Promise<SkillResult>
@@ -32,6 +32,22 @@ All 41 registered tools are shipped. Pending (low value, see [ROADMAP.md](ROADMA
 | Inventory | `pickUpNearby`, `equipItem`, `equipLoadout`, `dropItem`, `giveItemTo`, `giveItemsTo`, `getItems` | `getItems` creative only; operator-item denylist. |
 | Interaction / crafting / combat | `activateBlock`, `useOnEntity`, `useItem`, `craft`, `craftMany`, `smelt`, `attack`, `flee` | Crafting clicks are paced (120 ms). |
 | Storage / survival / meta | `depositToChest`, `depositManyToChest`, `withdrawFromChest`, `withdrawManyFromChest`, `eat`, `fish`, `sleepIn`, `remember`, `setTaskQueue`, `advanceTaskQueue` | |
+
+### Hidden from the model
+
+Live-polish A trimmed the model-facing tool surface from 41 to 29 definitions (~5k fewer prompt tokens per API call, measured with `Query.getContextUsage()`). The 12 tools below stay registered (`HIDDEN_FROM_CLAUDE` in `src/skills/registry.ts` sets `surfaces.claude = false`) and remain plain skills that jobs, the local/hybrid backends, tests and the reference below still use; the Claude bot just no longer sees them. Every capability is still reachable:
+
+| Hidden | Use instead |
+|---|---|
+| `observeSurroundings`, `checkInventory` | the per-task world-context block (inventory, nearby blocks/entities, status) |
+| `setTaskQueue`, `advanceTaskQueue` | jobs (`achieve` / `build` / `followPlayer`); the queue stays in the context if one exists |
+| `mineBlock` | `mineBlocks` with `types: ["oak_log"]`, `maxCount: n` (same collection logic) |
+| `placeBlock` | `placeBlocks` with one entry |
+| `craftMany` | `achieve` for chains; `craft` for one-offs |
+| `depositToChest` / `withdrawFromChest` | `depositManyToChest` / `withdrawManyFromChest` with a one-item list |
+| `giveItemTo` | `giveItemsTo` with a one-item list |
+| `equipLoadout` | `equipItem` per slot (armor is also equipped automatically) |
+| `pickUpNearby` | `mineBlocks` and the job steps collect their own drops |
 
 Skills are exercised through the Claude agent loop (see ["Exercising skills"](#exercising-skills)) and the eval harness (`npm run eval`).
 
