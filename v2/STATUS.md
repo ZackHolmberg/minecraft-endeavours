@@ -16,7 +16,8 @@
 - Worktrees: `minecraft-endeavours-v2` (branch `v2`, dev), `mcv2-dev` / `mcv2-build` (side branches), `mcv2-bench` (frozen), `minecraft-endeavours-v1base` (frozen v1).
 
 ## Next steps
-1. Confirm the `sdk init` isolation line on the live bot's first chat.
+0. **Live polish slice** from `v2/reports/live-review-2026-10-11.md` + `v2/reports/efficiency-analysis.md` (in progress): silent-turn nudge for continuation, pixel art via an existing conversion tool (owner direction; research → `v2/reports/pixel-art-research.md`), `find` job, creative flight, duplicate done-message.
+1. (Done) `sdk init` isolation confirmed on the live bot: `foreign=0`.
 2. Backlog in ROADMAP.md: t2.coal at lake-locked sites, portal scaffold miss, follow lag with fast players, stretch suite (iron kit, diamonds), pathfinder master pin, prompt/tool-surface trim (~13–19k cached tokens/call), combat/trading/Nether.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
