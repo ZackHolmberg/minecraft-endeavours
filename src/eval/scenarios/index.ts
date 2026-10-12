@@ -1,12 +1,13 @@
 import type { Scenario } from "../types.js";
 import { groups } from "./groups.js";
+import { polishA } from "./polish-a.js";
 import { tier1 } from "./tier1.js";
 import { tier2 } from "./tier2.js";
 import { tier3 } from "./tier3.js";
 import { tier4 } from "./tier4.js";
 
 /** All scenarios, in run order. Add new groups here. */
-export const scenarios: Scenario[] = [...tier1, ...tier2, ...tier3, ...groups, ...tier4];
+export const scenarios: Scenario[] = [...tier1, ...tier2, ...tier3, ...groups, ...polishA, ...tier4];
 
 const globToRe = (g: string) => new RegExp("^" + g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
 

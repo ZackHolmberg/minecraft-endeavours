@@ -154,13 +154,13 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "getItems",
     description:
-      "CREATIVE MODE ONLY: instantly take items from the creative inventory — how you get building materials, tools, food, anything, in creative. Tops up to at least `count` of each (default one full stack; 64 for most blocks), hotbar first. One call for a whole build's palette, e.g. [{ name: 'oak_planks', count: 192 }, { name: 'glass_pane' }, { name: 'oak_door', count: 1 }]. Fails in survival — gather or craft there instead. If the inventory fills up, returns ok:false with state.missing.",
+      "CREATIVE ONLY (fails in survival): take items from the creative inventory. Tops up to at least `count` of each (default one stack), hotbar first. One call for a whole palette, e.g. [{ name: 'oak_planks', count: 192 }, { name: 'glass_pane' }]. If the inventory fills up, returns ok:false with state.missing.",
     schema: {
       items: z
         .array(
           z.object({
             name: z.string().min(1).describe("Item ID, e.g. 'stone_bricks', 'oak_door'"),
-            count: z.number().int().min(1).max(2304).optional().describe("Total you want to hold (default one stack)"),
+            count: z.number().int().min(1).max(2304).optional().describe("Amount to hold (default one stack)"),
           }),
         )
         .min(1)
@@ -172,7 +172,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "say",
     description:
-      "Say something in public chat — the ONLY way players hear you (besides whisper). Use it to reply to public-chat messages. Write like a friendly player: one short casual line, plain text, no markdown. Don't narrate each step of a task; ack, then report the result. Max 256 chars.",
+      "Say something in public chat: the ONLY way players hear you (besides whisper). One short casual line, plain text, no markdown. Ack, then report the result; don't narrate steps. Max 256 chars.",
     schema: { message: z.string().min(1) },
     run: withParams("say", say, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
@@ -180,7 +180,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "whisper",
     description:
-      "Private message to one player. Use it to reply when a player whispered you (/msg). Same style as say: one short casual line. Fails if the player is offline.",
+      "Private message to one player, for replying to a whisper (/msg). Same style as say. Fails if they're offline.",
     schema: { player: z.string().min(1), message: z.string().min(1) },
     run: withParams("whisper", whisper, READ_ONLY),
     surfaces: EXEC_AND_PLAN,
@@ -188,7 +188,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "goTo",
     description:
-      "Walk to a target. Target is one of: { kind: 'coords', coords: { x, y, z } } | { kind: 'entity', entity: '<player or mob name>' } | { kind: 'block', block: '<block id>' }. Optional `reach` (default 1) is the stop distance. Wooden doors, fence gates and the like open automatically on the way (iron doors and trapdoors don't). It never digs through blocks and never places any (no bridging, no stairs, no towering up): if the only way is over a gap, up a cliff or through a wall, you get a no-path error, returning state.position. Gives up within ~20s if stuck. If you can't reach a spot inside a building, goTo its door or ask the player — never mine or place blocks to get in.",
+      "Walk to a target: { kind: 'coords', coords: {x,y,z} } | { kind: 'entity', entity: '<player or mob>' } | { kind: 'block', block: '<block id>' }. `reach` (default 1) is the stop distance. Wooden doors and fence gates open on the way (iron doors/trapdoors don't). Never digs or places blocks (no bridging, stairs or towering): over a gap, cliff or wall you get a no-path error with state.position. Gives up after ~20s if stuck. To get into a building, goTo its door or ask the player.",
     schema: {
       target: goToTargetSchema,
       reach: z.number().int().min(0).max(16).optional(),
@@ -199,7 +199,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "stop",
     description:
-      "Stop moving and cancel whatever is running (following, fighting, fleeing, fishing, walking, mining, placing, smelting, pillaring). Safe anytime. Use when a player says stop or to abandon a task.",
+      "Stop moving and cancel whatever is running (following, fighting, walking, mining, placing, smelting, jobs). Safe anytime; use when a player says stop.",
     schema: {},
     run: noParams("stop", stop),
     surfaces: EXECUTOR,
@@ -207,7 +207,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "followPlayer",
     description:
-      "Follow a player at `dist` blocks (default 3), until they say stop (or you call stop / cancelJob), for up to 30 minutes. Starts a background job and returns at once: reply briefly (say) and end your turn. The follow keeps running while the player chats — answer them with say/whisper only; any movement/mining/crafting tool you call cancels it. If the player walks out of view the bot searches for them (last position, then the way they were heading) for ~45s before giving up with a [job failed] message. Use it only when the player asked you to follow them — for 'come here' use goTo with the player as the target instead.",
+      "Follow a player at `dist` blocks (default 3) until they say stop (or you call stop/cancelJob), max 30 minutes. Background job: returns at once, so reply briefly and end your turn. It keeps running while they chat: answer with say/whisper only (movement/mining/crafting tools cancel it). If they leave view it searches ~45s, then sends [job failed]. Only when asked to follow; for 'come here' use goTo.",
     schema: {
       player: z.string().min(1),
       dist: z.number().int().min(1).max(16).optional().describe("Follow distance in blocks (default 3)"),
@@ -225,9 +225,7 @@ export const SKILL_SPECS: SkillSpec[] = [
       allowStructures: z
         .boolean()
         .optional()
-        .describe(
-          "Also mine blocks that look player-built (house walls, doors, glass). ONLY when a player explicitly asked you to demolish/remove them.",
-        ),
+        .describe("Also mine player-built blocks. ONLY when a player explicitly asked to demolish them."),
     },
     run: withParams("mineBlock", mineBlock),
     surfaces: EXECUTOR,
@@ -235,32 +233,30 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "mineBlocks",
     description:
-      "Mine several natural block types in one sweep, nearest first, until `maxCount` total is collected or nothing reachable is left in range — e.g. ['iron_ore', 'coal_ore', 'diamond_ore'] for 'mine any ores you find'. Types your tools can't harvest are skipped and reported in state.skipped (not fatal). Like mineBlock it counts what actually lands in your inventory (the drop, e.g. iron_ore gives raw_iron) until `maxCount` total, and returns state.collected, state.gained (by item), state.mined (blocks dug) and state.byType. It leaves player-built blocks alone unless allowStructures is set (demolition requests only).",
+      "Mine natural blocks, nearest first, until `maxCount` total (default 32, max 128) is in your inventory or nothing reachable is left. `types` is one block ('oak_log'; mine 'stone' for cobblestone) or several for 'any ores' trips (['iron_ore','coal_ore']). Counts what actually lands in your inventory (e.g. 'collected 10 oak_log (mined 11)'): trust that number; also returns state.collected, gained, mined, byType. Takes only blocks within arm's reach from the ground (about 4 up a tree), may tunnel a short way through natural blocks, skips types your tools can't harvest (state.skipped). Leaves player-built blocks alone unless allowStructures (demolition requests only). Creative: only clears blocks, use getItems.",
     schema: {
       types: z
         .array(z.string().min(1))
         .min(1)
-        .describe("Block IDs to look for, e.g. ['iron_ore', 'coal_ore', 'diamond_ore']"),
+        .describe("Block IDs, e.g. ['oak_log'] or ['iron_ore', 'coal_ore']"),
       maxCount: z
         .number()
         .int()
         .min(1)
         .max(128)
         .optional()
-        .describe("Total blocks across all types (default 32, max 128)"),
+        .describe("Total across all types (default 32)"),
       maxDistance: z
         .number()
         .int()
         .min(1)
         .max(128)
         .optional()
-        .describe("Search radius per scan (default 64)"),
+        .describe("Search radius (default 64)"),
       allowStructures: z
         .boolean()
         .optional()
-        .describe(
-          "Also mine blocks that look player-built (house walls, doors, glass). ONLY when a player explicitly asked you to demolish/remove them.",
-        ),
+        .describe("Also mine player-built blocks. ONLY when a player explicitly asked to demolish them."),
     },
     run: withParams("mineBlocks", mineBlocks),
     surfaces: CLAUDE_ONLY,
@@ -279,7 +275,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "placeBlocks",
     description:
-      "Place up to 64 blocks in one call — use it for any structure (floor, wall course, roof, staircase, path). Make sure you have enough of each block first. Order matters: list blocks so each one has something solid next to it (ground up). On the first failure returns ok:false with state.placed (how many landed) and state.failedIndex — fix the problem and continue from there; don't re-place what landed. In creative it takes missing blocks from the creative inventory and flies to spots out of reach.",
+      "Place up to 64 blocks in one call (a single block too): floors, wall courses, roofs, stairs, paths. You must hold enough of each block. List them ground-up so each has something solid beside it. On the first failure returns ok:false with state.placed and state.failedIndex: fix it and continue from there. Creative: takes missing blocks itself and flies to out-of-reach spots.",
     schema: {
       blocks: z
         .array(
@@ -297,7 +293,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "pillarUp",
     description:
-      "Climb straight up by jump-placing filler blocks (cobblestone/dirt/stone) under yourself — to get out of a hole, onto a ledge, or up to a tree top. Needs filler in inventory, solid ground, headroom. Cancellable. Returns state.placed and the final position. Only when genuinely needed — never as a way to travel; walk or build stairs instead.",
+      "Climb straight up by jump-placing filler blocks (cobblestone/dirt/stone) under you: out of a hole, onto a ledge, up to a tree top. Needs filler, solid ground, headroom. Cancellable. Only when genuinely needed, never to travel.",
     schema: {
       height: z.number().int().min(1).max(32),
     },
@@ -317,7 +313,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "dropItem",
     description:
-      "Drop `count` of `item` at your feet (all of it if `count` is omitted). To hand items to a player, use giveItemsTo instead — it walks to them first.",
+      "Drop `count` of `item` at your feet (all if omitted). To hand items to a player use giveItemsTo.",
     schema: {
       item: z.string().min(1).describe("Item ID, e.g. 'oak_log', 'iron_ingot'"),
       count: z.number().int().min(1).max(2304).optional(),
@@ -340,7 +336,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "giveItemsTo",
     description:
-      "Walk to a player once and toss them several items ('give me a full iron set', 'bring me food and a pickaxe'). Each `count` defaults to all you have of that item. Stops at the first failure with state.given and state.failedIndex.",
+      "Walk to a player once and toss them one or several items ('give me a full iron set'). Each `count` defaults to all you have. Stops at the first failure with state.given and state.failedIndex.",
     schema: {
       player: z.string().min(1),
       items: z
@@ -359,7 +355,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "equipItem",
     description:
-      "Equip ONE item to a slot (default 'hand'). For several slots at once (armor set, sword + shield) use equipLoadout. activateBlock / useOnEntity / useItem take a `with` param that equips for you, so you rarely need this for tools.",
+      "Equip ONE item to a slot (default 'hand'). activateBlock/useOnEntity/useItem take a `with` param that equips for you, so you rarely need this for tools.",
     schema: {
       item: z.string().min(1).describe("Item ID, e.g. 'iron_pickaxe', 'shears', 'iron_helmet'"),
       slot: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]).optional(),
@@ -385,10 +381,10 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "activateBlock",
     description:
-      "Right-click a block. With `with` it equips that item first. Uses: hoe on dirt → farmland; seeds on farmland → plant; bone_meal on a crop; bucket on water/lava → fill; water_bucket → place water; flint_and_steel → light fire; no `with` on a door/trapdoor/gate/lever/button → open, close or toggle it.",
+      "Right-click a block; `with` equips that item first. Hoe on dirt → farmland; seeds on farmland → plant; bone_meal on a crop; bucket on water/lava → fill; water_bucket → place water; flint_and_steel → light fire; no `with` on a door/trapdoor/gate/lever/button → toggle it.",
     schema: {
       position: posSchema,
-      with: z.string().optional().describe("Item ID to equip to hand before activating (e.g. 'iron_hoe', 'bucket')"),
+      with: z.string().optional().describe("Item to equip first (e.g. 'iron_hoe')"),
     },
     run: withParams("activateBlock", activateBlock),
     surfaces: CLAUDE_ONLY,
@@ -396,10 +392,10 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "useOnEntity",
     description:
-      "Right-click a mob or player. With `with` it equips that item first. Uses: shears on sheep → wool (no killing); bucket on cow → milk; lead, name_tag, saddle, dye on the right animal.",
+      "Right-click a mob or player; `with` equips that item first. Shears on sheep → wool (no killing); bucket on cow → milk; lead, name_tag, saddle, dye.",
     schema: {
       entity: z.string().min(1).describe("Mob type ('sheep', 'cow', 'pig') or player username"),
-      with: z.string().optional().describe("Item ID to equip to hand before using (e.g. 'shears', 'bucket')"),
+      with: z.string().optional().describe("Item to equip first (e.g. 'shears')"),
     },
     run: withParams("useOnEntity", useOnEntity),
     surfaces: CLAUDE_ONLY,
@@ -407,9 +403,9 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "useItem",
     description:
-      "Right-click in the air with the held (or off-hand) item — only for throwables and bows: ender pearls, splash/lingering potions, charging a bow. Never for food (use eat) or fishing (use fish).",
+      "Right-click in the air with the held (or off-hand) item: only throwables and bows (ender pearls, splash potions, charging a bow). Never for food (eat) or fishing (fish).",
     schema: {
-      with: z.string().optional().describe("Item ID to equip first (e.g. 'ender_pearl', 'bow')"),
+      with: z.string().optional().describe("Item to equip first"),
       offhand: z.boolean().optional().describe("Use the off-hand item instead of main-hand"),
     },
     run: withParams("useItem", useItem),
@@ -418,9 +414,9 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "eat",
     description:
-      "Eat food. Omit `item` to pick the best food you have (cooked first). Won't eat at full hunger unless you name an item. You also auto-eat when hungry; call this only when asked or before a fight.",
+      "Eat food; omit `item` to pick the best you have. Won't eat at full hunger unless you name an item. You auto-eat when hungry, so call this only when asked or before a fight.",
     schema: {
-      item: z.string().optional().describe("Specific food item; omit to auto-pick best from inventory"),
+      item: z.string().optional().describe("Food item (default: best you have)"),
     },
     run: withParams("eat", eat),
     surfaces: EXECUTOR,
@@ -428,7 +424,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "fish",
     description:
-      "Cast and wait for one catch. Needs a fishing_rod in hand (equipItem it first) and water in front of you. Stops early if a player says stop; gives up after 5 minutes.",
+      "Cast and wait for one catch. Needs a fishing_rod in hand (equipItem it) and water ahead. Stops if a player says stop; gives up after 5 minutes.",
     schema: {},
     run: noParams("fish", fish),
     surfaces: CLAUDE_ONLY,
@@ -436,9 +432,9 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "sleepIn",
     description:
-      "Sleep in a bed: the one at `pos`, else the nearest bed within 32 blocks, else a remembered bed. Walks there first. Only works at night or in a thunderstorm.",
+      "Sleep in a bed: the one at `pos`, else the nearest within 32 blocks, else a remembered one. Walks there first. Only at night or in a thunderstorm.",
     schema: {
-      pos: posSchema.optional().describe("Explicit bed position; omit to auto-find"),
+      pos: posSchema.optional().describe("Bed position (default: auto-find)"),
     },
     run: withParams("sleepIn", sleepIn),
     surfaces: CLAUDE_ONLY,
@@ -446,11 +442,11 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "craft",
     description:
-      "Craft ONE recipe. Ingredients must be in your inventory; it finds and walks to a crafting table itself (nearby or remembered) when the recipe needs one. `count` is the number of items wanted; rounded up to the recipe's batch size (e.g. planks come in 4s). If no crafting_table is within 32 blocks, places one from inventory or crafts one from 4 planks automatically. On failure the message says what's missing — gather it, then retry. For several recipes use craftMany. In creative, use getItems instead.",
+      "Craft ONE recipe from your inventory; finds (or places/crafts) a crafting table itself when the recipe needs one. `count` = items wanted, rounded up to the recipe batch (planks come in 4s). On failure the message says what's missing: gather it, then retry. Creative: use getItems.",
     schema: {
       item: z.string().min(1).describe("Item ID, e.g. 'oak_planks', 'iron_pickaxe'"),
       count: z.number().int().min(1).max(64).optional(),
-      tablePos: posSchema.optional().describe("Explicit crafting table position; omit to auto-find"),
+      tablePos: posSchema.optional().describe("Crafting table position (default: auto-find)"),
     },
     run: withParams("craft", craft),
     surfaces: EXECUTOR,
@@ -469,7 +465,7 @@ export const SKILL_SPECS: SkillSpec[] = [
         )
         .min(1)
         .max(36),
-      tablePos: posSchema.optional().describe("Explicit crafting table position; omit to auto-find"),
+      tablePos: posSchema.optional().describe("Crafting table position (default: auto-find)"),
     },
     run: withParams("craftMany", craftMany),
     surfaces: CLAUDE_ONLY,
@@ -477,12 +473,12 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "smelt",
     description:
-      "Smelt `count` of `input` (e.g. raw_iron → iron_ingot, beef → cooked_beef, sand → glass). Finds a furnace (nearby or remembered), walks there, waits, and takes the output. Picks a furnace type that fits the input (smoker = food, blast_furnace = ores) and places a carried furnace if none is nearby. Leave `fuel` out — it picks coal/charcoal first and falls back to planks/logs; prefer mining coal_ore over burning wood. Max 64 per call. Cancellable via stop.",
+      "Smelt `count` (max 64) of `input` (raw_iron → iron_ingot, beef → cooked_beef, sand → glass). Finds or places a furnace, waits, takes the output; picks the furnace type (smoker = food, blast_furnace = ores). Leave `fuel` out: it uses coal/charcoal, then planks/logs. Cancellable via stop.",
     schema: {
-      input: z.string().min(1).describe("Item ID to smelt, e.g. 'raw_iron', 'raw_copper', 'sand', 'beef'"),
-      fuel: z.string().optional().describe("Fuel item ID; omit to auto-pick best fuel from inventory"),
+      input: z.string().min(1).describe("Item to smelt, e.g. 'raw_iron', 'sand'"),
+      fuel: z.string().optional().describe("Fuel (default: auto)"),
       count: z.number().int().min(1).max(64).optional().describe("How many to smelt (default 1)"),
-      furnacePos: posSchema.optional().describe("Explicit furnace position; omit to auto-find"),
+      furnacePos: posSchema.optional().describe("Furnace position (default: auto-find)"),
     },
     run: withParams("smelt", smelt),
     surfaces: EXECUTOR,
@@ -490,7 +486,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "attack",
     description:
-      "Melee-attack `entity` (a mob type like 'zombie', or a player name) with your best weapon until it dies, gets away, or a player says stop. Gives up after 90s, or after 20s unable to reach the target; breaks off vs mobs at ≤6 health. Only attack players, pets or villagers if a player explicitly asked.",
+      "Melee-attack `entity` (mob type like 'zombie', or a player name) with your best weapon until it dies, escapes or a player says stop. Gives up after 90s, or 20s unable to reach it; breaks off vs mobs at 6 health or less. Players, pets, villagers only if a player explicitly asked.",
     schema: { entity: z.string().min(1) },
     run: withParams("attack", attack),
     surfaces: EXECUTOR,
@@ -498,7 +494,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "flee",
     description:
-      "Run from `from` (a mob type or player name) until `dist` blocks away. Use when health is low or a fight is hopeless. Gives up after 45s if it can't get away.",
+      "Run from `from` (mob type or player name) until `dist` blocks away. For low health or a hopeless fight. Gives up after 45s.",
     schema: {
       from: z.string().min(1),
       dist: z.number().int().min(1).max(64).optional().describe("Target separation in blocks (default 16)"),
@@ -513,7 +509,7 @@ export const SKILL_SPECS: SkillSpec[] = [
     schema: {
       item: z.string().min(1).describe("Item ID to deposit"),
       count: z.number().int().min(1).max(2304).optional(),
-      pos: posSchema.optional().describe("Explicit chest position; omit to use nearest known container"),
+      pos: posSchema.optional().describe("Chest position (default: nearest known)"),
     },
     run: withParams("depositToChest", depositToChest),
     surfaces: CLAUDE_ONLY,
@@ -521,7 +517,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "depositManyToChest",
     description:
-      "Put several item types into one chest in a single trip; each `count` defaults to all you have. Stops at the first failure with state.deposited and state.failedIndex. Without `pos`, uses the nearest chest within 16 blocks or a remembered one.",
+      "Put one or several item types into one chest in a single trip; each `count` defaults to all you have. Without `pos`: nearest chest within 16 blocks, else a remembered one. Stops at the first failure with state.deposited and state.failedIndex.",
     schema: {
       items: z
         .array(
@@ -532,7 +528,7 @@ export const SKILL_SPECS: SkillSpec[] = [
         )
         .min(1)
         .max(36),
-      pos: posSchema.optional().describe("Explicit chest position; omit to use nearest known container"),
+      pos: posSchema.optional().describe("Chest position (default: nearest known)"),
     },
     run: withParams("depositManyToChest", depositManyToChest),
     surfaces: CLAUDE_ONLY,
@@ -552,7 +548,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "withdrawManyFromChest",
     description:
-      "Take several item types out of ONE chest in a single trip. Without `pos` the chest is chosen by the FIRST item, so only group items stored in the same chest. Counts are capped at what's there (partial pulls succeed). Stops if an item is missing entirely: state.withdrawn and state.failedIndex. Without `pos`, uses the nearest chest within 16 blocks or a remembered one.",
+      "Take one or several item types out of ONE chest in a single trip. Without `pos` the chest is chosen by the FIRST item, so group only items stored together (nearest within 16 blocks, else remembered). Counts cap at what's there. Stops if an item is missing entirely: state.withdrawn and state.failedIndex.",
     schema: {
       items: z
         .array(
@@ -563,7 +559,7 @@ export const SKILL_SPECS: SkillSpec[] = [
         )
         .min(1)
         .max(36),
-      pos: posSchema.optional().describe("Explicit chest position; omit to resolve via the first item"),
+      pos: posSchema.optional().describe("Chest position (default: via the first item)"),
     },
     run: withParams("withdrawManyFromChest", withdrawManyFromChest),
     surfaces: CLAUDE_ONLY,
@@ -571,9 +567,9 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "remember",
     description:
-      "Remember a named place permanently (it appears under known waypoints/utilities from then on). Use when a player names a spot ('this is the base', 'call this the wheat farm') and at the surface before going underground (type 'mine_entrance'). Position defaults to where you stand.",
+      "Remember a named place permanently (shows under known waypoints/utilities). Use when a player names a spot ('this is the base') and at the surface before going underground (type 'mine_entrance'). Position defaults to where you stand.",
     schema: {
-      type: z.string().min(1).describe("Classification: 'base', 'portal', 'bed', 'crafting_table', 'home', etc."),
+      type: z.string().min(1).describe("'base', 'portal', 'bed', 'home', …"),
       name: z.string().optional(),
       pos: posSchema.optional(),
     },
@@ -601,18 +597,18 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "achieve",
     description:
-      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace), starts it as a background job and returns at once with the plan. Pass ALL requested items in ONE call: goals [{ item: 'iron_pickaxe', count: 1 }]. Item = exact snake_case ID, or a generic tag when any kind will do: '#log' (any wood), '#planks', '#wool', '#stone_tool_material' (cobblestone and friends), '#coal', '#sand' — e.g. 'chop 10 logs' = { item: '#log', count: 10 }; it takes whichever species is nearest and counts mixed logs together. This is also THE way to collect N of something (logs, planks, cobblestone, ...): it runs in the background so you can keep chatting. When the player wants the items themselves ('give me', 'get me', 'bring me'), add deliverTo: their name: the job then walks to them and hands the items over (creative: takes them with getItems first; capped at 2 stacks per item, 4 for unstackable items, and never operator items like command blocks). After it starts, reply briefly and end your turn — you get a '[job finished]' or '[job failed]' message when it ends. Don't call movement/mining/crafting tools while it runs (that cancels it). Fails with a reason if the item is unknown or has no known source. In creative it only works with deliverTo.",
+      "Get items. Plans the whole chain (gather, craft, smelt, place a table/furnace) and runs it as a background job; returns at once with the plan. Pass ALL requested items in ONE call. Item = exact snake_case ID, or a tag when any kind will do: '#log', '#planks', '#wool', '#stone_tool_material', '#coal', '#sand' ('chop 10 logs' = { item: '#log', count: 10 }; mixed species count together). Also THE way to collect N of anything: it runs in the background so you can keep chatting. If the player wants the items in their hands ('give me', 'get me', 'bring me'), set deliverTo to their name: the job walks to them and hands them over (creative: takes them with getItems; max 2 stacks per item, never operator items). After it starts, reply briefly and end your turn; you get '[job finished]' or '[job failed]'. Movement/mining/crafting tools called meanwhile cancel it. Fails with a reason if the item is unknown or has no source. Creative: only works with deliverTo.",
     schema: {
       goals: z
         .array(
           z.object({
-            item: z.string().min(1).describe("Item ID, e.g. 'iron_pickaxe', 'oak_planks', 'iron_ingot'; or a tag: '#log', '#planks', '#wool', '#stone_tool_material', '#coal', '#sand'"),
+            item: z.string().min(1).describe("Item ID or tag ('#log', '#planks', …)"),
             count: z.number().int().min(1).max(2304).describe("How many you should end up holding"),
           }),
         )
         .min(1)
         .max(8),
-      deliverTo: z.string().min(1).optional().describe("Player name to hand the finished items to (they must be nearby)"),
+      deliverTo: z.string().min(1).optional().describe("Player to hand the items to (must be nearby)"),
     },
     run: withParams("achieve", achieve, READ_ONLY),
     surfaces: CLAUDE_ONLY,
@@ -620,14 +616,14 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "build",
     description:
-      "Build a house, a nether portal or a wheat farm as a background job and return at once. It picks a level site next to the player (never on top of them or on anyone's build), gets any missing materials (survival: gathers/crafts them; creative: getItems), places everything bottom-up with temporary scaffolding and a door added last, then verifies the block count. blueprint 'house': params width/depth 5-9, height 3-4, wall/roof/floor block ids (default: the planks you hold), windows 0-8 (glass if you have it), door. 'portal': 10 obsidian frame + flint_and_steel. 'farm': size 3-9, needs a hoe + seeds, uses water within 4 or a water bucket. at: 'here' (default) or {x,y,z}. After it starts, reply briefly and end your turn — you get '[job finished]' or '[job failed]'. Don't call movement/building tools while it runs (that cancels it).",
+      "Build a house, nether portal or wheat farm as a background job; returns at once. Picks a level site next to the player (never on a build), gets missing materials (survival: gathers/crafts; creative: getItems), places bottom-up with scaffolding and the door last, then verifies the block count. 'house': width/depth 5-9, height 3-4, wall/roof/floor block ids (default: the planks you hold), windows 0-8, door. 'portal': 10 obsidian + flint_and_steel. 'farm': size 3-9, needs hoe + seeds, water within 4 or a water bucket. at: 'here' (default) or {x,y,z}. After it starts, reply briefly and end your turn; you get '[job finished]' or '[job failed]'. Movement/building tools called meanwhile cancel it.",
     schema: {
       blueprint: z.enum(["house", "portal", "farm"]),
       params: z
         .object({
           width: z.number().int().min(5).max(9).optional(),
           depth: z.number().int().min(5).max(9).optional(),
-          height: z.number().int().min(3).max(4).optional().describe("Rows including the roof: 3 = a 2-high interior"),
+          height: z.number().int().min(3).max(4).optional().describe("Rows incl. roof (3 = 2-high interior)"),
           wall: z.string().optional().describe("Wall block id, e.g. oak_planks, cobblestone"),
           roof: z.string().optional().describe("Roof block id (default: same as wall)"),
           floor: z.string().optional().describe("Optional floor block id"),
@@ -636,7 +632,7 @@ export const SKILL_SPECS: SkillSpec[] = [
           size: z.number().int().min(3).max(9).optional().describe("Farm plot size"),
         })
         .optional(),
-      at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = beside the requesting player (default)"),
+      at: z.union([z.literal("here"), posSchema]).optional().describe("'here' = beside the player (default)"),
     },
     run: withParams("build", build, READ_ONLY),
     surfaces: CLAUDE_ONLY,
@@ -644,7 +640,7 @@ export const SKILL_SPECS: SkillSpec[] = [
   {
     name: "surviveNight",
     description:
-      "Survive the night safely (call it at dusk, or when asked to 'survive the night', 'it's getting dark', 'stay safe tonight'). Background job: sleeps in a bed if one is within reach, otherwise digs itself a 1x2 pocket into the ground or a hillside in seconds (the quick shelter a player makes at dusk), seals it with the dug dirt and waits inside until dawn, then opens up. If no safe spot exists it builds a minimal 3x3 hut instead (next to the player, door or plugged doorway, torch if it has one). Never just stand around outside at night. useBed:false skips the bed (use it if sleeping failed). shelter:'hut' skips digging in and builds the hut (use it if digging in failed). After it starts, reply briefly and end your turn — you get '[job finished]' at dawn or '[job failed]'. Don't call movement/building tools while it runs (that cancels it). Not for creative mode.",
+      "Survive the night (at dusk, or 'survive the night', 'it's getting dark'). Background job: sleeps in a bed if one is near, else digs a sealed 1x2 pocket into the ground or hillside and waits until dawn; with no safe spot it builds a 3x3 hut next to the player. useBed:false skips the bed; shelter:'hut' skips digging in. After it starts, reply briefly and end your turn; you get '[job finished]' at dawn or '[job failed]'. Movement/building tools called meanwhile cancel it. Not for creative.",
     schema: {
       useBed: z.boolean().optional().describe("false = build a shelter even if a bed is at hand"),
       shelter: z.enum(["dig", "hut"]).optional().describe("hut = build the 3x3 hut instead of digging in (default dig)"),
@@ -654,12 +650,39 @@ export const SKILL_SPECS: SkillSpec[] = [
   },
   {
     name: "cancelJob",
-    description: "Cancel the running achieve job (if any). Use when the player changes their mind; a new achieve call also replaces the running job.",
+    description:
+      "Cancel the running job (if any). Use when the player changes their mind; a new achieve call also replaces it.",
     schema: {},
     run: noParams("cancelJob", cancelJob, READ_ONLY),
     surfaces: CLAUDE_ONLY,
   },
 ];
+
+/**
+ * Live-polish A (efficiency report rec. #6): tools the Claude bot no longer sees. Each is redundant or superseded
+ * (the world snapshot carries inventory + surroundings; `mineBlocks` / `placeBlocks` / `giveItemsTo` /
+ * `depositManyToChest` / `withdrawManyFromChest` take one-item lists; `achieve` crafts chains; the task queue is
+ * replaced by jobs). They stay in the registry and as plain skills (jobs, the local/hybrid backends and tests call
+ * them); only the `claude` surface drops them: 41 -> 29 tool definitions, ~3k fewer prompt tokens per API call.
+ * See SKILLS.md "Hidden from the model".
+ */
+export const HIDDEN_FROM_CLAUDE: ReadonlySet<string> = new Set([
+  "observeSurroundings",
+  "checkInventory",
+  "setTaskQueue",
+  "advanceTaskQueue",
+  "pickUpNearby",
+  "mineBlock",
+  "craftMany",
+  "placeBlock",
+  "depositToChest",
+  "withdrawFromChest",
+  "giveItemTo",
+  "equipLoadout",
+]);
+for (const spec of SKILL_SPECS) {
+  if (HIDDEN_FROM_CLAUDE.has(spec.name)) spec.surfaces = { ...spec.surfaces, claude: false };
+}
 
 export const SKILL_SPECS_BY_NAME: ReadonlyMap<string, SkillSpec> = new Map(
   SKILL_SPECS.map((s) => [s.name, s]),

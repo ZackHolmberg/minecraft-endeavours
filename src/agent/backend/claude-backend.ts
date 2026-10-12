@@ -52,7 +52,7 @@
  * more quota per ARCHITECTURE.md "Resilience".
  */
 
-import { coalesceMessages, isDirectAddress, isStatusQuestion, silentNudgeText } from "../coalesce.js";
+import { coalesceMessages, expectsReply, isDirectAddress, isStatusQuestion, silentNudgeText } from "../coalesce.js";
 import {
   query,
   type Query,
@@ -61,6 +61,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Bot } from "mineflayer";
 import { recordConversation } from "../../memory/conversation-log.js";
+import { setNearDuplicateGuard } from "../../skills/chat.js";
 import {
   beginTask,
   clip,
@@ -88,6 +89,7 @@ import {
 } from "../skill-tools.js";
 import { getJobRunner } from "../../jobs/registry.js";
 import { buildSystemPrompt } from "../system-prompt.js";
+import { EarlyEndTracker } from "./early-end.js";
 import { sdkIsolation } from "./sdk-isolation.js";
 import { summarizeInit, type InitLike } from "./init-summary.js";
 import { MAX_TURNS_PER_EVENT } from "../limits.js";
@@ -276,8 +278,14 @@ interface ActiveSession {
   closedByUs: boolean;
   /** Closed because a player said stop. */
   interrupted: boolean;
-  /** The task answers a direct address (name mention, whisper, @all) or a job event: silence is a bug. */
+  /** The task answers a direct address (name mention, whisper, @all, an answer to our question) or a job event: silence is a bug. */
   direct?: boolean;
+  /** The player messages this task answers (formatted), for the silent-turn nudge. */
+  batch?: string[];
+  /** per_task: watches the stream for a terminal say so the useless final text-only call can be skipped. */
+  early?: EarlyEndTracker;
+  /** We interrupted the query because its last turn was a terminal say (the `result` that follows is a normal finish). */
+  earlyEnd?: boolean;
 }
 
 export class ClaudeBackend implements AgentBackend {
@@ -355,6 +363,8 @@ export class ClaudeBackend implements AgentBackend {
     const skillsServer = specs ? buildSkillsServerFor(bot, specs) : buildSkillsServer(bot);
     const allowedTools = specs ? allowedToolNamesFor(specs) : [...ALLOWED_TOOL_NAMES];
     const input = new UserMessageQueue();
+    // Standalone per-task bot only (the hybrid planner overrides the system prompt and runs persistent).
+    const earlyEnd = this.mode === "per_task" && systemPrompt === undefined && process.env.BOT_NO_EARLY_END !== "1";
 
     const hint = modelHint ?? botConfig.model_hint;
     const q = query({
@@ -379,6 +389,8 @@ export class ClaudeBackend implements AgentBackend {
         allowDangerouslySkipPermissions: true,
         persistSession: false,
         maxTurns: MAX_TURNS_PER_EVENT,
+        // Raw stream events give the exact end of each API turn, which the early-end tracker needs.
+        ...(earlyEnd ? { includePartialMessages: true } : {}),
       },
     });
 
@@ -388,6 +400,7 @@ export class ClaudeBackend implements AgentBackend {
       resulted: false,
       closedByUs: false,
       interrupted: false,
+      ...(earlyEnd ? { early: new EarlyEndTracker() } : {}),
     };
     void this.runSession(active);
     return active;
@@ -425,7 +438,11 @@ export class ClaudeBackend implements AgentBackend {
     }
     if (this.task !== active) return;
     this.task = null;
-    if (!active.resulted && !this.stopped) {
+    if (!active.resulted && !this.stopped && active.earlyEnd && !active.interrupted) {
+      // Early end whose `result` never arrived (the interrupt fell back to close): still a normal finish.
+      console.log(`[${this.opts.bot.username}] event complete after ${this.turnsThisEvent} turn(s) — ended after say (no result message)`);
+      this.finishEvent("finished", { outcome: "finished", subtype: "ended_after_say", numTurns: null, usage: null });
+    } else if (!active.resulted && !this.stopped) {
       const status = active.interrupted ? "stopped by player" : "ended unexpectedly";
       if (!active.interrupted) {
         this.lastTurnError = { subtype: "session_ended_without_result", at: Date.now() };
@@ -478,6 +495,8 @@ export class ClaudeBackend implements AgentBackend {
   private handleMessage(msg: SDKMessage, active: ActiveSession): void {
     const { bot } = this.opts;
     const tag = `[${bot.username}]`;
+
+    if (active.early && !active.earlyEnd && active.early.feed(msg)) this.endAfterSay(active);
 
     switch (msg.type) {
       case "system": {
@@ -564,7 +583,9 @@ export class ClaudeBackend implements AgentBackend {
         this.followUpQueued = false;
         // v2: Haiku plans in plain text (invisible) and ends the turn without say. One nudge, never a loop.
         const silent = active.direct === true && !wasFollowUp && !wasInterrupted && msg.subtype === "success" && !hasReplied(this.opts.bot.username);
-        if (msg.subtype === "success") {
+        // Our own interrupt after a terminal say surfaces as error_during_execution; that is a normal finish.
+        const endedAfterSay = active.earlyEnd === true && !wasInterrupted && msg.subtype !== "success" && !active.interrupted;
+        if (msg.subtype === "success" || endedAfterSay) {
           const usage = msg.usage as Partial<TurnUsage> | undefined;
           const totalCost = (msg as { total_cost_usd?: number | null }).total_cost_usd ?? null;
           const turn: TurnUsage = {
@@ -599,7 +620,7 @@ export class ClaudeBackend implements AgentBackend {
           console.warn(`${tag} event ended after ${turnsForEvent} turn(s): ${msg.subtype}`);
         }
         this.finishEvent(
-          msg.subtype === "success"
+          msg.subtype === "success" || endedAfterSay
             ? "finished"
             : wasInterrupted
               ? "stopped by player"
@@ -608,15 +629,15 @@ export class ClaudeBackend implements AgentBackend {
                 : `failed (${msg.subtype})`,
           {
             outcome:
-              msg.subtype === "success"
+              msg.subtype === "success" || endedAfterSay
                 ? "finished"
                 : wasInterrupted
                   ? "stopped"
                   : msg.subtype === "error_max_turns"
                     ? "max_turns"
                     : "failed",
-            subtype: msg.subtype,
-            numTurns: typeof (msg as { num_turns?: unknown }).num_turns === "number"
+            subtype: endedAfterSay ? "ended_after_say" : msg.subtype,
+            numTurns: !endedAfterSay && typeof (msg as { num_turns?: unknown }).num_turns === "number"
               ? (msg as { num_turns: number }).num_turns
               : null,
             usage: usageOf(msg),
@@ -625,7 +646,7 @@ export class ClaudeBackend implements AgentBackend {
         if (msg.subtype === "error_max_turns" && !wasInterrupted && !wasFollowUp) {
           this.queueMaxTurnsFollowUp();
         } else if (silent) {
-          this.queueSilentFollowUp();
+          this.queueSilentFollowUp(active.batch ?? []);
         }
         if (this.mode === "per_task") {
           // Task done: tear the session down; onSessionEnded starts the next one.
@@ -639,6 +660,32 @@ export class ClaudeBackend implements AgentBackend {
       default:
         return;
     }
+  }
+
+  /**
+   * The model's last turn was a terminal say (+ background launchers), all tools succeeded: skip the final text-only
+   * API call nobody sees. Interrupt (the result still carries usage); if it doesn't wind down in 3 s, close.
+   */
+  private endAfterSay(active: ActiveSession): void {
+    active.earlyEnd = true;
+    console.log(`[${this.opts.bot.username}] terminal say — ending the session before the final text-only call`);
+    const q = active.query;
+    const timer = setTimeout(() => {
+      if (!active.resulted && !active.closedByUs) {
+        active.closedByUs = true;
+        active.input.close();
+        q.close();
+      }
+    }, 3_000);
+    timer.unref?.();
+    void q.interrupt().catch(() => {
+      clearTimeout(timer);
+      if (!active.resulted && !active.closedByUs) {
+        active.closedByUs = true;
+        active.input.close();
+        q.close();
+      }
+    });
   }
 
   /**
@@ -656,13 +703,13 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   /** The model ended a directly-addressed task without calling say/whisper: ask once for the reply. */
-  private queueSilentFollowUp(): void {
+  private queueSilentFollowUp(unanswered: readonly string[]): void {
     if (this.stopped || this.cooldown.isActive()) return;
     const partner = getCurrentConversationPartner(this.opts.bot.username);
     const how = partner ? `say (or whisper to ${partner} if they whispered you)` : "say";
     console.log(`[${this.opts.bot.username}] task ended without say/whisper; nudging once`);
     this.followUpQueued = true;
-    this.pushUserMessage(silentNudgeText(how));
+    this.pushUserMessage(silentNudgeText(how, unanswered.filter((m) => !m.startsWith("[orchestrator note"))));
   }
 
   /** True while an event is running (or, per_task, about to start). */
@@ -968,7 +1015,12 @@ export class ClaudeBackend implements AgentBackend {
       const active = this.openSession();
       this.eventLabels.push(labelFor(batch));
       this.queueTelemetryTask(batch, metas, ctxMs, context, injected);
-      active.direct = batch.some(isDirectAddress);
+      const partner = getCurrentConversationPartner(this.opts.bot.username);
+      active.direct =
+        batch.some(isDirectAddress) || metas.some((m) => expectsReply(m.chat?.route, m.chat?.player, partner));
+      active.batch = batch;
+      // Orchestrator-only tasks (nudge / job report) must not restate what was just said (see chat.ts).
+      setNearDuplicateGuard(this.opts.bot.username, batch.every((m) => m.startsWith("[orchestrator note") || m.startsWith("[job ")));
       this.task = active;
       active.input.push(userMessage(context ? `${context}\n\n${body}` : body));
     } catch (err) {
