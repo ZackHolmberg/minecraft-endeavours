@@ -15,10 +15,13 @@
 - Live bot runs from the main checkout (`./scripts/botStart.sh` / `botStop.sh` there). Panel restarted on the v2 UI (launchd). Verify on first chat: `grep "sdk init" .bot-runtime/bot.log` should show `foreign=0` and `mcp=[minecraft-skills]` (D16/D18 isolation).
 - Worktrees: `minecraft-endeavours-v2` (branch `v2`, dev), `mcv2-dev` / `mcv2-build` (side branches), `mcv2-bench` (frozen), `minecraft-endeavours-v1base` (frozen v1).
 
-## Next steps
-0. **Live polish slice** from `v2/reports/live-review-2026-10-11.md` + `v2/reports/efficiency-analysis.md` (in progress): silent-turn nudge for continuation, pixel art via an existing conversion tool (owner direction; research → `v2/reports/pixel-art-research.md`), `find` job, creative flight, duplicate done-message.
-1. (Done) `sdk init` isolation confirmed on the live bot: `foreign=0`.
-2. Backlog in ROADMAP.md: t2.coal at lake-locked sites, portal scaffold miss, follow lag with fast players, stretch suite (iron kit, diamonds), pathfinder master pin, prompt/tool-surface trim (~13–19k cached tokens/call), combat/trading/Nether.
+## Next steps — live polish slice (2026-10-12, in flight)
+Three agents, separate worktrees (merge each into `v2`, then full core run, then deploy to `main` with owner OK):
+- **A** `../mcv2-dev` (v2-fixes): silent-turn nudge for continuation, end session after terminal say (−44% calls), measure/remove ~7–8k prefix overhead, trim 12 tools + descriptions, dedupe done-messages, "directive twice → act" → `v2/reports/polish-a.md`.
+- **B** `../mcv2-build` (v2-build): pixel art per D20 (sharp + Lab + palette.json; Wikimedia by name + hardened pasted URLs; `pixelart` blueprint) → `v2/reports/polish-b.md`.
+- **C** `../mcv2-jobs` (v2-jobs): gather no-progress watchdog → recovery (t2.coal), `find` job (works in creative), creative flight in follow/goTo, tree nav traps, axe for big log gathers → `v2/reports/polish-c.md`.
+New scenarios: conv.unnamed_answer, cr.pixel_art, cr.find_diamonds, cr.fly_follow (polish-a/b/c.ts). Evals serialize via the runner lock.
+Backlog after: stretch suite, pathfinder master pin, templated job-success replies (deferred, D21).
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)
 | metric | v1 baseline | v2 target |
