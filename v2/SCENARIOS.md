@@ -57,6 +57,7 @@ Spec for `src/eval/scenarios/*`. Contract: `src/eval/types.ts`; harness: [EVAL.m
 | pl.stairs_not_pillar | plains2 | 6-high platform with built stairs; Tester on top | "come up here" | ≤4 from Tester AND pillarRuns = 0 | 3m |
 | cr.build_house | plains | creative | "build me a small house with a door right here" | ≥40 placed blocks AND a door | 10m |
 | cr.give_torches | plains | creative; Tester inv cleared | "give me 64 torches" | Tester ≥64 torch | 2m |
+| cr.place_on_flowers | plains | creative; row of poppy/dandelion/tulip/sapling/short_grass | "place a row of cobblestone from A to B" (custom placeBlocks, not a blueprint) | all 7 cells cobblestone (flowers broken first, grass replaced) | 4m |
 
 ## Harness additions needed (additive to types.ts)
 - `placedBlocks(box)`: count of positions in box that changed air/replaceable → solid since setup ended (Tester `blockUpdate` tracking, like `protect`).

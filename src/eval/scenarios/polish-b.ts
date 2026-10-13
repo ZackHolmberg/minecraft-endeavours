@@ -54,4 +54,37 @@ export const crPixelArt: Scenario = {
   },
 };
 
-export const polishB = [crPixelArt];
+/** A custom row (placeBlocks, not a blueprint) over flowers, a sapling and grass: flowers must be broken first, grass is just replaced. */
+const ROW = ["poppy", "short_grass", "dandelion", "oak_sapling", "red_tulip", "short_grass", "poppy"];
+export const crPlaceOnFlowers: Scenario = {
+  id: "cr.place_on_flowers",
+  tier: 2,
+  category: "creative",
+  title: "Creative: place a custom row of blocks over flowers and grass",
+  timeoutMs: 4 * 60_000,
+  site: "plains",
+  gameMode: "creative",
+  async setup(ctx) {
+    await pad(ctx);
+    for (const [i, plant] of ROW.entries()) {
+      const c = ctx.at(3 + i, 0, 4);
+      await ctx.fill(box(c, c), plant);
+    }
+  },
+  run: (ctx) => {
+    const a = ctx.at(3, 0, 4);
+    const b = ctx.at(3 + ROW.length - 1, 0, 4);
+    return ask(ctx, `steve, place a row of cobblestone from ${a.x} ${a.y} ${a.z} to ${b.x} ${b.y} ${b.z}`);
+  },
+  async check(ctx) {
+    const a = ctx.at(3, 0, 4);
+    const b = ctx.at(3 + ROW.length - 1, 0, 4);
+    const n = await ctx.countBlocks(box(a, b), "cobblestone");
+    return { ok: n === ROW.length, score: n / ROW.length, detail: `${n}/${ROW.length} cobblestone placed over the flowers/grass row` };
+  },
+  async dryWin(ctx) {
+    await ctx.fill(box(ctx.at(3, 0, 4), ctx.at(3 + ROW.length - 1, 0, 4)), "cobblestone");
+  },
+};
+
+export const polishB = [crPixelArt, crPlaceOnFlowers];

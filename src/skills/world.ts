@@ -1007,6 +1007,18 @@ async function placeSingleBlock(
     };
   }
 
+  // Grass, ferns, vines and thin snow are replaced by the placement itself; flowers, saplings and mushrooms are not
+  // (the server rejects the place). Break one in the target cell first: one hit, and only a natural plant.
+  const occupant = bot.blockAt(target);
+  if (occupant && blocksPlacement(occupant.name)) {
+    try {
+      await bot.dig(occupant, true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: `couldn't clear the ${occupant.name} at ${fmt(target.x, target.y, target.z)} before placing ${name}: ${message}` };
+    }
+  }
+
   if (bot.heldItem?.type !== stack.type) {
     try {
       await bot.equip(stack, "hand");
@@ -1035,6 +1047,19 @@ async function placeSingleBlock(
     message: `placed ${name} at ${fmt(target.x, target.y, target.z)}${supplied ? ` (took ${name} from the creative inventory)` : ""}`,
     state: { position: { x: target.x, y: target.y, z: target.z }, against: reference.block.name },
   };
+}
+
+/**
+ * Natural plants that sit in a cell without a collision box but are NOT replaceable by a placement (flowers,
+ * saplings, mushrooms, berry bushes). Grass/ferns/vines/snow are replaceable and stay out; player items with no
+ * collision box (torches, carpets, rails, signs) are never matched, so placing never breaks a build.
+ */
+const PLACEMENT_BLOCKING_PLANT =
+  /^(dandelion|poppy|blue_orchid|allium|azure_bluet|(red|orange|white|pink)_tulip|oxeye_daisy|cornflower|lily_of_the_valley|wither_rose|torchflower|sunflower|lilac|rose_bush|peony|pitcher_plant|pink_petals|wildflowers|open_eyeblossom|closed_eyeblossom|cactus_flower|[a-z_]+_sapling|mangrove_propagule|brown_mushroom|red_mushroom|crimson_fungus|warped_fungus|sweet_berry_bush|firefly_bush|bush)$/;
+
+/** True when a block in the target cell must be broken before a block can be placed there. */
+export function blocksPlacement(name: string): boolean {
+  return PLACEMENT_BLOCKING_PLANT.test(name);
 }
 
 export interface PillarUpParams {
