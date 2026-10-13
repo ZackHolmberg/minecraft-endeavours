@@ -279,7 +279,7 @@ export function pixelart(raw: Record<string, unknown> | undefined, facing: Facin
     clear: [],
     margin: 1,
     params: { design: d },
-    summary: `pixel art${d.title ? ` "${d.title}"` : ""} ${d.w}x${d.h} ${wall ? "wall" : "flat on the ground"}, ${n} ${d.blocks[0]!.replace(/^[a-z_]+?_(concrete|wool|terracotta)$/, "$1")} blocks in ${d.blocks.length} colour${d.blocks.length === 1 ? "" : "s"}, facing ${facing}`,
+    summary: `pixel art ${d.w}x${d.h} ${wall ? "wall" : "flat on the ground"}, ${n} ${d.blocks[0]!.replace(/^[a-z_]+?_(concrete|wool|terracotta)$/, "$1")} blocks in ${d.blocks.length} colour${d.blocks.length === 1 ? "" : "s"}, facing ${facing}`,
   };
 }
 

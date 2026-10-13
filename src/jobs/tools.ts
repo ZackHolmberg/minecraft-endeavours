@@ -12,7 +12,7 @@ import type { SkillResult } from "../skills/types.js";
 import { isOperatorItem } from "../skills/creative.js";
 import { isCreative } from "../skills/game-mode.js";
 import { followPlayer as followPlayerBlocking } from "../skills/movement.js";
-import { FIND_ACTIONS, FIND_MAX_COUNT, resolveFindTarget } from "./find.js";
+import { FIND_ACTIONS, FIND_MAX_COUNT, mineRefusal, resolveFindTarget } from "./find.js";
 import { FOLLOW_DEFAULT_DIST, FOLLOW_MAX_DIST } from "./follow.js";
 import { holdsDoor, pickShelterWall } from "./night.js";
 import { goalsText, jobLabel } from "./describe.js";
@@ -261,6 +261,10 @@ export async function find(bot: Bot, { block, action = "point", count = 1 }: Fin
     const r = resolveItem(bot, block);
     const hint = r.ok ? ` (did you mean the block for ${r.normalized}? use the block name, e.g. "${r.normalized}_ore" or a *_log)` : "";
     return { ok: false, message: `"${block}" isn't a block I know${hint}. Use a block id such as diamond_ore, iron_ore, oak_log, or an ore word like diamond.` };
+  }
+  if (action === "mine") {
+    const refusal = mineRefusal(target);
+    if (refusal) return { ok: false, message: refusal };
   }
   const requester = getCurrentConversationPartner(bot.username) ?? null;
   const n = Math.max(1, Math.min(FIND_MAX_COUNT, Math.floor(count)));

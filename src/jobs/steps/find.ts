@@ -29,6 +29,7 @@ import {
   FIND_SEARCH_MS,
   candKey,
   fmtPos,
+  mineRefusal,
   planFind,
   rankFindCandidates,
   type FindCandidate,
@@ -78,6 +79,10 @@ async function findBody(bot: Bot, spec: FindState, ctx: FindRunContext): Promise
   const tag = `[${bot.username}] job find`;
   const ids = spec.blocks.map((b) => bot.registry.blocksByName[b]?.id).filter((i): i is number => i !== undefined);
   if (ids.length === 0) return { ok: false, kind: "unknown_item", detail: `no such block: ${spec.block}` };
+  if (spec.action === "mine") {
+    const refusal = mineRefusal({ name: spec.block, blocks: spec.blocks });
+    if (refusal) return { ok: false, kind: "internal", detail: refusal };
+  }
   const plan = planFind(spec.blocks);
   const start = bot.entity.position.clone();
   spec.origin = { x: Math.floor(start.x), y: Math.floor(start.y), z: Math.floor(start.z) };

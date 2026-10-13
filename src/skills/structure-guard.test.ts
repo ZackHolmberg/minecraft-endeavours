@@ -134,3 +134,26 @@ describe("builtReasonAt / craftedWithin (pure forms)", () => {
     expect(craftedWithin(nameAt(w), new Vec3(0, 5, 0), 2)).toBe(false);
   });
 });
+
+describe("lone containers and stations are protected (live-polish review M3)", () => {
+  const LONE = [
+    "chest", "trapped_chest", "ender_chest", "barrel", "furnace", "blast_furnace", "smoker", "crafting_table", "red_bed", "white_bed", "oak_sign", "oak_wall_sign",
+    "oak_hanging_sign", "lectern", "enchanting_table", "anvil", "chipped_anvil", "beacon", "brewing_stand", "hopper", "shulker_box", "purple_shulker_box",
+  ];
+  it("each is refused even with nothing around it", () => {
+    for (const n of LONE) {
+      const w: World = new Map();
+      w.set(key(0, 64, 0), n);
+      expect(builtReasonAt(nameAt(w), { name: n, position: new Vec3(0, 64, 0) }), n).not.toBeNull();
+    }
+  });
+  it("they count as crafted for the clearance checks, and ordinary terrain still does not", () => {
+    const w: World = new Map();
+    w.set(key(2, 64, 0), "chest");
+    expect(craftedWithin(nameAt(w), new Vec3(0, 64, 0), 2)).toBe(true);
+    for (const n of ["stone", "coal_ore", "dirt", "gravel", "sand", "cobblestone"]) {
+      const lone: World = new Map();
+      expect(builtReasonAt(nameAt(lone), { name: n, position: new Vec3(0, 64, 0) }), n).toBeNull();
+    }
+  });
+});

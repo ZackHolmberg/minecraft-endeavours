@@ -466,7 +466,7 @@ describe("scaffold persistence and clean-up (H2)", () => {
     const design = async (w: number, h: number, orientation: "wall" | "flat") => {
       const { encodeDesign } = await import("../../pixelart/design.js");
       const cells = Array.from({ length: h }, (_, r) => Array.from({ length: w }, (_, c) => (r === 0 && c % 7 === 3 ? null : COLS[(r * 2 + c) % 3]!)));
-      return { d: encodeDesign({ w, h, cells }, { orientation, title: "Test" }), cells };
+      return { d: encodeDesign({ w, h, cells }, { orientation }), cells };
     };
 
     it("creative wall: every block lands, bottom-up, fetched per colour just in time (one batch per colour, not per stack)", async () => {

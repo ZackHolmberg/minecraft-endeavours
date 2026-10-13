@@ -17,7 +17,7 @@
 
 ## Next steps — live polish slice (2026-10-12)
 - Merged into `v2` @ `7619083` (640 tests): polish C `55f6bb5` (find job, creative flight, gather watchdog → t2.coal pass, tree write-off, axe plan), polish B `2808e8e` (pixel art per D20: Commons Canadiens logo 554/554 live), polish A `ca70b10` (silent-turn fix, early session end, 12 tools hidden; 16 core: 62→35 API calls, tokens −59%, prefix 20.3k→14.6k).
-- `v2-s6` (35 core ×2): 69/70. Review (`reports/polish-review.md`, no HIGH) fixes M1–M5 + LOWs → `v2-fixes` (D23), plus water-avoiding mine targets (`dryFirst`, after the s6 drowning).
+- `v2-s6` (35 core ×2): 69/70. Review (`reports/polish-review.md`, no HIGH) fixes M1–M5 + LOWs (D23) and water safety (`dryFirst` mine targets; `navigate` waits for an active surfacing reflex) merged into `v2`; live check `dev-water`: t2.coal 3/3, t3.iron_pickaxe 3/3, 0 deaths. 671 tests.
 - Then: deploy to `main` (merge in main checkout, `npm install` for sharp, bot restart) with owner OK.
 
 ## Targets (set 2026-10-09 from the v1 baseline; benchmark = `npm run eval`, see EVAL.md)

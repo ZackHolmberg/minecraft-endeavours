@@ -13,8 +13,10 @@ import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { ipBlockReason, validateUrl } from "./netguard.js";
 
+export { sniffImage, type ImageKind } from "./sniff.js";
+
 export const USER_AGENT = "minecraft-endeavours-bot/2 (+https://github.com/ZackHolmberg/minecraft-endeavours)";
-export const FETCH_LIMITS = { maxBytes: 5 * 1024 * 1024, timeoutMs: 10_000, maxRedirects: 3 } as const;
+export const FETCH_LIMITS = { maxBytes: 5 * 1024 * 1024, timeoutMs: 10_000, maxRedirects: 3, connectMs: 4_000 } as const;
 
 export interface HopResponse {
   status: number;
@@ -41,6 +43,10 @@ export interface SafeGetOptions {
   accept?: string;
   /** Extra check on the host of EVERY hop (e.g. the Wikimedia allowlist). */
   hostAllowed?: (host: string) => boolean;
+  /** Absolute epoch-ms deadline shared by several fetches (e.g. the Wikimedia search + image hops): the timeout never outlives it. */
+  deadline?: number;
+  /** Per-address connect timeout (until the response headers arrive), so one dead address doesn't eat the whole budget. */
+  connectMs?: number;
 }
 
 export type SafeGetResult = { ok: true; bytes: Buffer; finalUrl: string; status: number; contentType: string } | { ok: false; reason: string };
@@ -75,8 +81,11 @@ const header = (h: HopResponse["headers"], k: string): string => {
   return Array.isArray(v) ? (v[0] ?? "") : (v ?? "");
 };
 
-/** Resolve `host`, refuse if any address is blocked, return the one to connect to. */
-export async function pinAddress(host: string, resolve: Resolver): Promise<{ ok: true; address: string } | { ok: false; reason: string }> {
+/**
+ * Resolve `host`, refuse if ANY address is blocked, return every validated address (IPv4 first: a v6-only route
+ * failure then falls through quickly) in the order to try. `address` is the first of them.
+ */
+export async function pinAddress(host: string, resolve: Resolver): Promise<{ ok: true; address: string; addresses: string[] } | { ok: false; reason: string }> {
   let addrs: string[];
   try {
     addrs = await resolve(host);
@@ -89,7 +98,9 @@ export async function pinAddress(host: string, resolve: Resolver): Promise<{ ok:
     const why = ipBlockReason(a);
     if (why) return { ok: false, reason: `${host} points at a non-public address (${why}); refusing` };
   }
-  return { ok: true, address: addrs[0]! };
+  const ordered = [...addrs.filter((a) => isIP(a) === 4), ...addrs.filter((a) => isIP(a) === 6)];
+  const unique = [...new Set(ordered)];
+  return { ok: true, address: unique[0]!, addresses: unique };
 }
 
 export async function safeGet(rawUrl: string, opts: SafeGetOptions = {}, deps: SafeGetDeps = {}): Promise<SafeGetResult> {
@@ -98,7 +109,10 @@ export async function safeGet(rawUrl: string, opts: SafeGetOptions = {}, deps: S
   const maxBytes = opts.maxBytes ?? FETCH_LIMITS.maxBytes;
   const maxRedirects = opts.maxRedirects ?? FETCH_LIMITS.maxRedirects;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? FETCH_LIMITS.timeoutMs);
+  const budget = Math.min(opts.timeoutMs ?? FETCH_LIMITS.timeoutMs, opts.deadline !== undefined ? opts.deadline - Date.now() : Infinity);
+  if (budget <= 0) return { ok: false, reason: "timed out" };
+  const timer = setTimeout(() => ctrl.abort(), budget);
+  const connectMs = opts.connectMs ?? FETCH_LIMITS.connectMs;
   let current = rawUrl;
   try {
     for (let hop = 0; hop <= maxRedirects; hop++) {
@@ -108,17 +122,28 @@ export async function safeGet(rawUrl: string, opts: SafeGetOptions = {}, deps: S
       if (opts.hostAllowed && !opts.hostAllowed(host)) return { ok: false, reason: `host ${host} is not allowed here` };
       const pin = await pinAddress(host, resolve);
       if (!pin.ok) return { ok: false, reason: hop === 0 ? pin.reason : `redirect refused: ${pin.reason}` };
-      let res: HopResponse;
-      try {
-        res = await transport({
-          url: v.url,
-          address: pin.address,
-          signal: ctrl.signal,
-          headers: { "User-Agent": USER_AGENT, Accept: opts.accept ?? "image/png,image/jpeg,image/webp,image/gif;q=0.9,*/*;q=0.1", "Accept-Encoding": "identity", Connection: "close" },
-        });
-      } catch (err) {
-        return { ok: false, reason: ctrl.signal.aborted ? "timed out" : `connection failed: ${err instanceof Error ? err.message : String(err)}` };
+      const headers = { "User-Agent": USER_AGENT, Accept: opts.accept ?? "image/png,image/jpeg,image/webp,image/gif;q=0.9,*/*;q=0.1", "Accept-Encoding": "identity", Connection: "close" };
+      // Try each validated address in turn (a dead AAAA or one unreachable A record must not fail the fetch).
+      let res: HopResponse | null = null;
+      let lastErr = "";
+      for (const address of pin.addresses) {
+        if (ctrl.signal.aborted) break;
+        const attempt = new AbortController();
+        const onAbort = (): void => attempt.abort();
+        ctrl.signal.addEventListener("abort", onAbort, { once: true });
+        const connectTimer = setTimeout(() => attempt.abort(), connectMs);
+        try {
+          // the overall abort stays linked to a successful attempt (it covers the body download too)
+          res = await transport({ url: v.url, address, signal: attempt.signal, headers });
+          break;
+        } catch (err) {
+          lastErr = attempt.signal.aborted && !ctrl.signal.aborted ? "connect timed out" : err instanceof Error ? err.message : String(err);
+          ctrl.signal.removeEventListener("abort", onAbort);
+        } finally {
+          clearTimeout(connectTimer);
+        }
       }
+      if (!res) return { ok: false, reason: ctrl.signal.aborted ? "timed out" : `connection failed: ${lastErr}` };
       try {
         if (REDIRECTS.has(res.status)) {
           const loc = header(res.headers, "location");
@@ -154,15 +179,4 @@ export async function safeGet(rawUrl: string, opts: SafeGetOptions = {}, deps: S
   } finally {
     clearTimeout(timer);
   }
-}
-
-export type ImageKind = "png" | "jpeg" | "gif" | "webp";
-
-/** Magic-byte sniff. SVG (and everything else) is deliberately not recognised. */
-export function sniffImage(b: Uint8Array): ImageKind | null {
-  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) return "png";
-  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpeg";
-  if (b.length >= 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38 && (b[4] === 0x37 || b[4] === 0x39) && b[5] === 0x61) return "gif";
-  if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "webp";
-  return null;
 }

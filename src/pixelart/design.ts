@@ -17,17 +17,15 @@ export interface PixelDesign {
   blocks: string[];
   /** h rows of w chars, top row first: "." = nothing, otherwise an index into `blocks` (0-9, A-Z, a-z). */
   rows: string[];
-  /** Provenance for the reply / telemetry. */
-  title?: string;
-  credit?: string;
 }
 
 const SYMBOLS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 export const EMPTY = ".";
 
 /**
- * Text from the web (file titles, licences, credits) ends up in prompts and in chat: keep letters, digits and plain
- * punctuation only, collapse whitespace, cap the length. (Control characters, markup, brackets and newlines go.)
+ * Generic untrusted-text cleaner: keep letters, digits and plain punctuation only, collapse whitespace, cap the
+ * length. NOT enough to make web text safe for the model (an instruction survives it); web metadata is therefore never
+ * given to the model at all: see credit.ts (fixed template, posted by code).
  */
 export function plainText(s: unknown, max: number): string {
   if (typeof s !== "string") return "";
@@ -39,15 +37,11 @@ export function plainText(s: unknown, max: number): string {
     .slice(0, max)
     .trim();
 }
-const clean = plainText;
-
-export function encodeDesign(d: Design, meta: { orientation: Orientation; title?: string; credit?: string }): PixelDesign {
+export function encodeDesign(d: Design, meta: { orientation: Orientation }): PixelDesign {
   const blocks = countCells(d.cells).map((c) => c.block);
   const idx = new Map(blocks.map((b, i) => [b, SYMBOLS[i]!]));
   const rows = d.cells.map((row) => row.map((b) => (b ? idx.get(b)! : EMPTY)).join(""));
-  const title = clean(meta.title, 120);
-  const credit = clean(meta.credit, 200);
-  return { v: 1, orientation: meta.orientation, w: d.w, h: d.h, blocks, rows, ...(title ? { title } : {}), ...(credit ? { credit } : {}) };
+  return { v: 1, orientation: meta.orientation, w: d.w, h: d.h, blocks, rows };
 }
 
 export function decodeCells(d: PixelDesign): Cells {
@@ -76,9 +70,8 @@ export function parseDesign(raw: unknown): { ok: true; design: PixelDesign } | {
     }
   }
   const orientation: Orientation = r.orientation === "flat" ? "flat" : "wall";
-  const title = clean(r.title, 120);
-  const credit = clean(r.credit, 200);
-  const design: PixelDesign = { v: 1, orientation, w: w!, h: h!, blocks: [...(blocks as string[])], rows: [...(rows as string[])], ...(title ? { title } : {}), ...(credit ? { credit } : {}) };
+  // only the known fields are copied: a title/credit from an older job.json (or anything else) is dropped here
+  const design: PixelDesign = { v: 1, orientation, w: w!, h: h!, blocks: [...(blocks as string[])], rows: [...(rows as string[])] };
   if (design.rows.every((row) => row === EMPTY.repeat(design.w))) return { ok: false, reason: "the design is empty" };
   return { ok: true, design };
 }
@@ -128,6 +121,6 @@ export function designFromGrid(grid: unknown, palette: unknown, orientation: Ori
   }
   const used = countCells(cells);
   if (used.length === 0) return { ok: false, reason: "the grid is empty" };
-  const enc = encodeDesign({ w, h, cells }, { orientation, title: "hand-drawn grid" });
+  const enc = encodeDesign({ w, h, cells }, { orientation });
   return parseDesign(enc);
 }

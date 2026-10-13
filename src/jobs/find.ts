@@ -8,6 +8,8 @@
  * "report" (just the coordinates). Works in creative and survival.
  */
 import { ORE_BANDS, oreBandForBlock } from "../planner/knowledge/ores.js";
+import { isNaturalTerrain } from "../skills/structure-guard.js";
+import { isTreeLogName } from "../skills/tree-felling.js";
 import type { FindAction } from "./types.js";
 
 /** Never wander further than this (horizontally) from where the find began. */
@@ -25,6 +27,21 @@ export const FIND_MAX_COUNT = 16;
 const DIG_DOWN_WEIGHT = 4;
 
 export const FIND_ACTIONS: readonly FindAction[] = ["point", "mine", "report"];
+
+/**
+ * `find` with action "mine" runs unattended for up to 10 minutes, so it may only take natural terrain, ores and
+ * (unstripped) tree logs: never a chest, furnace, bed, planks... that a player put down (live-polish review M3).
+ * `point` / `report` stay open to any block. The per-block structure guard still applies on top of this.
+ */
+export function isMineableFindTarget(name: string): boolean {
+  return isNaturalTerrain(name) || oreBandForBlock(name) !== undefined || isTreeLogName(name);
+}
+
+export function mineRefusal(target: { name: string; blocks: readonly string[] }): string | null {
+  const bad = target.blocks.find((b) => !isMineableFindTarget(b));
+  if (bad === undefined) return null;
+  return `I only mine natural blocks (stone, dirt, sand, ores, tree logs) with find, and ${bad} isn't one of those, so I won't break it (it may be something a player built). I can still point it out or report where it is (action point / report).`;
+}
 
 export interface FindTarget {
   /** Canonical name as the player means it ("diamond_ore", "oak_log"). */

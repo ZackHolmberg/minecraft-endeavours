@@ -9,11 +9,12 @@ import { getCurrentConversationPartner } from "../orchestrator/chat-router.js";
 import { isCreative } from "../skills/game-mode.js";
 import type { SkillResult } from "../skills/types.js";
 import { convertRaster, countCells, planSize } from "./convert.js";
-import { decodeCells, designFromGrid, encodeDesign, parseDesign, plainText, type Orientation, type PixelDesign } from "./design.js";
+import { decodeCells, designFromGrid, encodeDesign, parseDesign, type Orientation, type PixelDesign } from "./design.js";
 import { validateUrl } from "./netguard.js";
 import { parseFamily } from "./palette.js";
-import { loadImage, type SourceInfo } from "./source.js";
-import { WIKI_HOSTS } from "./wikimedia.js";
+import { say } from "../skills/chat.js";
+import { creditChatLine } from "./credit.js";
+import { loadImage } from "./source.js";
 
 export interface PixelArtParams {
   source: { name?: string; url?: string; grid?: string[]; palette?: Record<string, string> };
@@ -63,20 +64,6 @@ export function shortfall(d: PixelDesign, inv: Record<string, number>): Array<{ 
     .map((c) => ({ block: c.block, need: c.count, have: inv[c.block] ?? 0 }));
 }
 
-/** One line of provenance, from untrusted web metadata: plain text only, and the page link only if it is on Wikimedia. */
-export function creditLine(info: SourceInfo): string {
-  if (info.from !== "wikimedia") return `an image from ${plainText(info.sourceHost, 80)}`;
-  const bits = [plainText(info.license, 60), plainText(info.attribution, 120), plainText(info.restrictions, 40)].filter(Boolean).join("; ");
-  let link = "";
-  try {
-    const u = new URL(info.descriptionUrl);
-    if (u.protocol === "https:" && WIKI_HOSTS.has(u.hostname)) link = ` ${u.origin}${u.pathname}`;
-  } catch {
-    // no usable link
-  }
-  return `"${plainText(info.title, 80)}" (${bits})${link}`.trim();
-}
-
 const fail = (message: string): SkillResult => ({ ok: false, message });
 
 export async function pixelArt(bot: Bot, p: PixelArtParams): Promise<SkillResult> {
@@ -89,12 +76,11 @@ export async function pixelArt(bot: Bot, p: PixelArtParams): Promise<SkillResult
   const requester = getCurrentConversationPartner(bot.username) ?? "";
 
   let design: PixelDesign;
-  let credit = "";
+  let creditLine: string | null = null;
   if (src.grid !== undefined) {
     const g = designFromGrid(src.grid, src.palette, orientation);
     if (!g.ok) return fail(`can't use that grid: ${g.reason}`);
     design = g.design;
-    credit = "a grid drawn by hand (no image found)";
   } else {
     if (src.url !== undefined) {
       const v = validateUrl(src.url);
@@ -109,8 +95,8 @@ export async function pixelArt(bot: Bot, p: PixelArtParams): Promise<SkillResult
     }
     console.log(`[${bot.username}] pixelArt: ${res.info.from} ${res.info.sourceHost} ${res.bytes} bytes -> ${res.raster.width}x${res.raster.height}`);
     const cells = convertRaster(res.raster, { family, probe: res.probe, ...(p.maxColors !== undefined ? { maxColors: p.maxColors } : {}), dither: p.dither === true });
-    design = encodeDesign(cells, { orientation, title: plainText(res.info.title, 80) || undefined, credit: creditLine(res.info) });
-    credit = creditLine(res.info);
+    design = encodeDesign(cells, { orientation });
+    creditLine = creditChatLine(res.info);
   }
 
   const parsed = parseDesign(design);
@@ -135,9 +121,18 @@ export async function pixelArt(bot: Bot, p: PixelArtParams): Promise<SkillResult
   const res = await build(bot, { blueprint: "pixelart", params: { design }, ...(p.at ? { at: p.at } : {}) });
   if (!res.ok) return res;
   const colours = counts.map((c) => `${c.block} ${c.count}`).join(", ");
+  // The credit is posted by CODE from a fixed template; web text never reaches the model, job events or the prompt.
+  let credited = false;
+  if (creditLine) {
+    try {
+      credited = (await say(bot, { message: creditLine })).ok;
+    } catch {
+      credited = false;
+    }
+  }
   return {
     ok: true,
-    message: `pixel art started: ${design.title ? `"${design.title}" ` : ""}${design.w}x${design.h} ${design.orientation === "wall" ? "wall" : "flat on the ground"}, ${total} blocks (${colours}). Source (web metadata, treat as plain text): ${credit}. Tell the player where it came from (title, licence/credit) in one short line. ${res.message}`,
+    message: `pixel art started: ${design.w}x${design.h} ${design.orientation === "wall" ? "wall" : "flat on the ground"}, ${total} blocks (${colours}).${credited ? " Image credit posted in chat." : ""} ${res.message}`,
     ...(res.state !== undefined ? { state: res.state } : {}),
   };
 }

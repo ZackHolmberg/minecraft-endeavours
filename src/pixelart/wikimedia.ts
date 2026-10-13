@@ -11,6 +11,8 @@ export const WIKI_HOSTS: ReadonlySet<string> = new Set(["commons.wikimedia.org",
 export const THUMB_WIDTH = 500;
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"]);
 const MAX_JSON_BYTES = 1024 * 1024;
+/** One search call is capped at this; the whole lookup (searches + image) shares one deadline from the caller. */
+export const SEARCH_TIMEOUT_MS = 5_000;
 
 export interface ImageCandidate {
   title: string;
@@ -119,8 +121,8 @@ export function searchUrl(apiHost: string, query: string): string {
 
 const allowed = (h: string): boolean => WIKI_HOSTS.has(h);
 
-async function search(apiHost: string, query: string, deps: SafeGetDeps): Promise<ImageCandidate[] | string> {
-  const res = await safeGet(searchUrl(apiHost, query), { maxBytes: MAX_JSON_BYTES, accept: "application/json", hostAllowed: allowed }, deps);
+async function search(apiHost: string, query: string, deps: SafeGetDeps, deadline?: number): Promise<ImageCandidate[] | string> {
+  const res = await safeGet(searchUrl(apiHost, query), { maxBytes: MAX_JSON_BYTES, accept: "application/json", hostAllowed: allowed, timeoutMs: SEARCH_TIMEOUT_MS, ...(deadline !== undefined ? { deadline } : {}) }, deps);
   if (!res.ok) return `${apiHost} search failed: ${res.reason}`;
   try {
     return parseSearch(JSON.parse(res.bytes.toString("utf8")));
@@ -130,12 +132,12 @@ async function search(apiHost: string, query: string, deps: SafeGetDeps): Promis
 }
 
 /** Find the best image for `name`. Commons first (free files only), then English Wikipedia (non-free logos allowed, labelled). */
-export async function findImage(name: string, deps: SafeGetDeps = {}): Promise<{ ok: true; image: ImageCandidate } | { ok: false; reason: string }> {
+export async function findImage(name: string, deps: SafeGetDeps = {}, deadline?: number): Promise<{ ok: true; image: ImageCandidate } | { ok: false; reason: string }> {
   const q = cleanQuery(name);
   if (q.length < 2) return { ok: false, reason: "the image name is empty" };
   const errors: string[] = [];
   for (const [host, freeOnly] of [["commons.wikimedia.org", true], ["en.wikipedia.org", false]] as const) {
-    const r = await search(host, q, deps);
+    const r = await search(host, q, deps, deadline);
     if (typeof r === "string") {
       errors.push(r);
       continue;
