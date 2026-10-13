@@ -28,16 +28,23 @@ import type { Bot } from "mineflayer";
 import type { Block } from "prismarine-block";
 import { Vec3 } from "vec3";
 
+/** Containers, stations and signage: placed by players, never generated scattered in the open. */
+const CONTAINER_STATION_PATTERNS: readonly RegExp[] = [
+  /^(trapped_|ender_)?chest$/, /^barrel$/, /^(blast_)?furnace$/, /^smoker$/, /^crafting_table$/, /_bed$/, /_sign$/, /_hanging_sign$/,
+  /^lectern$/, /^enchanting_table$/, /^(chipped_|damaged_)?anvil$/, /^beacon$/, /^brewing_stand$/, /^hopper$/, /shulker_box$/,
+];
+
 const CRAFTED_PATTERNS: readonly RegExp[] = [
   /_planks$/, /_stairs$/, /_slab$/, /_door$/, /_trapdoor$/, /_fence$/, /_fence_gate$/,
   /glass/, /_wall$/, /bricks?$/, /_wool$/, /_carpet$/, /_concrete$/, /glazed_terracotta$/,
   /^polished_/, /^smooth_(?!basalt)/, /^cut_/, /^chiseled_/, /_bed$/, /^bookshelf$/, /^quartz_/,
   /^lantern$/, /_lantern$/, /^ladder$/, /^iron_bars$/, /_pane$/,
+  ...CONTAINER_STATION_PATTERNS,
 ];
 
-// Protected regardless of neighbours: no one wants a lone door or window
-// "harvested".
-const ALWAYS_PATTERNS: readonly RegExp[] = [/_door$/, /_trapdoor$/, /_fence_gate$/, /glass/];
+// Protected regardless of neighbours: no one wants a lone door, window, chest or furnace
+// "harvested" (live-polish review M3: a single player-placed chest was only protected when joined to another build).
+const ALWAYS_PATTERNS: readonly RegExp[] = [/_door$/, /_trapdoor$/, /_fence_gate$/, /glass/, ...CONTAINER_STATION_PATTERNS];
 
 const NEIGHBOURS: readonly Vec3[] = [
   new Vec3(1, 0, 0), new Vec3(-1, 0, 0),

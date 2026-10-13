@@ -78,6 +78,11 @@ export async function attachJobRunner(bot: Bot, username: string, state: BotStat
     night: createNightDeps(bot),
     countItem: (item) => itemCount(bot, item),
     progress: () => bot.inventory.items().reduce((n, it) => n + it.count, 0),
+    watchState: () => ({
+      inventoryFull: bot.inventory.emptySlotCount() === 0,
+      inWater: (bot.entity as { isInWater?: boolean }).isInWater === true,
+      pos: { x: bot.entity.position.x, y: bot.entity.position.y, z: bot.entity.position.z },
+    }),
     reserve: (items) => {
       if (items) {
         setReserved(username, items);

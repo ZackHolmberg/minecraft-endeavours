@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { TelemetryInput } from "../observability/telemetry.js";
 import { formatJobEvent, jobContextLines, jobLabel } from "./describe.js";
-import { candKey, FIND_MAX_FROM_START, planFind, rankFindCandidates, resolveFindTarget } from "./find.js";
+import { candKey, FIND_MAX_FROM_START, isMineableFindTarget, mineRefusal, planFind, rankFindCandidates, resolveFindTarget } from "./find.js";
 import { JobRunner, type FindRunContext, type RunnerDeps } from "./runner.js";
-import { shouldCancelJobFor } from "./tools.js";
+import { find as findTool, shouldCancelJobFor } from "./tools.js";
+import { registerJobRunner, unregisterJobRunner } from "./registry.js";
+import type { Bot } from "mineflayer";
 import type { FindOutcome, FindState, Job } from "./types.js";
 
 const known = (b: string): boolean => /^(diamond_ore|deepslate_diamond_ore|iron_ore|deepslate_iron_ore|coal_ore|deepslate_coal_ore|oak_log|lapis_ore|deepslate_lapis_ore|sand)$/.test(b);
@@ -182,5 +184,37 @@ describe("find job in the runner", () => {
     expect(shouldCancelJobFor("find", true)).toBe(false);
     const none = harness({ find: false });
     expect((await none.runner.startFind({ ...SPEC }, null)).ok).toBe(false);
+  });
+});
+
+describe("find action mine: natural blocks only (live-polish review M3)", () => {
+  it("allows terrain, ores and unstripped logs; refuses player-made blocks", () => {
+    for (const n of ["stone", "dirt", "sand", "gravel", "coal_ore", "deepslate_diamond_ore", "ancient_debris_ore", "oak_log", "dark_oak_log", "oak_wood", "netherrack"]) {
+      expect(isMineableFindTarget(n), n).toBe(true);
+    }
+    for (const n of ["chest", "trapped_chest", "barrel", "furnace", "blast_furnace", "crafting_table", "red_bed", "oak_sign", "lectern", "anvil", "beacon", "hopper", "shulker_box", "oak_planks", "stripped_oak_log", "cobblestone", "glass", "tnt", "bedrock", "spawner"]) {
+      expect(isMineableFindTarget(n), n).toBe(false);
+    }
+    expect(mineRefusal({ name: "chest", blocks: ["chest"] })).toMatch(/natural blocks/);
+    expect(mineRefusal({ name: "diamond_ore", blocks: ["diamond_ore", "deepslate_diamond_ore"] })).toBeNull();
+  });
+
+  it("the find skill refuses mine on a chest, but still points at or reports it", async () => {
+    const started: unknown[] = [];
+    await registerJobRunner("Finder", { startFind: async (spec: unknown) => (started.push(spec), { ok: true, jobId: "f1", message: "ok" }), dispose: async () => {} } as never);
+    const bot = { username: "Finder", registry: { blocksByName: { chest: {}, diamond_ore: {}, deepslate_diamond_ore: {}, oak_log: {} } } } as unknown as Bot;
+    try {
+      const refused = await findTool(bot, { block: "chest", action: "mine" });
+      expect(refused.ok).toBe(false);
+      expect(refused.message).toMatch(/natural blocks/);
+      expect(started).toHaveLength(0);
+      expect((await findTool(bot, { block: "chest", action: "point" })).ok).toBe(true);
+      expect((await findTool(bot, { block: "chest", action: "report" })).ok).toBe(true);
+      expect((await findTool(bot, { block: "diamond", action: "mine", count: 2 })).ok).toBe(true);
+      expect((await findTool(bot, { block: "oak_log", action: "mine" })).ok).toBe(true);
+      expect(started).toHaveLength(4);
+    } finally {
+      await unregisterJobRunner("Finder");
+    }
   });
 });

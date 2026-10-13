@@ -160,6 +160,74 @@ describe("safeGet", () => {
   });
 });
 
+describe("trying every validated address", () => {
+  it("falls through a dead address to the next one (IPv4 first), each connection pinned to a validated address", async () => {
+    const tried: string[] = [];
+    const transport: Transport = async ({ address }) => {
+      tried.push(address);
+      if (address.includes(":") || address === "93.184.216.34") throw new Error("ECONNREFUSED");
+      return ok([PNG]);
+    };
+    const resolve: Resolver = async () => ["2606:2800:220:1:248:1893:25c8:1946", "93.184.216.34", "93.184.216.35"];
+    const r = await safeGet("https://multi.example.com/a.png", {}, { resolve, transport });
+    expect(r.ok).toBe(true);
+    expect(tried).toEqual(["93.184.216.34", "93.184.216.35"]);
+  });
+
+  it("fails after the last address, and never connects when any record is private", async () => {
+    const tried: string[] = [];
+    const transport: Transport = async ({ address }) => {
+      tried.push(address);
+      throw new Error("ECONNREFUSED");
+    };
+    const r = await safeGet("https://multi.example.com/a.png", {}, { resolve: async () => ["93.184.216.34", "93.184.216.35"], transport });
+    expect(r).toMatchObject({ ok: false });
+    expect(tried).toHaveLength(2);
+    tried.length = 0;
+    const bad = await safeGet("https://multi.example.com/a.png", {}, { resolve: async () => ["93.184.216.34", "10.1.2.3"], transport });
+    expect(bad.ok).toBe(false);
+    expect(tried).toHaveLength(0);
+  });
+
+  it("a connect that hangs times out per address and moves on", async () => {
+    const tried: string[] = [];
+    const transport: Transport = ({ address, signal }) =>
+      new Promise<HopResponse>((resolve, reject) => {
+        tried.push(address);
+        if (address === "93.184.216.34") signal.addEventListener("abort", () => reject(new Error("aborted")));
+        else resolve(ok([PNG]));
+      });
+    const r = await safeGet("https://multi.example.com/a.png", { connectMs: 50 }, { resolve: async () => ["93.184.216.34", "93.184.216.35"], transport });
+    expect(r.ok).toBe(true);
+    expect(tried).toEqual(["93.184.216.34", "93.184.216.35"]);
+  });
+});
+
+describe("shared deadline", () => {
+  it("a fetch never outlives the deadline, and an expired one does not connect", async () => {
+    let conns = 0;
+    const transport: Transport = async ({ signal }) => {
+      conns += 1;
+      const slow = (async function* () {
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, 500);
+          signal.addEventListener("abort", () => (clearTimeout(t), reject(new Error("aborted"))));
+        });
+        yield PNG;
+      })();
+      return { status: 200, headers: {}, body: slow, destroy: () => {} };
+    };
+    const deps = { resolve: async () => ["93.184.216.34"], transport };
+    const t0 = Date.now();
+    const slow = await safeGet("https://slow.example.com/a.png", { deadline: Date.now() + 100 }, deps);
+    expect(slow).toMatchObject({ ok: false, reason: "timed out" });
+    expect(Date.now() - t0).toBeLessThan(450);
+    const before = conns;
+    expect(await safeGet("https://slow.example.com/a.png", { deadline: Date.now() - 1 }, deps)).toMatchObject({ ok: false, reason: "timed out" });
+    expect(conns).toBe(before);
+  });
+});
+
 describe("pinAddress", () => {
   it("rejects results that aren't IPs", async () => {
     expect((await pinAddress("x.example.com", async () => ["not-an-ip"])).ok).toBe(false);

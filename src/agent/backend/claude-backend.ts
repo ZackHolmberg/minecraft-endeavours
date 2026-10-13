@@ -1020,7 +1020,10 @@ export class ClaudeBackend implements AgentBackend {
         batch.some(isDirectAddress) || metas.some((m) => expectsReply(m.chat?.route, m.chat?.player, partner));
       active.batch = batch;
       // Orchestrator-only tasks (nudge / job report) must not restate what was just said (see chat.ts).
-      setNearDuplicateGuard(this.opts.bot.username, batch.every((m) => m.startsWith("[orchestrator note") || m.startsWith("[job ")));
+      setNearDuplicateGuard(
+        this.opts.bot.username,
+        batch.every((m) => m.startsWith("[orchestrator note")) ? "nudge" : batch.every((m) => m.startsWith("[orchestrator note") || m.startsWith("[job ")) ? "report" : "off",
+      );
       this.task = active;
       active.input.push(userMessage(context ? `${context}\n\n${body}` : body));
     } catch (err) {

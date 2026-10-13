@@ -7,7 +7,7 @@
  */
 import sharp, { type Sharp } from "sharp";
 import { opaqueBounds, planSize, type Raster } from "./convert.js";
-import { sniffImage } from "./safe-fetch.js";
+import { sniffImage } from "./sniff.js";
 
 export const MAX_INPUT_PIXELS = 25_000_000;
 

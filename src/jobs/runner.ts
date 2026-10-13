@@ -178,6 +178,12 @@ export interface RunnerDeps {
   countItem: (item: string) => number;
   /** Total items held (any kind): the gather no-progress watchdog reads it. Absent => no watchdog. */
   progress?: () => number;
+  /**
+   * What the gather watchdog needs to tell "stuck" from "busy": a full inventory (no free slot: nothing can be gained, so
+   * the stall is reported `inventory_full`, not a pathing problem), whether the bot is in water, and where the bot is (a bot on land that
+   * has moved >= {@link GATHER_MOVE_RESET_BLOCKS} blocks gets one extra window, {@link GATHER_MAX_MOVE_RESETS} per step). Absent => time only.
+   */
+  watchState?: () => { inventoryFull: boolean; inWater: boolean; pos: { x: number; y: number; z: number } };
   /** The bot's position (centre for an exhausted area when a failure reported no positions). Optional: tests may omit. */
   position?: () => { x: number; y: number; z: number };
   /** Ask the running skill to wind down (cancellation flag + pathfinder.stop). */
@@ -225,6 +231,10 @@ export const STEP_GRACE_MS = 20_000;
  * long before the step's total cap (4 min + 20 s/item). Any inventory increase resets the clock.
  */
 export const GATHER_NO_PROGRESS_MS = 60_000;
+/** Net movement since the last reset that counts as progress for the gather watchdog (long detours around lakes, far remembered ore). */
+export const GATHER_MOVE_RESET_BLOCKS = 8;
+/** How many such resets one step gets (so a pathing loop can delay the stall by at most this many windows). */
+export const GATHER_MAX_MOVE_RESETS = 1;
 /** How often the no-progress watchdog samples the inventory. */
 const PROGRESS_POLL_MS = 2_000;
 
@@ -969,7 +979,7 @@ export class JobRunner {
 
   private async runStep(job: Job, step: Step, ctx: StepRunContext): Promise<StepResult> {
     const t0 = this.now();
-    const watch = step.op === "gather" && this.deps.progress ? { read: this.deps.progress, idleMs: GATHER_NO_PROGRESS_MS } : undefined;
+    const watch = step.op === "gather" && this.deps.progress ? { read: this.deps.progress, idleMs: GATHER_NO_PROGRESS_MS, ...(this.deps.watchState ? { state: this.deps.watchState } : {}) } : undefined;
     const res = await this.timed(step, describeStep(step), stepTimeoutMs(step), () => this.deps.execute(step, ctx), watch);
     this.deps.record({
       kind: "step",
@@ -988,9 +998,10 @@ export class JobRunner {
    * the skill ignores it, abandon it. `step` is the failure's step (a placeholder
    * for build / deliver phases).
    */
-  private async timed(step: Step, label: string, limit: number, exec: () => Promise<StepResult>, watch?: { read: () => number; idleMs: number }): Promise<StepResult> {
+  private async timed(step: Step, label: string, limit: number, exec: () => Promise<StepResult>, watch?: { read: () => number; idleMs: number; state?: NonNullable<RunnerDeps["watchState"]> }): Promise<StepResult> {
     let timedOut = false;
     let stalled = false;
+    let fullInventory = false;
     let abandonTimer: NodeJS.Timeout | undefined;
     // The runner owns step timeouts (job steps run without the skill watchdog):
     // first a cooperative stop, then, if the skill ignores it, abandon the step.
@@ -1008,19 +1019,43 @@ export class JobRunner {
     if (watch) {
       let last = watch.read();
       let idle = 0;
+      const sample = (): ReturnType<NonNullable<typeof watch.state>> | null => {
+        try {
+          return watch.state ? watch.state() : null;
+        } catch {
+          return null;
+        }
+      };
+      let basePos = sample()?.pos ?? null;
+      let moveResets = 0;
       const poll = (): void => {
         if (timedOut || stalled) return;
         const cur = watch.read();
-        if (cur > last) idle = 0;
-        else idle += PROGRESS_POLL_MS;
+        const st = sample();
+        if (cur > last) {
+          idle = 0;
+          basePos = st?.pos ?? basePos;
+        } else if (st && basePos && !st.inWater && moveResets < GATHER_MAX_MOVE_RESETS && Math.hypot(st.pos.x - basePos.x, st.pos.z - basePos.z) >= GATHER_MOVE_RESET_BLOCKS) {
+          // a long walk on land to a far ore / around a lake is not "stuck": one extra window. Bounded (once per step) and never
+          // in water on purpose: live (dev-prfix) a bot diving for an underwater coal vein "travelled" along the shore with
+          // an 8-block rule, never stalled, and drowned; that loop looks exactly like a long swim, so swimming is NOT excused.
+          idle = 0;
+          moveResets += 1;
+          basePos = st.pos;
+        } else idle += PROGRESS_POLL_MS;
         last = cur; // a decrease (auto-eat, a craft) re-baselines without counting as progress
         if (idle >= watch.idleMs) {
           stalled = true;
+          fullInventory = st?.inventoryFull === true;
           this.stopInternal();
           if (!abandonTimer) {
             abandonTimer = setTimeout(() => {
               this.stopInternal();
-              giveUp({ ok: false, failure: { kind: "unreachable", step, detail: `${label} made no progress for ${Math.round(watch.idleMs / 1000)}s and did not stop; abandoned`, attempts: 1, stalled: true } as JobStepFailure });
+              giveUp(
+                fullInventory
+                  ? { ok: false, failure: { kind: "inventory_full", step, detail: `${label}: the inventory is full (no free slot), so nothing more can be picked up; abandoned`, attempts: 1 } }
+                  : { ok: false, failure: { kind: "unreachable", step, detail: `${label} made no progress for ${Math.round(watch.idleMs / 1000)}s and did not stop; abandoned`, attempts: 1, stalled: true } as JobStepFailure },
+              );
             }, STEP_GRACE_MS);
           }
           return;
@@ -1048,6 +1083,9 @@ export class JobRunner {
     }
     if (timedOut && !res.ok && res.failure.kind === "cancelled") {
       res = { ok: false, failure: { ...res.failure, kind: "timeout", detail: `${label} timed out after ${Math.round(limit / 1000)}s` } };
+    } else if (stalled && fullInventory && !timedOut && !res.ok && (res.failure.kind === "cancelled" || res.failure.kind === "timeout" || res.failure.kind === "unreachable")) {
+      // Nothing was gained because there was nowhere to put it: say so (no relocation / retry can help).
+      res = { ok: false, failure: { kind: "inventory_full", step, detail: `${label}: the inventory is full (no free slot), so nothing more can be picked up`, attempts: 1 } };
     } else if (stalled && !timedOut && !res.ok && (res.failure.kind === "cancelled" || res.failure.kind === "timeout" || res.failure.kind === "unreachable")) {
       // Our own stop made the skill return "cancelled": that is a stuck gather, not a player stop. Keep the positions it gave up on.
       const f = res.failure as JobStepFailure;

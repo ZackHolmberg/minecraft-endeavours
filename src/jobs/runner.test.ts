@@ -41,6 +41,7 @@ function harness(opts: {
   buildView?: RunnerDeps["buildView"];
   onPlan?: (view: WorldView) => void;
   progress?: () => number;
+  watchState?: RunnerDeps["watchState"];
 }): Harness {
   const h: Harness = { events: [], ended: [], saved: [], stops: 0, plans: [...opts.plans], calls: [], inv: {}, runner: null as never };
   let n = 0;
@@ -60,6 +61,7 @@ function harness(opts: {
     position: () => ({ x: 10, y: 64, z: 20 }),
     countItem: (item) => h.inv[item] ?? 0,
     ...(opts.progress ? { progress: opts.progress } : {}),
+    ...(opts.watchState ? { watchState: opts.watchState } : {}),
     requestStop: () => {
       h.stops++;
     },
@@ -617,6 +619,76 @@ describe("gather no-progress watchdog", () => {
       release();
       await vi.advanceTimersByTimeAsync(100);
       expect(h.events.find((e) => e.kind === "step")).toMatchObject({ ok: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a stall with a full inventory fails as inventory_full (no relocation, no retry)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let relocated = 0;
+      const h: Harness = harness({
+        plans: [mkPlan([gatherStep("coal", 8)]), mkPlan([])],
+        script: (s) => stuckUntilStopped(() => h)(s),
+        relocate: () => (relocated++, { moved: true, detail: "moved" }),
+        progress: () => 64 * 36,
+        watchState: () => ({ inventoryFull: true, inWater: false, pos: { x: 10, y: 64, z: 20 } }),
+      });
+      await h.runner.start([{ item: "coal", count: 8 }], null);
+      await vi.advanceTimersByTimeAsync(GATHER_NO_PROGRESS_MS + 8_000);
+      expect(h.events.find((e) => e.kind === "step")).toMatchObject({ ok: false, failureKind: "inventory_full" });
+      expect(relocated).toBe(0);
+      expect(rungs(h)).not.toContain("relocate");
+      expect(h.runner.current()!.status).toBe("failed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a long walk on land earns ONE extra window; swimming / treading water or a second 'walk' does not postpone the stall", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let inWater = false;
+      let x = 10;
+      let y = 64;
+      const h: Harness = harness({
+        plans: [mkPlan([gatherStep("coal", 8)]), mkPlan([])],
+        script: (s) => stuckUntilStopped(() => h)(s),
+        relocate: () => ({ moved: false, detail: "no" }),
+        progress: () => 3,
+        watchState: () => ({ inventoryFull: false, inWater, pos: { x, y, z: 20 } }),
+      });
+      await h.runner.start([{ item: "coal", count: 8 }], null);
+      await vi.advanceTimersByTimeAsync(GATHER_NO_PROGRESS_MS - 10_000);
+      x += 20; // walked 20 blocks on land: the clock restarts once
+      await vi.advanceTimersByTimeAsync(GATHER_NO_PROGRESS_MS - 10_000);
+      expect(h.stops).toBe(0);
+      x += 20; // a second walk does not restart it again
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.stops).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // live regression (t2.coal): a bot diving for an underwater vein and bobbing along the shore must stall at 60 s, not drown
+      let x = 10;
+      let y = 64;
+      const h: Harness = harness({
+        plans: [mkPlan([gatherStep("coal", 8)]), mkPlan([])],
+        script: (s) => stuckUntilStopped(() => h)(s),
+        relocate: () => ({ moved: false, detail: "no" }),
+        progress: () => 3,
+        watchState: () => ({ inventoryFull: false, inWater: true, pos: { x, y, z: 20 } }),
+      });
+      await h.runner.start([{ item: "coal", count: 8 }], null);
+      for (let i = 0; i < 4; i++) {
+        await vi.advanceTimersByTimeAsync(15_000);
+        x += 6; // bobbing/travelling in the water, and up and down 9 blocks
+        y = y === 64 ? 55 : 64;
+      }
+      expect(h.stops).toBeGreaterThan(0);
     } finally {
       vi.useRealTimers();
     }

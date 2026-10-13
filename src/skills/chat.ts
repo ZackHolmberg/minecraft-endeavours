@@ -47,14 +47,21 @@ export function isNearDuplicate(a: string, b: string): boolean {
  * the player's message in front of them and are where a restated completion line came from. A reply to a real player
  * message may legitimately restate the proposal it confirms ("sure, on it: 5x5 oak house…"), so it is never dropped.
  */
-const nearDupGuard = new Set<string>();
-export function setNearDuplicateGuard(botUsername: string, on: boolean): void {
-  if (on) nearDupGuard.add(botUsername);
-  else nearDupGuard.delete(botUsername);
+export type NearDupMode = "off" | "nudge" | "report";
+const nearDupMode = new Map<string, NearDupMode>();
+/**
+ * "nudge": the current task is a silent-turn nudge: its line is checked against earlier lines sent by orchestrator
+ * tasks (nudge / job report) only. "report": a [job ...] report task: its lines are recorded for that comparison but
+ * NEVER dropped, so a job's completion line can't be swallowed (live-polish review L6). "off": a player task; nothing
+ * it says is dropped and nothing it said (acks, proposals) is compared against.
+ */
+export function setNearDuplicateGuard(botUsername: string, mode: NearDupMode): void {
+  if (mode === "off") nearDupMode.delete(botUsername);
+  else nearDupMode.set(botUsername, mode);
 }
 
 const lastSent = new Map<string, { text: string; at: number }>();
-const recentSent = new Map<string, Array<{ text: string; at: number }>>();
+const recentSent = new Map<string, Array<{ text: string; at: number; orch: boolean }>>();
 
 /** Shared send-side hygiene: suppress exact repeats and pace lines. */
 async function prepareLine(bot: Bot, raw: string): Promise<{ sent: string; truncated: boolean; duplicate: boolean }> {
@@ -67,11 +74,12 @@ async function prepareLine(bot: Bot, raw: string): Promise<{ sent: string; trunc
     return { sent: text, truncated, duplicate: true };
   }
   const recent = (recentSent.get(bot.username) ?? []).filter((r) => now - r.at < NEAR_DUPLICATE_WINDOW_MS);
-  if (nearDupGuard.has(bot.username) && recent.some((r) => isNearDuplicate(r.text, text))) {
+  const mode = nearDupMode.get(bot.username) ?? "off";
+  if (mode === "nudge" && recent.some((r) => r.orch && isNearDuplicate(r.text, text))) {
     recentSent.set(bot.username, recent);
     return { sent: text, truncated, duplicate: true };
   }
-  recent.push({ text, at: now });
+  recent.push({ text, at: now, orch: mode !== "off" });
   recentSent.set(bot.username, recent.slice(-6));
   if (prev && now - prev.at < MIN_CHAT_GAP_MS) {
     await new Promise((r) => setTimeout(r, MIN_CHAT_GAP_MS - (now - prev.at)));

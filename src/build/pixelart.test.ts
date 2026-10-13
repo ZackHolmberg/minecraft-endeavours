@@ -10,8 +10,8 @@ const ALPHA = [
   ["red_concrete", "white_concrete", "blue_concrete"],
   ["yellow_concrete", null, "black_concrete"],
 ];
-const design = (cells: Array<Array<string | null>>, orientation: Orientation, title?: string) =>
-  encodeDesign({ w: cells[0]!.length, h: cells.length, cells }, { orientation, ...(title ? { title } : {}) });
+const design = (cells: Array<Array<string | null>>, orientation: Orientation) =>
+  encodeDesign({ w: cells[0]!.length, h: cells.length, cells }, { orientation });
 
 /** What a viewer standing on the `facing` side sees, as rows of block names (top row first, left to right). */
 function view(placements: Array<{ x: number; y: number; z: number; block: string }>, facing: Facing, orientation: Orientation): Array<Array<string | null>> {
@@ -54,9 +54,9 @@ describe("pixelart blueprint: orientation", () => {
     expect(flat.placements.find((p) => p.block === "red_concrete")).toMatchObject({ x: 0, z: 0 }); // top row = z 0 = far from a viewer standing south
   });
   it("transparent cells place nothing; counts, summary and params carry the design", () => {
-    const bp = buildBlueprint("pixelart", { design: design(ALPHA, "wall", "Test Flag") }, "north");
+    const bp = buildBlueprint("pixelart", { design: design(ALPHA, "wall") }, "north");
     expect(countBlocks(bp)).toEqual({ red_concrete: 1, white_concrete: 1, blue_concrete: 1, yellow_concrete: 1, black_concrete: 1 });
-    expect(bp.summary).toContain("Test Flag");
+    expect(bp.summary).toMatch(/^pixel art 3x2 wall/);
     expect(bp.summary).toContain("3x2 wall");
     expect(placedCount((bp.params["design"] as ReturnType<typeof design>))).toBe(5);
     expect(new Set(bp.placements.map((p) => `${p.x},${p.y},${p.z}`)).size).toBe(5);
@@ -76,7 +76,7 @@ const world = (over: Record<string, string> = {}) => ({
   blockAt: (x: number, y: number, z: number) => over[`${x},${y},${z}`] ?? (y > 63 ? "air" : y === 63 ? "grass_block" : "dirt"),
 });
 const big = (w: number, h: number, orientation: Orientation) =>
-  design(Array.from({ length: h }, (_, r) => Array.from({ length: w }, (_, c) => ["red_concrete", "white_concrete", "blue_concrete"][(r + c) % 3]!)), orientation, "Big");
+  design(Array.from({ length: h }, (_, r) => Array.from({ length: w }, (_, c) => ["red_concrete", "white_concrete", "blue_concrete"][(r + c) % 3]!)), orientation);
 const input = (d: ReturnType<typeof design>, extra: Partial<Parameters<typeof prepare>[0]> = {}): Parameters<typeof prepare>[0] => ({
   grid: world(),
   inv: {},
