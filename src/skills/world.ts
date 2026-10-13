@@ -504,6 +504,7 @@ function findMineCandidate(
     if (more.length > positions.length) positions.splice(0, positions.length, ...more);
   }
   rankAvoidingPits(bot, positions);
+  dryFirst(positions, (p) => bot.blockAt(p)?.name ?? null);
   if (allowStructures) {
     const first = positions[0];
     return first ? bot.blockAt(first) : null;
@@ -586,6 +587,28 @@ function rankAvoidingPits(bot: Bot, positions: Vec3[]): void {
     const f = positions[0]!;
     console.log(`[${bot.username}] [mine] pit-avoid: preferring (${f.x}, ${f.y}, ${f.z}) over nearest (${first.x}, ${first.y}, ${first.z}) which needs digging straight down`);
   }
+}
+
+const LIQUID_NAME = /^(water|lava|flowing_water|flowing_lava|bubble_column)$/;
+const FACES: ReadonlyArray<readonly [number, number, number]> = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+
+/** True when the block at `p` or one of its six neighbours is a liquid: digging it floods the hole or means a swim. */
+export function touchesLiquidAt(nameAt: (p: Vec3) => string | null, p: Vec3): boolean {
+  if (LIQUID_NAME.test(nameAt(p) ?? "")) return true;
+  return FACES.some(([dx, dy, dz]) => LIQUID_NAME.test(nameAt(p.offset(dx, dy, dz)) ?? ""));
+}
+
+/**
+ * Stable partition (in place): candidates touching water/lava go after every dry one. Players don't dive or
+ * flood their own shaft for stone; live (v2-s6 t3.iron_pickaxe) a bot dug stone in a flooded pit and drowned.
+ * A wet candidate is still used when nothing dry is in the scan.
+ */
+export function dryFirst(positions: Vec3[], nameAt: (p: Vec3) => string | null): void {
+  const dry: Vec3[] = [];
+  const wet: Vec3[] = [];
+  for (const p of positions) (touchesLiquidAt(nameAt, p) ? wet : dry).push(p);
+  if (wet.length === 0 || dry.length === 0) return;
+  positions.splice(0, positions.length, ...dry, ...wet);
 }
 
 function posOf(bot: Bot): { x: number; y: number; z: number } {

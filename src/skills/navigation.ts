@@ -24,7 +24,7 @@ import { Vec3 } from "vec3";
 import { recordEvent } from "../observability/telemetry.js";
 import type { Vec } from "../observability/telemetry-types.js";
 import { getBotState } from "../state/index.js";
-import { surfaceInterrupted } from "./auto-behaviors.js";
+import { isSurfacing, surfaceInterrupted } from "./auto-behaviors.js";
 import { diggingDepth, ensureMovements, withDiggingMovements, type BotWithPathfinder } from "./pathfinder-config.js";
 import { pickFiller, pillarUpBy } from "./pillar.js";
 import type { SkillResult } from "./types.js";
@@ -228,6 +228,13 @@ async function navigateInner(
   const pBot = bot as BotWithPathfinder;
   ensureMovements(pBot);
   const cancellation = getBotState(bot.username)?.cancellation;
+
+  // A leg started while the reflex is mid-swim would take the controls from it (dev-prfix3 t2.coal: a relocate
+  // began 5 s into a swim and the bot drowned under its own pathfinder): let the reflex finish first.
+  if (isSurfacing(bot)) {
+    console.log(`[${bot.username}] [nav] waiting for the surfacing reflex before heading to ${opts.label}`);
+    await surfaceInterrupted(bot);
+  }
 
   const startDist = bot.entity.position.distanceTo(opts.target);
   const timeoutMs = opts.timeoutMs
